@@ -397,3 +397,82 @@ def test_cat_and_fee_change_roles_and_actions_are_shared_with_execution():
     assert actions[0]["id"] == {"type": "existing", "asset_id": "c" * 64}
     assert actions[2]["id"] == {"type": "xch"}
     assert actions[-1] == {"type": "fee", "amount": "10"}
+
+
+@pytest.mark.parametrize(
+    "failure,expected",
+    [
+        ({"success": False, "reason": "LEASE_OWNED_BY_OTHER"}, "LEASE_OWNED_BY_OTHER"),
+        (
+            {"success": False, "reason": "MUTATION_RUNTIME_NOT_INITIALIZED"},
+            "MUTATION_RUNTIME_NOT_INITIALIZED",
+        ),
+        (
+            {
+                "success": False,
+                "error": "SAGE_CONNECTION_ERROR",
+                "error_code": "SAGE_CONNECTION_ERROR",
+            },
+            "SAGE_CONNECTION_ERROR",
+        ),
+        (
+            {
+                "success": False,
+                "error": "SAGE_HTTP_ERROR",
+                "error_code": "SAGE_HTTP_ERROR",
+            },
+            "SAGE_HTTP_ERROR",
+        ),
+    ],
+)
+def test_unsigned_build_failure_retains_known_reason_without_inspection(
+    monkeypatch, failure, expected
+):
+    monkeypatch.setattr(wallet, "build_transaction_rpc", lambda *_: failure)
+
+    def forbidden(*_):
+        pytest.fail(
+            "failed unsigned build must not be treated as a transaction summary"
+        )
+
+    monkeypatch.setattr(wallet, "inspect_unsigned_transaction_effect", forbidden)
+    result = _service().inspect_batch_unsigned(_plan(), ADDRESS, None)
+    assert result == {"available": False, "cost": None, "reason": expected}
+
+
+def test_unsigned_build_unknown_error_is_not_exposed(monkeypatch):
+    monkeypatch.setattr(
+        wallet,
+        "build_transaction_rpc",
+        lambda *_: {
+            "success": False,
+            "error": "secret value",
+            "reason": "untrusted text",
+        },
+    )
+    result = _service().inspect_batch_unsigned(_plan(), ADDRESS, None)
+    assert result == {
+        "available": False,
+        "cost": None,
+        "reason": "UNSIGNED_EFFECT_NOT_INSPECTABLE",
+    }
+
+
+@pytest.mark.parametrize("value", [[], {}, 1, True, None])
+def test_unsigned_build_nontext_error_is_not_exposed(monkeypatch, value):
+    monkeypatch.setattr(
+        wallet,
+        "build_transaction_rpc",
+        lambda *_: {
+            "success": False,
+            "reason": value,
+            "error_code": value,
+            "error": value,
+        },
+    )
+    result = _service().inspect_batch_unsigned(_plan(), ADDRESS, None)
+    assert result == {
+        "available": False,
+        "cost": None,
+        "reason": "UNSIGNED_EFFECT_NOT_INSPECTABLE",
+    }

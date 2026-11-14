@@ -266,3 +266,26 @@ def test_public_quote_revalidates_unsynced_raw_evidence(monkeypatch):
     assert quote["available"] is False
     assert quote["fee_mojos"] is None
     assert quote["network_evidence"]["full_node_synced"] is False
+
+
+@pytest.mark.parametrize("synced, available", [(True, True), (False, False)])
+def test_force_refresh_reaches_transport_and_still_validates_network_evidence(
+    monkeypatch, synced, available
+):
+    module = importlib.import_module("fee_estimation")
+    fees = importlib.import_module("tx_fees")
+
+    def provider(*, cost, target_seconds, force_refresh):
+        assert (cost, target_seconds, force_refresh) == (20_000_000, 300, True)
+        return {
+            "available": True,
+            "source": "coinset",
+            "observed_at": 100,
+            "raw": {"success": True, "estimates": [123], "full_node_synced": synced},
+        }
+
+    monkeypatch.setattr(fees, "get_suggested_transaction_fee", provider)
+    monkeypatch.setattr(module.time, "time", lambda: 100)
+    result = module.quote_fee(20_000_000, force_refresh=True)
+    assert result["available"] is available
+    assert result["fee_mojos"] == (123 if available else None)

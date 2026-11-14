@@ -1,0 +1,535 @@
+name: Publish unsigned Windows stable
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Public catalystxch/catalyst-bot release tag (vMAJOR.MINOR.PATCH)
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: catalyst-stable-release-channel
+  cancel-in-progress: false
+
+jobs:
+  publish-unsigned-windows-stable:
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout trusted main release tooling
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
+        with:
+          ref: main
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
+        with:
+          python-version: "3.12"
+
+      - name: Install release verification dependencies
+        shell: pwsh
+        run: python -m pip install -r requirements.txt
+
+      - name: Validate release tag
+        id: release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_REF: ${{ inputs.tag }}
+          SOURCE_REPOSITORY: catalystxch/catalyst-bot
+        run: |
+          if ($env:RELEASE_REF -cnotmatch '^v[0-9]+\.[0-9]+\.[0-9]+$') {
+            throw "Release tag must be vMAJOR.MINOR.PATCH"
+          }
+          git fetch --no-tags origin "+refs/heads/main:refs/remotes/origin/main" "refs/tags/$($env:RELEASE_REF):refs/tags/$($env:RELEASE_REF)"
+          if ($LASTEXITCODE -ne 0) {
+            throw "Unable to fetch refs/tags/$($env:RELEASE_REF)"
+          }
+          $tagCommit = (git rev-list -n 1 "refs/tags/$($env:RELEASE_REF)").Trim()
+          $mainCommit = (git rev-parse origin/main).Trim()
+          if ($tagCommit -notmatch '^[0-9a-f]{40}$' -or $mainCommit -notmatch '^[0-9a-f]{40}$') {
+            throw "Release source identity is invalid"
+          }
+          git merge-base --is-ancestor $tagCommit $mainCommit
+          if ($LASTEXITCODE -ne 0) {
+            throw "$($env:RELEASE_REF) is not an ancestor of protected main"
+          }
+          $release = gh release view $env:RELEASE_REF `
+            --repo $env:SOURCE_REPOSITORY `
+            --json isDraft,isPrerelease,tagName | ConvertFrom-Json
+          if ($release.isDraft -or $release.isPrerelease -or $release.tagName -cne $env:RELEASE_REF) {
+            throw "$($env:RELEASE_REF) is not a matching public stable source release"
+          }
+          "version=$($env:RELEASE_REF.TrimStart('v'))" >> $env:GITHUB_OUTPUT
+          "source_commit=$tagCommit" >> $env:GITHUB_OUTPUT
+
+      - name: Stage trusted stable verification tooling
+        shell: pwsh
+        run: |
+          $trusted = Join-Path $env:RUNNER_TEMP "stable-release-tooling"
+          New-Item -ItemType Directory -Force -Path (Join-Path $trusted "scripts") | Out-Null
+          New-Item -ItemType Directory -Force -Path (Join-Path $trusted "src/catalyst") | Out-Null
+          Copy-Item -LiteralPath "scripts/verify_unsigned_stable_assets.py" `
+            -Destination (Join-Path $trusted "scripts/verify_unsigned_stable_assets.py") -ErrorAction Stop
+          Copy-Item -LiteralPath "scripts/verify_previous_stable_installer.py" `
+            -Destination (Join-Path $trusted "scripts/verify_previous_stable_installer.py") -ErrorAction Stop
+          Copy-Item -LiteralPath "scripts/sign_update_manifest.py" `
+            -Destination (Join-Path $trusted "scripts/sign_update_manifest.py") -ErrorAction Stop
+          Copy-Item -LiteralPath "src/catalyst/app_update.py" `
+            -Destination (Join-Path $trusted "src/catalyst/app_update.py") -ErrorAction Stop
+
+      - name: Build unsigned Windows installer from exact release tag
+        shell: pwsh
+        env:
+          RELEASE_REF: ${{ inputs.tag }}
+          RELEASE_VERSION: ${{ steps.release.outputs.version }}
+          SOURCE_COMMIT: ${{ steps.release.outputs.source_commit }}
+        run: |
+          $tagCommit = $env:SOURCE_COMMIT
+          git checkout --detach $tagCommit
+          if ($LASTEXITCODE -ne 0 -or (git rev-parse HEAD).Trim() -cne $tagCommit) {
+            throw "Unable to check out the exact release tag commit"
+          }
+          python -m pip install pyinstaller
+          if ($LASTEXITCODE -ne 0) { throw "Unable to install PyInstaller" }
+          python -m pip install -r requirements.txt
+          if ($LASTEXITCODE -ne 0) { throw "Unable to install release dependencies" }
+          python scripts/sync_release_metadata.py $env:RELEASE_VERSION
+          if ($LASTEXITCODE -ne 0) { throw "Unable to synchronize release version" }
+          python build.py
+          if ($LASTEXITCODE -ne 0) { throw "Exact-tag Windows build failed" }
+          choco install innosetup --yes --no-progress
+          if ($LASTEXITCODE -ne 0) { throw "Unable to install Inno Setup" }
+          $iscc = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path -LiteralPath $iscc)) { throw "ISCC.exe is unavailable" }
+          (Get-Content installer.iss) -replace 'MyAppVersion     ".*"', "MyAppVersion     `"$($env:RELEASE_VERSION)`"" |
+            Set-Content installer.iss
+          & $iscc installer.iss
+          if ($LASTEXITCODE -ne 0) { throw "Exact-tag installer build failed" }
+          New-Item -ItemType Directory -Force -Path release | Out-Null
+          $name = "Catalyst-Setup-$($env:RELEASE_REF).exe"
+          Move-Item -LiteralPath "Output/Catalyst-Setup-$($env:RELEASE_VERSION).exe" `
+            -Destination "release/$name"
+          $digest = (Get-FileHash -Algorithm SHA256 -LiteralPath "release/$name").Hash.ToLowerInvariant()
+          "$digest  $name" | Set-Content -NoNewline -Encoding ascii "release/$name.sha256"
+
+      - name: Prove installer identity and unsigned status
+        shell: pwsh
+        env:
+          RELEASE_REF: ${{ inputs.tag }}
+          RELEASE_VERSION: ${{ steps.release.outputs.version }}
+        run: |
+          $name = "Catalyst-Setup-$($env:RELEASE_REF).exe"
+          $installer = Resolve-Path -LiteralPath "release/$name"
+          $sidecarPath = "release/$name.sha256"
+          $digest = (Get-FileHash -Algorithm SHA256 -LiteralPath $installer).Hash.ToLowerInvariant()
+          $sidecar = (Get-Content -Raw -LiteralPath $sidecarPath).TrimEnd("`r", "`n")
+          if ($sidecar -cne "$digest  $name") {
+            throw "Installer SHA-256 sidecar does not match the downloaded bytes"
+          }
+          $signature = Get-AuthenticodeSignature -LiteralPath $installer
+          if ($signature.Status -ne "NotSigned") {
+            throw "Unsigned stable path requires NotSigned status; found $($signature.Status)"
+          }
+          $version = (Get-Item -LiteralPath $installer).VersionInfo.ProductVersion.Trim()
+          if ($version -ne $env:RELEASE_VERSION) {
+            throw "Installer product version $version does not match $($env:RELEASE_VERSION)"
+          }
+          $defender = @(
+            (Join-Path $env:ProgramFiles "Windows Defender/MpCmdRun.exe")
+            Get-ChildItem "$env:ProgramData/Microsoft/Windows Defender/Platform" -Directory -ErrorAction SilentlyContinue |
+              Sort-Object Name -Descending |
+              ForEach-Object { Join-Path $_.FullName "MpCmdRun.exe" }
+          ) | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
+          if (-not $defender) {
+            throw "Microsoft Defender command-line scanner is unavailable"
+          }
+          & $defender -Scan -ScanType 3 -File $installer
+          if ($LASTEXITCODE -ne 0) {
+            throw "Microsoft Defender rejected the installer with exit code $LASTEXITCODE"
+          }
+
+      - name: Install and smoke test the downloaded release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_REF: ${{ inputs.tag }}
+          RELEASE_VERSION: ${{ steps.release.outputs.version }}
+          RELEASE_CHANNEL_REPOSITORY: Lowestofttim/catalyst-releases
+        run: |
+          $installer = Resolve-Path -LiteralPath "release/Catalyst-Setup-$($env:RELEASE_REF).exe"
+          $installDir = Join-Path $env:RUNNER_TEMP "CatalystUnsignedStable"
+          $install = Start-Process -FilePath $installer -ArgumentList @(
+            "/VERYSILENT",
+            "/SUPPRESSMSGBOXES",
+            "/NORESTART",
+            "/NOICONS",
+            "/CURRENTUSER",
+            "/DIR=$installDir"
+          ) -Wait -PassThru
+          if ($install.ExitCode -ne 0) {
+            throw "Installer exited with code $($install.ExitCode)"
+          }
+          $installedExe = Join-Path $installDir "Catalyst.exe"
+          $bundleExe = "dist/Catalyst/Catalyst.exe"
+          $version = (Get-Item -LiteralPath $installedExe).VersionInfo.ProductVersion.Trim()
+          if ($version -ne $env:RELEASE_VERSION) {
+            throw "Installed product version $version does not match $($env:RELEASE_VERSION)"
+          }
+          $signature = Get-AuthenticodeSignature -LiteralPath $installedExe
+          if ($signature.Status -ne "NotSigned") {
+            throw "Unsigned stable payload requires NotSigned status; found $($signature.Status)"
+          }
+          $bundleHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $bundleExe).Hash
+          $installedHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $installedExe).Hash
+          if ($installedHash -cne $bundleHash) {
+            throw "installed Catalyst.exe hash does not match unsigned bundle"
+          }
+          $defender = @(
+            (Join-Path $env:ProgramFiles "Windows Defender/MpCmdRun.exe")
+            Get-ChildItem "$env:ProgramData/Microsoft/Windows Defender/Platform" -Directory -ErrorAction SilentlyContinue |
+              Sort-Object Name -Descending |
+              ForEach-Object { Join-Path $_.FullName "MpCmdRun.exe" }
+          ) | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
+          if (-not $defender) {
+            throw "Microsoft Defender command-line scanner is unavailable"
+          }
+          & $defender -Scan -ScanType 3 -File $installedExe
+          if ($LASTEXITCODE -ne 0) {
+            throw "Microsoft Defender rejected the installed app with exit code $LASTEXITCODE"
+          }
+          python scripts/packaged_sage_rpc_smoke.py --exe $installedExe
+          if ($LASTEXITCODE -ne 0) { throw "Packaged Sage RPC smoke failed" }
+          python scripts/packaged_api_smoke.py --exe $installedExe
+          if ($LASTEXITCODE -ne 0) { throw "Packaged API smoke failed" }
+          python scripts/packaged_desktop_first_launch_smoke.py --exe $installedExe
+          if ($LASTEXITCODE -ne 0) { throw "Packaged desktop smoke failed" }
+          python scripts/packaged_upgrade_publication_recovery_smoke.py --exe $installedExe
+          if ($LASTEXITCODE -ne 0) { throw "Packaged upgrade recovery smoke failed" }
+          $uninstaller = Join-Path $installDir "unins000.exe"
+          if (-not (Test-Path -LiteralPath $uninstaller)) {
+            throw "Clean install did not create an uninstaller"
+          }
+          $uninstall = Start-Process -FilePath $uninstaller -ArgumentList @(
+            "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART"
+          ) -Wait -PassThru
+          if ($uninstall.ExitCode -ne 0) {
+            throw "Clean install uninstall exited with code $($uninstall.ExitCode)"
+          }
+
+          Write-Host "Smoke test Windows Existing-install upgrade"
+          $previousJson = gh api "repos/$($env:RELEASE_CHANNEL_REPOSITORY)/releases/latest"
+          if ($LASTEXITCODE -ne 0) {
+            throw "Unable to inspect previous public stable release for upgrade smoke"
+          }
+          $previous = ConvertFrom-Json -InputObject ($previousJson -join "`n")
+          $previousTag = [string]$previous.tag_name
+          if ($previous.draft -or $previous.prerelease -or $previousTag -notmatch '^v[0-9]+\.[0-9]+\.[0-9]+$') {
+            throw "Previous public stable release identity is invalid"
+          }
+          if ([version]$previousTag.Substring(1) -ge [version]$env:RELEASE_VERSION) {
+            throw "Previous release version must be older than candidate"
+          }
+          $previousDir = Join-Path $env:RUNNER_TEMP "CATalystPreviousStable"
+          New-Item -ItemType Directory -Path $previousDir -ErrorAction Stop | Out-Null
+          $previousName = "Catalyst-Setup-$previousTag.exe"
+          gh release download $previousTag `
+            --repo $env:RELEASE_CHANNEL_REPOSITORY `
+            --pattern "$previousName*" `
+            --dir $previousDir
+          if ($LASTEXITCODE -ne 0) {
+            throw "Unable to download previous public stable installer"
+          }
+          gh release download $previousTag `
+            --repo $env:RELEASE_CHANNEL_REPOSITORY `
+            --pattern "update-manifest-$previousTag.json*" `
+            --dir $previousDir
+          if ($LASTEXITCODE -ne 0) {
+            throw "Unable to download previous signed stable update manifest"
+          }
+          $previousInstaller = Join-Path $previousDir $previousName
+          $previousSidecar = Join-Path $previousDir "$previousName.sha256"
+          $previousDigest = (Get-FileHash -Algorithm SHA256 -LiteralPath $previousInstaller).Hash.ToLowerInvariant()
+          $previousExpected = (Get-Content -Raw -LiteralPath $previousSidecar).TrimEnd("`r", "`n")
+          if ($previousExpected -cne "$previousDigest  $previousName") {
+            throw "Previous release installer SHA-256 sidecar does not match"
+          }
+          python (Join-Path $env:RUNNER_TEMP "stable-release-tooling/scripts/verify_previous_stable_installer.py") `
+            --installer $previousInstaller `
+            --sidecar $previousSidecar `
+            --manifest (Join-Path $previousDir "update-manifest-$previousTag.json") `
+            --signature (Join-Path $previousDir "update-manifest-$previousTag.json.sig") `
+            --release-ref $previousTag
+          if ($LASTEXITCODE -ne 0) {
+            throw "Previous release installer failed signed manifest verification"
+          }
+          $upgradeDir = Join-Path $env:LOCALAPPDATA "Programs/CATalyst"
+          if (Test-Path -LiteralPath $upgradeDir) {
+            throw "Existing-install smoke target unexpectedly exists: $upgradeDir"
+          }
+          $bootstrap = Start-Process -FilePath $previousInstaller -ArgumentList @(
+            "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART",
+            "/CURRENTUSER", "/DIR=$upgradeDir"
+          ) -Wait -PassThru
+          if ($bootstrap.ExitCode -ne 0) {
+            throw "Initial same-user install exited with code $($bootstrap.ExitCode)"
+          }
+          $upgradedExe = Join-Path $upgradeDir "Catalyst.exe"
+          $installedPreviousVersion = (Get-Item -LiteralPath $upgradedExe).VersionInfo.ProductVersion.Trim()
+          if ($installedPreviousVersion -cne $previousTag.Substring(1)) {
+            throw "Previous stable installer left unexpected version $installedPreviousVersion"
+          }
+          $upgrade = Start-Process -FilePath $installer -ArgumentList @(
+            "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/CURRENTUSER"
+          ) -Wait -PassThru
+          if ($upgrade.ExitCode -ne 0) {
+            throw "Existing-install upgrade exited with code $($upgrade.ExitCode)"
+          }
+          $upgradedVersion = (Get-Item -LiteralPath $upgradedExe).VersionInfo.ProductVersion.Trim()
+          if ($upgradedVersion -ne $env:RELEASE_VERSION) {
+            throw "Existing-install upgrade left version $upgradedVersion"
+          }
+          $upgradedSignature = Get-AuthenticodeSignature -LiteralPath $upgradedExe
+          if ($upgradedSignature.Status -ne "NotSigned") {
+            throw "Existing-install upgrade payload is not unsigned"
+          }
+          $upgradedHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $upgradedExe).Hash
+          if ($upgradedHash -cne $bundleHash) {
+            throw "Upgraded Catalyst.exe hash does not match unsigned bundle"
+          }
+          $shortcutPath = Join-Path $env:APPDATA "Microsoft/Windows/Start Menu/Programs/CATalyst.lnk"
+          if (-not (Test-Path -LiteralPath $shortcutPath)) {
+            throw "Existing-install upgrade did not refresh the Start Menu shortcut"
+          }
+          $shortcutTarget = (New-Object -ComObject WScript.Shell).CreateShortcut($shortcutPath).TargetPath
+          if ($shortcutTarget -cne $upgradedExe) {
+            throw "Existing-install shortcut targets $shortcutTarget; expected $upgradedExe"
+          }
+          $upgradeUninstaller = Join-Path $upgradeDir "unins000.exe"
+          if (-not (Test-Path -LiteralPath $upgradeUninstaller)) {
+            throw "Existing-install upgrade did not create an uninstaller"
+          }
+          $uninstall = Start-Process -FilePath $upgradeUninstaller -ArgumentList @(
+            "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART"
+          ) -Wait -PassThru
+          if ($uninstall.ExitCode -ne 0) {
+            throw "Upgrade uninstall exited with code $($uninstall.ExitCode)"
+          }
+
+      - name: Generate signed update metadata
+        shell: pwsh
+        env:
+          CATALYST_UPDATE_SIGNING_KEY_B64: ${{ secrets.CATALYST_UPDATE_SIGNING_KEY_B64 }}
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_REF: ${{ inputs.tag }}
+          SOURCE_REPOSITORY: catalystxch/catalyst-bot
+          RELEASE_CHANNEL_REPOSITORY: Lowestofttim/catalyst-releases
+          SOURCE_COMMIT: ${{ steps.release.outputs.source_commit }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:CATALYST_UPDATE_SIGNING_KEY_B64)) {
+            throw "CATALYST_UPDATE_SIGNING_KEY_B64 is required"
+          }
+          if ((git rev-parse HEAD).Trim() -cne $env:SOURCE_COMMIT) {
+            throw "Release source changed before manifest signing"
+          }
+          gh release view $env:RELEASE_REF `
+            --repo $env:SOURCE_REPOSITORY `
+            --json body --jq .body | Set-Content -Encoding utf8 release_notes.md
+          python scripts/sanitize_release_notes.py `
+            release_notes.md `
+            release_notes_sanitized.md
+          $sourceNotes = Get-Content -Raw -LiteralPath release_notes_sanitized.md
+          $warning = @"
+          ## Unsigned Windows release
+
+          This release installs intentionally unsigned Windows software. Verify the exact SHA-256 sidecar. The ordinary SmartScreen "Windows protected your PC" warning may allow More info and Run anyway after checking the app name. Smart App Control or organization policy may have no such option; do not bypass those blocks or malware and potentially unwanted app warnings.
+
+          The installer has no Authenticode publisher signature; only this update manifest is cryptographically signed.
+
+          Source: catalystxch/catalyst-bot $($env:RELEASE_REF) at $($env:SOURCE_COMMIT).
+          "@
+          "$warning`r`n`r`n$sourceNotes" |
+            Set-Content -Encoding utf8 release_notes_unsigned_stable.md
+          $installer = "release/Catalyst-Setup-$($env:RELEASE_REF).exe"
+          $sidecar = "$installer.sha256"
+          python (Join-Path $env:RUNNER_TEMP "stable-release-tooling/scripts/sign_update_manifest.py") `
+            --version $env:RELEASE_REF `
+            --source-commit $env:SOURCE_COMMIT `
+            --installer $installer `
+            --sha256-file $sidecar `
+            --download-base-url "https://github.com/$($env:RELEASE_CHANNEL_REPOSITORY)/releases/download/$($env:RELEASE_REF)" `
+            --release-url "https://github.com/$($env:RELEASE_CHANNEL_REPOSITORY)/releases/tag/$($env:RELEASE_REF)" `
+            --release-notes-file release_notes_unsigned_stable.md `
+            --out-manifest latest.json `
+            --out-signature latest.json.sig
+          if ($LASTEXITCODE -ne 0) {
+            throw "Unable to sign the update manifest"
+          }
+          Copy-Item latest.json "update-manifest-$($env:RELEASE_REF).json"
+          Copy-Item latest.json.sig "update-manifest-$($env:RELEASE_REF).json.sig"
+
+      - name: Verify staged unsigned stable bytes
+        shell: pwsh
+        env:
+          RELEASE_REF: ${{ inputs.tag }}
+          SOURCE_COMMIT: ${{ steps.release.outputs.source_commit }}
+          RELEASE_CHANNEL_REPOSITORY: Lowestofttim/catalyst-releases
+        run: |
+          $installer = "release/Catalyst-Setup-$($env:RELEASE_REF).exe"
+          $signature = Get-AuthenticodeSignature -LiteralPath $installer
+          if ($signature.Status -ne "NotSigned") {
+            throw "Final unsigned installer status changed to $($signature.Status)"
+          }
+          python (Join-Path $env:RUNNER_TEMP "stable-release-tooling/scripts/verify_unsigned_stable_assets.py") `
+            --installer $installer `
+            --sidecar "$installer.sha256" `
+            --manifest latest.json `
+            --signature latest.json.sig `
+            --versioned-manifest "update-manifest-$($env:RELEASE_REF).json" `
+            --versioned-signature "update-manifest-$($env:RELEASE_REF).json.sig" `
+            --release-ref $env:RELEASE_REF `
+            --source-commit $env:SOURCE_COMMIT `
+            --release-channel-repository $env:RELEASE_CHANNEL_REPOSITORY
+          if ($LASTEXITCODE -ne 0) {
+            throw "Final unsigned stable asset verification failed"
+          }
+
+      - name: Publish unsigned stable update channel
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.CATALYST_RELEASE_CHANNEL_TOKEN }}
+          RELEASE_REF: ${{ inputs.tag }}
+          RELEASE_CHANNEL_REPOSITORY: Lowestofttim/catalyst-releases
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:GH_TOKEN)) {
+            throw "CATALYST_RELEASE_CHANNEL_TOKEN is required"
+          }
+          $channelPush = @(gh api "repos/$($env:RELEASE_CHANNEL_REPOSITORY)" --jq '.permissions.push')
+          if ($LASTEXITCODE -ne 0 -or [string]($channelPush | Select-Object -First 1) -cne 'true') {
+            throw "Release channel token must have push access to inspect draft releases"
+          }
+          $releaseTags = @(gh api --paginate --jq '.[].tag_name' "repos/$($env:RELEASE_CHANNEL_REPOSITORY)/releases?per_page=100")
+          if ($LASTEXITCODE -ne 0) {
+            throw "Unable to enumerate release channel drafts and published releases"
+          }
+          foreach ($releaseTag in $releaseTags) {
+            if ($releaseTag -ceq $env:RELEASE_REF) {
+              throw "Release channel tag already exists as a draft or published release"
+            }
+          }
+          $candidateVersion = [version]$env:RELEASE_REF.Substring(1)
+          $latestJson = gh api "repos/$($env:RELEASE_CHANNEL_REPOSITORY)/releases/latest"
+          if ($LASTEXITCODE -ne 0) {
+            throw "Unable to inspect current stable latest release"
+          }
+          $latest = ConvertFrom-Json -InputObject ($latestJson -join "`n")
+          if ($latest.draft -or $latest.prerelease -or $latest.tag_name -notmatch '^v[0-9]+\.[0-9]+\.[0-9]+$') {
+            throw "Current stable latest release identity is invalid"
+          }
+          if ($candidateVersion -le [version]$latest.tag_name.Substring(1)) {
+            throw "Candidate is older than or equal to current stable latest $($latest.tag_name)"
+          }
+          $installer = "release/Catalyst-Setup-$($env:RELEASE_REF).exe"
+          $assets = @(
+            $installer,
+            "$installer.sha256",
+            "latest.json",
+            "latest.json.sig",
+            "update-manifest-$($env:RELEASE_REF).json",
+            "update-manifest-$($env:RELEASE_REF).json.sig"
+          )
+          $releaseLookup = @(gh api --include "repos/$($env:RELEASE_CHANNEL_REPOSITORY)/releases/tags/$($env:RELEASE_REF)" 2>&1)
+          $releaseExit = $LASTEXITCODE
+          $releaseStatus = [string]($releaseLookup | Select-Object -First 1)
+          if ($releaseStatus -match '^HTTP/\S+ 200(?:\s|$)') {
+            throw "Release channel tag already exists; unsigned stable releases are immutable"
+          }
+          if ($releaseStatus -notmatch '^HTTP/\S+ 404(?:\s|$)' -or $releaseExit -eq 0) {
+            throw "Unable to verify whether the release channel release exists"
+          }
+          $tagRefsJson = gh api "repos/$($env:RELEASE_CHANNEL_REPOSITORY)/git/matching-refs/tags/$($env:RELEASE_REF)"
+          if ($LASTEXITCODE -ne 0) {
+            throw "Unable to verify whether the release channel tag exists"
+          }
+          $tagRefs = ConvertFrom-Json -InputObject ($tagRefsJson -join "`n")
+          foreach ($tagRef in @($tagRefs)) {
+            if ($null -ne $tagRef -and $tagRef.ref -ceq "refs/tags/$($env:RELEASE_REF)") {
+              throw "Release channel tag already exists without a release"
+            }
+          }
+          gh release create $env:RELEASE_REF `
+            --repo $env:RELEASE_CHANNEL_REPOSITORY `
+            --title "CATalyst $($env:RELEASE_REF)" `
+            --notes-file release_notes_unsigned_stable.md `
+            --draft `
+            --prerelease=false `
+            --latest=false
+          if ($LASTEXITCODE -ne 0) {
+            throw "Unable to create staged unsigned Windows stable release"
+          }
+          gh release upload $env:RELEASE_REF @assets `
+            --repo $env:RELEASE_CHANNEL_REPOSITORY
+          if ($LASTEXITCODE -ne 0) {
+            throw "Unsigned Windows stable asset upload failed; the release remains a draft"
+          }
+          $stagedJson = gh api "repos/$($env:RELEASE_CHANNEL_REPOSITORY)/releases/tags/$($env:RELEASE_REF)"
+          if ($LASTEXITCODE -ne 0) {
+            throw "Unable to inspect staged unsigned release"
+          }
+          $staged = ConvertFrom-Json -InputObject ($stagedJson -join "`n")
+          if (-not $staged.draft -or $staged.prerelease -or $staged.tag_name -cne $env:RELEASE_REF) {
+            throw "Staged unsigned release is not the expected draft"
+          }
+          $expectedNames = @($assets | ForEach-Object { Split-Path -Leaf $_ } | Sort-Object)
+          $remoteNames = @($staged.assets | ForEach-Object { $_.name } | Sort-Object)
+          if (@(Compare-Object $expectedNames $remoteNames).Count -ne 0 -or $remoteNames.Count -ne $assets.Count) {
+            throw "Draft release asset names or count differ from the verified local assets"
+          }
+          $downloadDir = Join-Path $env:RUNNER_TEMP "unsigned-stable-draft-$($env:RELEASE_REF)"
+          New-Item -ItemType Directory -Path $downloadDir -ErrorAction Stop | Out-Null
+          gh release download $env:RELEASE_REF `
+            --repo $env:RELEASE_CHANNEL_REPOSITORY `
+            --dir $downloadDir
+          if ($LASTEXITCODE -ne 0) {
+            throw "Unable to download staged unsigned release assets"
+          }
+          $downloadedNames = @(Get-ChildItem -LiteralPath $downloadDir -File | ForEach-Object { $_.Name } | Sort-Object)
+          if (@(Compare-Object $expectedNames $downloadedNames).Count -ne 0 -or $downloadedNames.Count -ne $assets.Count) {
+            throw "Draft release asset downloads differ from the verified local assets"
+          }
+          foreach ($asset in $assets) {
+            $name = Split-Path -Leaf $asset
+            $remote = @($staged.assets | Where-Object { $_.name -ceq $name })
+            $downloaded = Join-Path $downloadDir $name
+            if ($remote.Count -ne 1 -or $remote[0].size -ne (Get-Item -LiteralPath $asset).Length) {
+              throw "Draft release asset metadata differs for $name"
+            }
+            $localHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $asset).Hash
+            $downloadedHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $downloaded).Hash
+            if ($localHash -cne $downloadedHash) {
+              throw "Draft release asset bytes differ for $name"
+            }
+          }
+          $latestJson = gh api "repos/$($env:RELEASE_CHANNEL_REPOSITORY)/releases/latest"
+          if ($LASTEXITCODE -ne 0) {
+            throw "Unable to recheck current stable latest release"
+          }
+          $latest = ConvertFrom-Json -InputObject ($latestJson -join "`n")
+          if ($latest.draft -or $latest.prerelease -or $latest.tag_name -notmatch '^v[0-9]+\.[0-9]+\.[0-9]+$' -or
+              $candidateVersion -le [version]$latest.tag_name.Substring(1)) {
+            throw "Candidate is older than or equal to current stable latest $($latest.tag_name)"
+          }
+          gh release edit $env:RELEASE_REF `
+            --repo $env:RELEASE_CHANNEL_REPOSITORY `
+            --draft=false `
+            --prerelease=false `
+            --latest=true
+          if ($LASTEXITCODE -ne 0) {
+            throw "Unsigned Windows stable publication failed; the release remains a draft"
+          }

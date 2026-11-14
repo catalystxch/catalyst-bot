@@ -196,9 +196,11 @@ def test_no_resume_startup_path_does_not_request_authoritative_fresh_reset():
     resume_start = html.index("async function checkForResume()")
     resume_end = html.index("async function resumeSession()", resume_start)
     resume_block = html[resume_start:resume_end]
-    no_resume_start = resume_block.index("if (!data.can_resume)")
+    no_resume_start = resume_block.index(
+        "if (!data.can_resume && data.auto_resume_requested !== true)"
+    )
     no_resume_end = resume_block.index(
-        "setResumeSessionSummary(data);", no_resume_start
+        "if (data.auto_resume_requested", no_resume_start
     )
     no_resume_block = resume_block[no_resume_start:no_resume_end]
 
@@ -253,7 +255,7 @@ def test_coin_prep_preflight_verifies_trade_headroom_but_exact_fee_size():
     """Trade tiers use headroom; the configured fee denomination does not."""
     html = GUI.read_text(encoding="utf-8", errors="replace")
 
-    check_start = html.index("async function checkIfCoinPrepNeeded(config)")
+    check_start = html.index("async function checkIfCoinPrepNeeded(config")
     check_end = html.index("function showCoinPrepConfirm(config", check_start)
     check_block = html[check_start:check_end]
 

@@ -33,7 +33,7 @@ def test_sell_ladder_cat_summary_uses_generated_slot_prices_not_mid():
     spread_fraction = (Decimal("0.000400") / mid) - Decimal("1")
     summary = summarize_sell_ladder_cat(
         mid_price=mid,
-        spread_fraction=spread_fraction,
+        spread_fraction=spread_fraction / Decimal("2"),
         max_offers=200,
         tier_counts=_sbx_counts(),
         tier_sizes_xch=_sbx_sizes(),
@@ -46,12 +46,12 @@ def test_sell_ladder_cat_summary_uses_generated_slot_prices_not_mid():
     for tier, count in _sbx_counts().items():
         for _ in range(count):
             expected_live_total += _sbx_sizes()[tier] / _price_for_slot(
-                mid, spread_fraction, 200, slot
+                mid, spread_fraction / Decimal("2"), 200, slot
             )
             slot += 1
 
     assert summary.live_cat_total == pytest.approx(expected_live_total)
-    assert summary.live_cat_total < naive_mid_total * Decimal("0.57")
+    assert summary.live_cat_total < naive_mid_total * Decimal("0.75")
     assert summary.tier_live_cat["extreme"] < Decimal("15") * 60 / mid
 
 
@@ -81,7 +81,9 @@ def test_coin_prep_worker_derives_sell_cat_tier_sizes_from_ladder_prices(monkeyp
 
     result = worker._derive_tier_cat_sizes()
 
-    expected_extreme_start_price = _price_for_slot(mid, spread_fraction, 200, 140)
+    expected_extreme_start_price = _price_for_slot(
+        mid, spread_fraction / Decimal("2"), 200, 140
+    )
     expected_extreme = round_cat_display_amount_up_to_mojo(
         (Decimal("15") / expected_extreme_start_price) * Decimal("1.10"),
         3,
@@ -121,7 +123,9 @@ def test_coin_prep_worker_uses_cli_cat_tier_counts_for_ladder_prices(monkeypatch
 
     result = worker._derive_tier_cat_sizes()
 
-    expected_extreme_start_price = _price_for_slot(mid, spread_fraction, 200, 140)
+    expected_extreme_start_price = _price_for_slot(
+        mid, spread_fraction / Decimal("2"), 200, 140
+    )
     expected_extreme = round_cat_display_amount_up_to_mojo(
         (Decimal("15") / expected_extreme_start_price) * Decimal("1.10"),
         3,
@@ -168,7 +172,7 @@ def test_cat_tier_size_ssot_matches_coin_prep_sell_ladder_prices(monkeypatch):
 
     summary = summarize_sell_ladder_cat(
         mid_price=mid,
-        spread_fraction=stub.SPREAD_BPS / Decimal("10000"),
+        spread_fraction=stub.SPREAD_BPS / Decimal("20000"),
         max_offers=stub.MAX_ACTIVE_SELL_OFFERS,
         tier_counts=counts,
         tier_sizes_xch=sizes,
@@ -183,6 +187,12 @@ def test_cat_tier_size_ssot_matches_coin_prep_sell_ladder_prices(monkeypatch):
     }
 
     assert coin_manager.get_tier_sizes_mojos_from_cfg(is_cat=True) == expected
+    # With 24 configured offers, each prepared tier denomination covers the
+    # largest CAT requirement in its Follow tier, including prep headroom.
+    for tier in sizes:
+        assert Decimal(expected[tier]) / Decimal(10**stub.CAT_DECIMALS) >= (
+            summary.max_cat_per_tier[tier] * Decimal("1.15")
+        )
 
 
 def test_runtime_topup_cat_sizes_match_coin_prep_sell_ladder_prices(monkeypatch):
@@ -258,7 +268,7 @@ def test_smart_defaults_cat_prep_total_uses_generated_slot_prices():
             max_cat = max(
                 max_cat,
                 _sbx_sizes()[tier]
-                / _price_for_slot(mid, spread_bps / Decimal("10000"), 200, slot),
+                / _price_for_slot(mid, spread_bps / Decimal("20000"), 200, slot),
             )
             slot += 1
         expected += count * int(
@@ -266,7 +276,7 @@ def test_smart_defaults_cat_prep_total_uses_generated_slot_prices():
         )
 
     assert actual == expected
-    assert actual < old_mid_priced_total * Decimal("0.65")
+    assert actual < old_mid_priced_total * Decimal("0.8")
 
 
 def test_frontend_coin_prep_uses_sell_ladder_slot_price_plan():

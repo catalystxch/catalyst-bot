@@ -1443,6 +1443,7 @@ def _get_sage_connection(timeout: int = 10):
         try:
             sock = getattr(conn, "sock", None)
             if sock is not None:
+                sock.settimeout(timeout)
                 conn.timeout = timeout
                 return conn
         except Exception:
@@ -2976,6 +2977,24 @@ def get_pending_transactions() -> Optional[list]:
     return None
 
 
+def get_pending_transactions_strict() -> Optional[list]:
+    """Read the exact Sage pending list for no-effect recovery proof.
+
+    A success envelope without the native list is an incomplete read, not an
+    empty pending set.
+    """
+    result = rpc("get_pending_transactions", {}, timeout=10)
+    if type(result) is not dict or not _rpc_succeeded(result):
+        return None
+    if "transactions" in result and "pending_transactions" in result:
+        if result["transactions"] != result["pending_transactions"]:
+            return None
+    for key in ("transactions", "pending_transactions"):
+        if key in result:
+            return result[key] if type(result[key]) is list else None
+    return None
+
+
 def _are_coins_spendable_rpc(coin_ids: list) -> Optional[bool]:
     """Call Sage's exact spendability endpoint for a set of coin ids."""
     if not coin_ids:
@@ -3090,6 +3109,53 @@ def build_transaction_rpc(
     if WALLET_DEBUG:
         _console(f"  [Sage] create_transaction result: {result}")
     return result
+
+
+def build_coin_prep_rbf_preview_rpc(
+    source_coin_id: str,
+    outputs: list,
+    fee_mojos: int,
+    *,
+    _identity_recheck=None,
+) -> Optional[Dict]:
+    """Build only a five-output XCH fee-prep replacement, never submit it.
+
+    The wallet facade derives these arguments from the exact recovery journal
+    and pending Sage transaction. This adapter entry point does not accept
+    arbitrary Sage actions or an ``auto_submit`` switch.
+    """
+    if (
+        type(source_coin_id) is not str
+        or re.fullmatch(r"[0-9a-f]{64}", source_coin_id) is None
+        or type(outputs) is not list
+        or len(outputs) != 5
+        or type(fee_mojos) is not int
+        or fee_mojos < 10_000_000
+    ):
+        return None
+    actions = []
+    for output in outputs:
+        if (
+            type(output) is not dict
+            or output.get("asset") != "xch"
+            or type(output.get("address")) is not str
+            or type(output.get("amount_mojos")) is not int
+            or output["amount_mojos"] <= 0
+        ):
+            return None
+        actions.append(
+            {
+                "type": "send",
+                "id": {"type": "xch"},
+                "address": output["address"],
+                "amount": str(output["amount_mojos"]),
+                "memos": [],
+            }
+        )
+    actions.append({"type": "fee", "amount": str(fee_mojos)})
+    return build_transaction_rpc(
+        [source_coin_id], actions, _identity_recheck=_identity_recheck
+    )
 
 
 def _unsigned_effect_refusal(reason: str) -> Dict:
@@ -3394,6 +3460,143 @@ def submit_built_transaction_rpc(
         "create_transaction",
         _identity_recheck=_identity_recheck,
     )
+
+
+def _rbf_coin_spend_bytes(raw_spends: Any) -> Optional[list[bytes]]:
+    """Canonicalize Sage coin spends for exact signed/unsigned comparison."""
+
+    if type(raw_spends) is not list or not raw_spends:
+        return None
+    try:
+        from chia_rs import CoinSpend
+
+        def prefixed(value: Any) -> str:
+            if (
+                type(value) is not str
+                or re.fullmatch(r"(?:0x)?[0-9a-fA-F]*", value) is None
+            ):
+                raise ValueError("invalid coin spend bytes")
+            return value if value.startswith("0x") else f"0x{value}"
+
+        result = []
+        for raw in raw_spends:
+            if type(raw) is not dict or type(raw.get("coin")) is not dict:
+                return None
+            spend = dict(raw)
+            coin = dict(spend["coin"])
+            coin["parent_coin_info"] = prefixed(coin.get("parent_coin_info"))
+            coin["puzzle_hash"] = prefixed(coin.get("puzzle_hash"))
+            spend["coin"] = coin
+            spend["puzzle_reveal"] = prefixed(spend.get("puzzle_reveal"))
+            spend["solution"] = prefixed(spend.get("solution"))
+            result.append(bytes(CoinSpend.from_json_dict(spend)))
+        return result if len(result) == len(set(result)) else None
+    except Exception:
+        return None
+
+
+def submit_reviewed_coin_prep_rbf_rpc(
+    validated_unsigned: Dict, *, _identity_recheck=None
+) -> Dict:
+    """Sign and submit only the exact previously inspected RBF coin spends."""
+
+    context = "coin_prep_rbf_rescue"
+
+    def refuse(reason: str, *, attempted: bool = False) -> Dict:
+        return {
+            "success": False,
+            "reason": reason,
+            "_catalyst_effect_attempted": attempted,
+        }
+
+    if type(validated_unsigned) is not dict:
+        return refuse("RBF_UNSIGNED_EFFECT_UNVERIFIED")
+    try:
+        digest = hashlib.sha256(
+            _json.dumps(
+                {
+                    "summary": validated_unsigned["summary"],
+                    "coin_spends": validated_unsigned["coin_spends"],
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+    except (KeyError, TypeError, ValueError):
+        return refuse("RBF_UNSIGNED_EFFECT_UNVERIFIED")
+    if (
+        validated_unsigned.get("_catalyst_validated_unsigned") is not True
+        or validated_unsigned.get("_catalyst_executable_effect_bound") is not True
+        or digest != validated_unsigned.get("_catalyst_unsigned_digest")
+    ):
+        return refuse("RBF_UNSIGNED_EFFECT_UNVERIFIED")
+    unsigned_spends = validated_unsigned["coin_spends"]
+    unsigned_bytes = _rbf_coin_spend_bytes(unsigned_spends)
+    if unsigned_bytes is None:
+        return refuse("RBF_UNSIGNED_EFFECT_UNVERIFIED")
+    if _identity_recheck is not None:
+        _identity_recheck(f"{context}:sign")
+    try:
+        signed = _sage_post(
+            "sign_coin_spends",
+            {"coin_spends": unsigned_spends, "auto_submit": False, "partial": False},
+            timeout=30,
+            _identity_recheck=_identity_recheck,
+        )
+    except mutation_gate.MutationBlocked:
+        raise
+    except Exception:
+        return refuse("RBF_SIGN_UNCERTAIN", attempted=True)
+    if (
+        type(signed) is not dict
+        or signed.get("success") is False
+        or signed.get("error")
+        or type(signed.get("spend_bundle")) is not dict
+    ):
+        return refuse("RBF_SIGN_RESPONSE_INVALID", attempted=True)
+    spend_bundle = signed["spend_bundle"]
+    signed_bytes = _rbf_coin_spend_bytes(spend_bundle.get("coin_spends"))
+    if signed_bytes is None or Counter(signed_bytes) != Counter(unsigned_bytes):
+        return refuse("RBF_SIGNED_SPENDS_MISMATCH", attempted=True)
+    transaction_id = _spend_bundle_transaction_id(spend_bundle)
+    if transaction_id is None:
+        return refuse("RBF_SIGNED_BUNDLE_INVALID", attempted=True)
+    if _identity_recheck is not None:
+        _identity_recheck(f"{context}:submit")
+    try:
+        submitted = _sage_post(
+            "submit_transaction",
+            {"spend_bundle": spend_bundle},
+            timeout=30,
+            retry_transport_error=False,
+            _identity_recheck=_identity_recheck,
+        )
+    except mutation_gate.MutationBlocked:
+        raise
+    except Exception:
+        return refuse("RBF_SUBMIT_UNCERTAIN", attempted=True)
+    if type(submitted) is not dict:
+        return refuse("RBF_SUBMIT_UNCERTAIN", attempted=True)
+    if (
+        submitted.get("success") is False
+        or submitted.get("error")
+        or submitted.get("reason")
+        or str(submitted.get("status") or "").lower() in {"failed", "error", "rejected"}
+    ):
+        return refuse("RBF_SUBMIT_REJECTED", attempted=True)
+    reported_id = _response_transaction_id(submitted)
+    if (
+        reported_id is not None
+        and reported_id.lower().removeprefix("0x") != transaction_id
+    ):
+        return refuse("RBF_SUBMIT_ID_MISMATCH", attempted=True)
+    return {
+        "success": True,
+        "submitted": True,
+        "transaction_id": transaction_id,
+        "submit_response": submitted,
+        "_catalyst_effect_attempted": True,
+    }
 
 
 def create_transaction_rpc(
@@ -4872,6 +5075,20 @@ def cancel_offer(
         )
     )
 
+    # A secure cancellation must have a relay fee. If an explicitly planned
+    # bulk fee cannot be funded, never silently submit a zero-fee single
+    # cancellation and leave its offer pending behind a safety latch.
+    if secure and resolved_fee <= 0:
+        return cancellation_result(
+            CANCEL_FAILED,
+            method="single_rpc",
+            raw_response={
+                "success": False,
+                "error_code": "FEE_CANCELLATION_FUNDING_REQUIRED",
+            },
+            error="FEE_CANCELLATION_FUNDING_REQUIRED",
+        )
+
     payload = {
         "offer_id": trade_id,  # Sage uses offer_id, not trade_id
         "fee": str(int(resolved_fee)),  # REQUIRED — Sage 422s without fee field
@@ -5328,6 +5545,30 @@ def get_authoritative_offers_by_ids(offer_ids: tuple[str, ...]) -> dict:
         "offers": records,
         "read_error": None,
     }
+
+
+def get_recovery_active_offers_by_ids(offer_ids: tuple[str, ...]) -> dict | None:
+    """Require each native Sage offer response to prove active status."""
+    _require_exact_offer_ids(offer_ids)
+    records = []
+    for offer_id in offer_ids:
+        response = rpc("get_offer", {"offer_id": offer_id}, timeout=10)
+        if (
+            type(response) is not dict
+            or not _rpc_succeeded(response)
+            or type(response.get("offer")) is not dict
+        ):
+            return None
+        row = response["offer"]
+        if (
+            row.get("offer_id") != offer_id
+            or row.get("trade_id", offer_id) != offer_id
+            or "status" not in row
+            or type(row["status"]) is not str
+        ):
+            return None
+        records.append({"offer_id": offer_id, "status": row["status"]})
+    return {"complete": True, "requested_ids": list(offer_ids), "offers": records}
 
 
 def get_authoritative_offer_absence_by_ids(offer_ids: tuple[str, ...]) -> dict:
@@ -5812,12 +6053,23 @@ def build_cancel_offers_batch_unsigned(
         and not cancel_result.get("error")
         and cancel_result.get("coin_spends")
     ):
-        return cancel_result
+        return (
+            {
+                **cancel_result,
+                "_catalyst_cancel_pricing_stage": "cancel_component",
+            }
+            if type(cancel_result) is dict
+            else cancel_result
+        )
 
-    def _seal_unsigned(result):
+    def _seal_unsigned(result, *, stage):
         cost = estimate_unsigned_transaction_cost(result)
         if type(cost) is not int or isinstance(cost, bool) or cost <= 0:
-            return {"success": False, "reason": "FEE_UNSIGNED_COST_UNAVAILABLE"}
+            return {
+                "success": False,
+                "reason": "FEE_UNSIGNED_COST_UNAVAILABLE",
+                "_catalyst_cancel_pricing_stage": stage,
+            }
         sealed_result = dict(result)
         sealed_result["_catalyst_validated_cancel_unsigned"] = True
         sealed_result["_catalyst_exact_unsigned_cost"] = cost
@@ -5837,7 +6089,7 @@ def build_cancel_offers_batch_unsigned(
     # manufacture an empty fee transaction or consume the protected fee coin
     # merely to discover the cancellation bundle's exact CLVM cost.
     if fee_mojos == 0:
-        return _seal_unsigned(cancel_result)
+        return _seal_unsigned(cancel_result, stage="cancel_cost")
 
     if _identity_recheck is not None:
         _identity_recheck("cancel_offers:fee_build")
@@ -5863,7 +6115,14 @@ def build_cancel_offers_batch_unsigned(
         and not fee_result.get("error")
         and fee_result.get("coin_spends")
     ):
-        return fee_result
+        return (
+            {
+                **fee_result,
+                "_catalyst_cancel_pricing_stage": "fee_component",
+            }
+            if type(fee_result) is dict
+            else fee_result
+        )
 
     combined = {
         "summary": {
@@ -5880,8 +6139,15 @@ def build_cancel_offers_batch_unsigned(
         [*normalized_source_ids, normalized_fee_coin_id],
     )
     if type(combined) is not dict or combined.get("success") is False:
-        return combined
-    return _seal_unsigned(combined)
+        return (
+            {
+                **combined,
+                "_catalyst_cancel_pricing_stage": "combined_component",
+            }
+            if type(combined) is dict
+            else combined
+        )
+    return _seal_unsigned(combined, stage="combined_cost")
 
 
 def cancel_offers_batch(
@@ -6842,6 +7108,57 @@ def get_coins_by_ids(
         if asset_id is not None:
             coin_map[cid]["asset_id"] = asset_id
     return coin_map
+
+
+def get_recovery_coins_by_ids(coin_ids: list[str]) -> dict | None:
+    """Require explicit unspent and offer-lock fields from the native RPC."""
+    if (
+        type(coin_ids) is not list
+        or not 1 <= len(coin_ids) <= _MAX_GET_COINS_BY_IDS
+        or any(
+            type(value) is not str or re.fullmatch(r"[0-9a-f]{64}", value) is None
+            for value in coin_ids
+        )
+        or len(set(coin_ids)) != len(coin_ids)
+    ):
+        return None
+    response = rpc("get_coins_by_ids", {"coin_ids": coin_ids}, timeout=15)
+    if (
+        type(response) is not dict
+        or not _rpc_succeeded(response)
+        or type(response.get("coins")) is not list
+        or len(response["coins"]) != len(coin_ids)
+    ):
+        return None
+    result = {}
+    for row in response["coins"]:
+        if (
+            type(row) is not dict
+            or "coin_id" not in row
+            or "spent_height" not in row
+            or "offer_id" not in row
+            or type(row["coin_id"]) is not str
+        ):
+            return None
+        normalized = row["coin_id"].lower().removeprefix("0x")
+        if normalized not in coin_ids or normalized in result:
+            return None
+        if row["spent_height"] is not None and (
+            type(row["spent_height"]) is not int or row["spent_height"] < 0
+        ):
+            return None
+        if row["offer_id"] is not None and type(row["offer_id"]) is not str:
+            return None
+        result[normalized] = {
+            "coin_id": normalized,
+            "offer_id": row["offer_id"],
+            "spent_height": row["spent_height"],
+        }
+    return (
+        {"0x" + coin_id: result[coin_id] for coin_id in coin_ids}
+        if len(result) == len(coin_ids)
+        else None
+    )
 
 
 def are_coins_spendable(coin_ids: list) -> Optional[bool]:

@@ -11,8 +11,9 @@ from __future__ import annotations
 
 import hashlib
 import time
+from dataclasses import replace
 from datetime import datetime, timezone
-from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
+from decimal import Decimal, InvalidOperation, ROUND_DOWN, ROUND_HALF_UP
 
 from flask import Blueprint, jsonify, request
 
@@ -22,6 +23,7 @@ from config import cfg
 from database import log_event
 from ladder_sizing import prepared_sell_ladder_cat_total
 from offer_book_policy import derive_bootstrap_plan, derive_offer_book_policy
+from fee_coin_plan import plan_weekly_fee_coins
 
 try:
     from api_call_tracker import record as _record_api_call
@@ -33,11 +35,20 @@ except Exception:
 
 bp = Blueprint("smart_defaults", __name__)
 
+# Retain the last usable live quote for transient provider failures during
+# Smart Settings. This is process-local and carries no dispatch authority.
+_LAST_SMART_FEE_ESTIMATE_MOJOS = 0
+
 
 def derive_bootstrap_smart_settings(*, campaign, decision, balances) -> dict:
     """Return the exact Bootstrap plan without consulting Follow capacity."""
 
-    plan = derive_bootstrap_plan(campaign, decision, balances)
+    plan = derive_bootstrap_plan(
+        campaign,
+        decision,
+        balances,
+        cat_decimals=int(getattr(cfg, "CAT_DECIMALS", 3)),
+    )
     return {
         **plan,
         "market_mode": "bootstrap",
@@ -58,6 +69,18 @@ def _smart_tibet_shock_trigger_pct(min_edge_bps) -> float:
         edge_bps = Decimal("0")
     trigger = max(Decimal("0.50"), edge_bps / Decimal("200"))
     return float(trigger.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
+
+
+def _smart_price_rails_for_book(min_mid, max_mid, best_bid, best_ask):
+    """Keep generated price rails outside both sides of a usable book."""
+    low = Decimal(str(min_mid))
+    high = Decimal(str(max_mid))
+    bid = Decimal(str(best_bid or 0))
+    ask = Decimal(str(best_ask or 0))
+    if bid > 0 and ask > bid:
+        low = min(low, bid * Decimal("0.85"))
+        high = max(high, ask * Decimal("1.15"))
+    return float(low), float(high)
 
 
 def _positive_int_or_none(value):
@@ -220,6 +243,66 @@ def _smart_fee_prep_count(
     return _prep_count_from_budget(
         avail_xch * max(0.0, _smart_float(fee_pct)), fee_coin_size_xch, cap, minimum
     )
+
+
+def _reconcile_smart_fee_inventory(result: dict, available_xch) -> None:
+    """Fit fee inventory and topup reserve after final buy-ladder sizing."""
+    try:
+        available = max(Decimal("0"), Decimal(str(available_xch)))
+        headroom = Decimal("1") + Decimal(
+            str(result.get("coin_prep_headroom_pct", 0) or 0)
+        ) / Decimal("100")
+        ladder = Decimal("0")
+        for tier in ("inner", "mid", "outer", "extreme"):
+            size = Decimal(str(result.get(f"buy_{tier}_size_xch") or 0))
+            count = int(result.get(f"buy_{tier}_tier_count") or 0)
+            spare = int(result.get(f"buy_{tier}_tier_spare_count") or 0)
+            if size > 0 and count + spare > 0:
+                ladder += size * (count + spare) * headroom
+
+        fee_size = Decimal(str(result.get("fee_coin_size_xch") or 0))
+        fee_count = max(0, int(result.get("fee_prep_count") or 0))
+        topup = max(Decimal("0"), Decimal(str(result.get("topup_pool_xch") or 0)))
+        if fee_size > 0:
+            fee_capacity = max(Decimal("0"), available - ladder - topup)
+            fee_count = min(fee_count, int(fee_capacity // fee_size))
+        else:
+            fee_count = 0
+        fee_principal = fee_size * fee_count
+
+        # Preserve actual offer principal first. If the wallet is too small
+        # for both the ladder and its topup buffer, trim the buffer before
+        # touching offer sizes. Then cap fees to whatever remains.
+        topup = min(topup, max(Decimal("0"), available - ladder - fee_principal))
+        if ladder + fee_principal + topup > available:
+            topup = Decimal("0")
+            if fee_size > 0:
+                fee_count = min(
+                    fee_count,
+                    int(max(Decimal("0"), available - ladder) // fee_size),
+                )
+                fee_principal = fee_size * fee_count
+        if ladder > max(Decimal("0"), available - fee_principal - topup) and ladder > 0:
+            size_budget = max(Decimal("0"), available - fee_principal - topup)
+            scale = size_budget / ladder
+            for tier in ("inner", "mid", "outer", "extreme"):
+                key = f"buy_{tier}_size_xch"
+                size = Decimal(str(result.get(key) or 0))
+                if size > 0:
+                    result[key] = float((size * scale).quantize(Decimal("0.000001")))
+            ladder = size_budget
+
+        result["fee_prep_count"] = fee_count
+        result["topup_pool_xch"] = float(topup)
+        capital = result.get("_capital_plan")
+        if isinstance(capital, dict):
+            capital["fee_pool_xch"] = float(fee_principal)
+            capital["fee_pct"] = (
+                float(fee_principal / available * 100) if available > 0 else 0.0
+            )
+            capital["topup_buffer_xch"] = float(topup)
+    except (ArithmeticError, TypeError, ValueError):
+        return
 
 
 def _smart_sniper_pool_pct(avail_xch: float, fills_per_day: float) -> float:
@@ -1001,6 +1084,18 @@ def _derive_smart_market_confidence(
             return []
         return active_bot._get_fresh_splash_confidence_offers(requested_asset, now=now)
 
+    def settled_trades(requested_asset: str):
+        if requested_asset != asset_id or active_bot is None:
+            raise ValueError("Smart Settings settled-trade asset unavailable")
+        dexie = getattr(active_bot, "dexie_manager", None)
+        fetch = getattr(dexie, "fetch_v3_historical_trades", None)
+        ticker = str(getattr(cfg, "CAT_TICKER_ID", "") or "").strip().upper()
+        if not callable(fetch) or not ticker:
+            raise ValueError("Smart Settings settled-trade source unavailable")
+        if "_" not in ticker:
+            ticker = f"{ticker}_XCH"
+        return fetch(ticker, limit=10, force=True) or []
+
     runtime = OfferBookMarketRuntime(
         asset_id=asset_id,
         risk_preset=risk_profile,
@@ -1011,6 +1106,7 @@ def _derive_smart_market_confidence(
         ),
         fetch_splash_offers=splash_offers,
         fetch_splash_health=splash_health,
+        fetch_dexie_settled_trades=settled_trades,
         minimum_provider_count=2,
     )
     return runtime.refresh(
@@ -1051,6 +1147,51 @@ def _smart_bootstrap_suggestion_reasons(
     return tuple(dict.fromkeys(reasons))
 
 
+def _passive_red_planning_prices(confidence):
+    """Plan from a current thin book or a proven price at most 24 hours old.
+
+    A one-sided book cannot by itself establish a midpoint. A recent trusted
+    anchor supplies that midpoint, while the observed side can widen the
+    planning corridor. This is only a setup input, never trading authority.
+    """
+    if getattr(confidence, "state", None) != "RED":
+        return None
+    from thin_market_reference import select_thin_market_reference
+
+    reference = select_thin_market_reference(
+        confidence,
+        now=datetime.now(timezone.utc),
+        allow_thin_move_for_setup=True,
+    )
+    if reference is None:
+        return None
+    if reference.source == "current_book":
+        return (
+            reference.observed_bid,
+            reference.midpoint,
+            reference.observed_ask,
+        )
+
+    try:
+        half_spread = Decimal(str(cfg.SPREAD_BPS)) / Decimal("20000")
+    except (InvalidOperation, TypeError, ValueError):
+        return None
+    if not half_spread.is_finite() or not Decimal("0") < half_spread < Decimal("1"):
+        return None
+    midpoint = reference.midpoint
+    bid = reference.observed_bid
+    ask = reference.observed_ask
+    if (bid is not None and bid >= midpoint) or (ask is not None and ask <= midpoint):
+        return None
+    lower = midpoint * (Decimal("1") - half_spread)
+    upper = midpoint * (Decimal("1") + half_spread)
+    if bid is not None:
+        lower = min(lower, bid)
+    if ask is not None:
+        upper = max(upper, ask)
+    return lower, midpoint, upper
+
+
 @bp.route("/api/smart-defaults")
 def api_smart_defaults():
     """Calculate ALL smart default settings from live market data.
@@ -1086,6 +1227,9 @@ def api_smart_defaults():
         cat_name = (request.args.get("cat_name", "") or "").strip()
         cat_wallet_id = _positive_int_or_none(request.args.get("cat_wallet_id"))
         cat_decimals = _nonnegative_int_or_none(request.args.get("cat_decimals"))
+        target_offers_per_side = _positive_int_or_none(
+            request.args.get("target_offers_per_side")
+        )
         return api_server._calculate_smart_defaults(
             xch_reserve=xch_res,
             cat_reserve=cat_res,
@@ -1095,6 +1239,7 @@ def api_smart_defaults():
             asset_id=asset_id or None,
             cat_wallet_id=cat_wallet_id,
             cat_decimals=cat_decimals,
+            target_offers_per_side=target_offers_per_side,
             cat_ticker_id=cat_ticker_id or None,
             cat_name=cat_name or None,
         )
@@ -1120,6 +1265,7 @@ def _calculate_smart_defaults(
     cat_decimals=None,
     cat_ticker_id=None,
     cat_name=None,
+    target_offers_per_side=None,
 ):
     """Smart Defaults v2 — data-driven settings from 30 days of market data.
 
@@ -1294,7 +1440,10 @@ def _calculate_smart_defaults(
     )
     bootstrap_reason_codes = _smart_bootstrap_suggestion_reasons(market_confidence)
     bootstrap_suggested = bool(bootstrap_reason_codes)
-    if data_valid is not True or bootstrap_suggested:
+    passive_red_prices = _passive_red_planning_prices(market_confidence)
+    passive_red_requested = request.args.get("prepare_passive_red") == "true"
+    passive_red_planning = passive_red_requested and passive_red_prices is not None
+    if (data_valid is not True or bootstrap_suggested) and not passive_red_planning:
         reason_codes = list(market_confidence.reason_codes)
         message = (
             "Follow market is unsuitable; Bootstrap may be configured separately"
@@ -1333,9 +1482,16 @@ def _calculate_smart_defaults(
                     "reason_codes": reason_codes,
                     "bootstrap_suggested": bootstrap_suggested,
                     "bootstrap_reason_codes": list(bootstrap_reason_codes),
+                    "passive_red_setup_available": passive_red_prices is not None,
                 }
             ),
             409,
+        )
+    if passive_red_planning:
+        messages.append(
+            "Passive RED setup uses the current observed two-sided book inside "
+            "the hard price band. This does not approve a live run; the scoped "
+            "RED override and wallet-wide fee guard still apply at Start."
         )
 
     print("\n[SMART_DEFAULTS v2] === Gathering 30 days of market data ===")
@@ -1475,8 +1631,19 @@ def _calculate_smart_defaults(
     quality = analysis.get("data_quality", {})
     risk_level = health.get("risk_level", "moderate")
 
-    orderbook["best_bid"] = market_confidence.trusted_bid or Decimal("0")
-    orderbook["best_ask"] = market_confidence.trusted_ask or Decimal("0")
+    planning_confidence = (
+        replace(
+            market_confidence,
+            data_valid=True,
+            trusted_bid=passive_red_prices[0],
+            trusted_midpoint=passive_red_prices[1],
+            trusted_ask=passive_red_prices[2],
+        )
+        if passive_red_planning
+        else market_confidence
+    )
+    orderbook["best_bid"] = planning_confidence.trusted_bid or Decimal("0")
+    orderbook["best_ask"] = planning_confidence.trusted_ask or Decimal("0")
     orderbook["buy_depth_xch"] = Decimal(
         market_confidence.independent_bid_depth_mojos
     ) / Decimal("1000000000000")
@@ -1495,7 +1662,7 @@ def _calculate_smart_defaults(
         spacescan,
         trades,
         orderbook,
-        market_confidence=market_confidence,
+        market_confidence=planning_confidence,
         messages=messages,
     )
     trusted_mid_price = price_info["mid_price"]
@@ -1937,6 +2104,12 @@ def _calculate_smart_defaults(
         if min_mid > live_price * 0.85:
             min_mid = live_price * 0.85
 
+    # Follow authority checks the observed bid and ask, not only the midpoint.
+    # In a thin book the ask can sit above a rail derived from the midpoint.
+    min_mid, max_mid = _smart_price_rails_for_book(
+        min_mid, max_mid, orderbook.get("best_bid"), orderbook.get("best_ask")
+    )
+
     # ═══ COMPETITOR AWARENESS ═══
     competitor_enabled = True
 
@@ -2085,6 +2258,7 @@ def _calculate_smart_defaults(
     else:
         _fee_target_secs = 120
     _fee_spike_secs = max(30, int(_fee_target_secs / 2))
+    global _LAST_SMART_FEE_ESTIMATE_MOJOS
     try:
         from tx_fees import get_suggested_transaction_fee
 
@@ -2095,15 +2269,37 @@ def _calculate_smart_defaults(
         _fee_est_60 = get_suggested_transaction_fee(
             target_seconds=_fee_spike_secs, cost=35_000_000
         )
+        # Follow must be able to cancel its whole book when stopped. That
+        # shutdown can cost far more than an ordinary CAT spend, so size each
+        # prepared fee coin to cover a fresh one-block cancellation quote.
+        from follow_shutdown_funding import ONE_BLOCK_COST_LIMIT
+
+        _shutdown_fee_est = get_suggested_transaction_fee(
+            target_seconds=300, cost=ONE_BLOCK_COST_LIMIT
+        )
+        _shutdown_fee_xch = (
+            max(0, int(_shutdown_fee_est.get("fee_mojos", 0) or 0)) / 1e12
+            if _shutdown_fee_est.get("available")
+            else 0.0
+        )
         if _fee_est.get("available"):
             _fee_mojos = int(_fee_est.get("fee_mojos", 0) or 0)
             _fee_mojos_60 = int(_fee_est_60.get("fee_mojos", 0) or 0)
             # Use the higher of 60s/120s for headroom — covers congestion spikes
             _peak_fee_mojos = max(_fee_mojos, _fee_mojos_60)
+            if _peak_fee_mojos > 0:
+                _LAST_SMART_FEE_ESTIMATE_MOJOS = _peak_fee_mojos
+            else:
+                _fee_fallback = _LAST_SMART_FEE_ESTIMATE_MOJOS or int(
+                    Decimal(str(getattr(cfg, "FEE_COIN_SIZE_XCH", Decimal("0.001"))))
+                    * Decimal(10**12)
+                    / Decimal(16)
+                )
+                _peak_fee_mojos = max(1, int(_fee_fallback * 1.25))
             _peak_fee_xch = _peak_fee_mojos / 1e12
             # Fee coin must be at least 20x the peak fee so it can recycle ~10 times
             # before a top-up is needed. Hard minimum 0.001 XCH.
-            _fee_coin_raw = max(0.001, _peak_fee_xch * 20)
+            _fee_coin_raw = max(0.001, _peak_fee_xch * 20, _shutdown_fee_xch * 2)
             # Round up to 3 significant figures for cleanliness
             import math as _math
 
@@ -2125,14 +2321,29 @@ def _calculate_smart_defaults(
                 f"→ coin size {_fee_coin_size:.4f} XCH"
             )
         else:
-            # Coinset unavailable — preserve existing values
-            _fee_coin_size = float(getattr(cfg, "FEE_COIN_SIZE_XCH", Decimal("0.001")))
-            _smart_fee_xch = float(
-                getattr(cfg, "TRANSACTION_FEE_XCH", Decimal("0.000001"))
+            # Reuse the last successful estimate with 25% margin. If this
+            # process has not seen a quote yet, infer a conservative estimate
+            # from the configured coin size and the helper's 20x coverage.
+            _fee_fallback = _LAST_SMART_FEE_ESTIMATE_MOJOS or int(
+                Decimal(str(getattr(cfg, "FEE_COIN_SIZE_XCH", Decimal("0.001"))))
+                * Decimal(10**12)
+                / Decimal(16)
             )
+            _peak_fee_mojos = max(1, int(_fee_fallback * 1.25))
+            _smart_fee_xch = _peak_fee_mojos / 1e12
+            messages.append(
+                "Fee estimate unavailable; using cached fee with 25% margin."
+            )
+            _fee_coin_size = float(getattr(cfg, "FEE_COIN_SIZE_XCH", Decimal("0.001")))
     except Exception:
+        _fee_fallback = _LAST_SMART_FEE_ESTIMATE_MOJOS or int(
+            Decimal(str(getattr(cfg, "FEE_COIN_SIZE_XCH", Decimal("0.001"))))
+            * Decimal(10**12)
+            / Decimal(16)
+        )
+        _peak_fee_mojos = max(1, int(_fee_fallback * 1.25))
+        _smart_fee_xch = _peak_fee_mojos / 1e12
         _fee_coin_size = float(getattr(cfg, "FEE_COIN_SIZE_XCH", Decimal("0.001")))
-        _smart_fee_xch = float(getattr(cfg, "TRANSACTION_FEE_XCH", Decimal("0.000001")))
 
     # ═══ Capital Allocation — reserve-first, scales from 1 XCH to thousands ═══
     # Reserve-first: everything sized from what the user is willing to risk.
@@ -2147,17 +2358,65 @@ def _calculate_smart_defaults(
     # Practical minimum: Dexie offers below this aren't worth a taker's fee
     _MIN_OFFER_XCH = 0.005
 
-    # ── Percentage-based pool allocation ──
-    # Fee pool: 3% of available → buy fee coins at Coinset-estimated size.
+    # ── Dedicated fee inventory ──
+    # Plan a week's fee inventory from all safely available XCH. Preserve
+    # principal for at least one minimum XCH offer per configured buy slot;
+    # the helper then reduces fee-coin count if congestion and wallet size make
+    # the full weekly target unaffordable. There is no percentage fee cap.
     # The former AMM sniper pool is retired; bounded opportunity orders reuse
     # ordinary prepared tier coins and are governed by trusted book depth.
-    _FEE_PCT = 0.03
     _SNIPER_PCT = 0.0
     _smart_sniper_size = 0.0
 
-    _fee_pool_target = _avail_xch * _FEE_PCT
-    _fee_prep_count = _smart_fee_prep_count(_avail_xch, _fee_coin_size, _FEE_PCT)
+    _active_offer_target_count = max(
+        1,
+        int(getattr(cfg, "MAX_ACTIVE_BUY_OFFERS", 5) or 5)
+        + int(getattr(cfg, "MAX_ACTIVE_SELL_OFFERS", 5) or 5),
+    )
+    if fills_per_day > 10:
+        _fee_ladder_slot_target = 60
+    elif fills_per_day > 3:
+        _fee_ladder_slot_target = 45
+    elif fills_per_day > 0.5:
+        _fee_ladder_slot_target = 36
+    else:
+        _fee_ladder_slot_target = 24
+    _fee_ladder_slot_capacity = max(0, int(_avail_xch / (_MIN_OFFER_XCH * 2.5)))
+    _fee_ladder_buy_slots = (
+        0
+        if active_sell_only
+        else min(_fee_ladder_slot_target, _fee_ladder_slot_capacity)
+    )
+    _minimum_buy_principal_xch = min(_avail_xch, _MIN_OFFER_XCH * _fee_ladder_buy_slots)
+    _fee_allocatable_xch = max(0.0, _avail_xch - _minimum_buy_principal_xch)
+    _fee_plan = plan_weekly_fee_coins(
+        estimated_fee_mojos=max(1, int(_peak_fee_mojos)),
+        active_offer_target_count=_active_offer_target_count,
+        minimum_coin_size_mojos=int(Decimal(str(_fee_coin_size)) * Decimal(10**12)),
+        allocatable_xch_mojos=max(
+            0,
+            int(Decimal(str(_fee_allocatable_xch)) * Decimal(10**12)),
+        ),
+    )
+    _fee_coin_size = _fee_plan["fee_coin_size_mojos"] / 1e12
+    _fee_prep_count = _fee_plan["fee_coin_count"]
+    # Smart Settings may recommend a smaller weekly pool, but an existing
+    # operator-selected fee inventory remains the floor when it fits after
+    # reserves. This also makes the subsequent ladder sizing account for it.
+    _configured_fee_size = Decimal(str(getattr(cfg, "FEE_COIN_SIZE_XCH", 0) or 0))
+    _configured_fee_count = max(0, int(getattr(cfg, "FEE_PREP_COUNT", 0) or 0))
+    _configured_fee_principal = _configured_fee_size * _configured_fee_count
+    _recommended_fee_principal = Decimal(str(_fee_coin_size)) * _fee_prep_count
+    if (
+        _configured_fee_size > 0
+        and _configured_fee_principal > _recommended_fee_principal
+        and _configured_fee_principal <= Decimal(str(_fee_allocatable_xch))
+    ):
+        _fee_coin_size = float(_configured_fee_size)
+        _fee_prep_count = _configured_fee_count
     _fee_pool_xch = _fee_coin_size * _fee_prep_count
+    _fee_pool_target = _fee_plan["target_fee_coin_principal_mojos"] / 1e12
+    _fee_pool_pct = _fee_pool_xch / _avail_xch if _avail_xch > 0 else 0.0
 
     _smart_sniper_prep = 0
     _sniper_pool_xch = 0.0
@@ -2276,6 +2535,10 @@ def _calculate_smart_defaults(
     # (uses 2.5 as an approximate capital factor before tier selection)
     _max_possible_n = max(2, int(_trading_xch / (_MIN_OFFER_XCH * 2.5)))
     _target_n = min(_market_n, _max_possible_n)
+    if type(target_offers_per_side) is int and target_offers_per_side > 0:
+        # Market activity chooses a default. An explicit user target replaces
+        # that default while the spendable capital calculation still caps it.
+        _target_n = min(target_offers_per_side, _max_possible_n)
 
     # AMM pool-impact caps are retired; the market-confidence layer scales
     # independent order-book depth to configured offer size.
@@ -2495,6 +2758,7 @@ def _calculate_smart_defaults(
                 int(
                     (_xch_units_avail / _CP_HEADROOM_MULT - _BUY_SPARE_OVERHEAD)
                     / max(1e-9, _BUY_TIER_FACTOR)
+                    + 1e-9
                 ),
             )
             _n_buy = max(1, min(_target_n, _n_buy))
@@ -2516,6 +2780,7 @@ def _calculate_smart_defaults(
                     int(
                         (_cat_units_avail / _CP_HEADROOM_MULT - _SPARE_OVERHEAD)
                         / max(1e-9, _TIER_CAPITAL_FACTOR)
+                        + 1e-9
                     ),
                 )
         elif _avail_cat <= 0:
@@ -2530,7 +2795,14 @@ def _calculate_smart_defaults(
             _n_final = max(1, min(_n_buy, _n_sell)) if _n_sell > 0 else max(1, _n_buy)
 
         # Recalculate base size with agreed n (uses the binding constraint).
-        _base_size = max(_MIN_OFFER_XCH, round(_solve_base(_n_final), 4))
+        _base_size = max(
+            _MIN_OFFER_XCH,
+            float(
+                Decimal(str(_solve_base(_n_final))).quantize(
+                    Decimal("0.0001"), rounding=ROUND_DOWN
+                )
+            ),
+        )
 
         # Re-check CAT capacity against the definitive final base_size.
         if (
@@ -2549,6 +2821,7 @@ def _calculate_smart_defaults(
                     int(
                         (_cat_units_avail / _CP_HEADROOM_MULT - _SPARE_OVERHEAD)
                         / max(1e-9, _TIER_CAPITAL_FACTOR)
+                        + 1e-9
                     ),
                 )
         _n_sell_cap = _n_sell  # definitive CAT-backed sell capacity
@@ -2587,7 +2860,7 @@ def _calculate_smart_defaults(
         # config value so coin prep, spares, and active-offer limits are aligned.
         # capital_mult already shrank _trading_xch → smaller per-offer sizes.
         # Combining both: conservative = fewer AND smaller offers.
-        if _rp["max_offers_mult"] != 1.0:
+        if _rp["max_offers_mult"] != 1.0 and target_offers_per_side is None:
             _adj_n = max(1, round(_n_final * _rp["max_offers_mult"]))
             _smart_max_buy = _adj_n
             _smart_max_sell = _adj_n
@@ -2938,7 +3211,7 @@ def _calculate_smart_defaults(
             "available_xch": round(_avail_xch, 4),
             "available_cat": round(_avail_cat, 2),
             "fee_pool_xch": round(_fee_pool_xch, 4),
-            "fee_pct": round(_FEE_PCT * 100, 1),
+            "fee_pct": round(_fee_pool_pct * 100, 1),
             "sniper_pool_xch": round(_sniper_pool_xch, 4),
             "sniper_pct": round(_SNIPER_PCT * 100, 1),
             "trading_xch": round(_trading_xch, 4),
@@ -4217,7 +4490,10 @@ def _calculate_smart_defaults(
             str(getattr(cfg, "MINIMUM_PROFIT_XCH", Decimal("0.0001")))
         ),
     )
-    if not _offer_book_policy["independent_depth_sufficient"]:
+    if (
+        not _offer_book_policy["independent_depth_sufficient"]
+        and not passive_red_planning
+    ):
         return (
             jsonify(
                 {
@@ -4315,6 +4591,7 @@ def _calculate_smart_defaults(
         "market_risk_preset": _risk_profile_name,
         "market_confidence": market_confidence.state,
         "market_data_valid": market_confidence.data_valid,
+        "passive_red_setup": passive_red_planning,
         "market_provider_redundancy": market_confidence.provider_redundancy,
         "market_follow_capacity_fraction": str(
             market_confidence.follow_capacity_fraction
@@ -4865,4 +5142,5 @@ def _calculate_smart_defaults(
     except Exception as _mp_err:
         print(f"[SMART_DEFAULTS] Max position consistency clamp skipped: {_mp_err}")
 
+    _reconcile_smart_fee_inventory(result, _avail_xch)
     return jsonify(result)

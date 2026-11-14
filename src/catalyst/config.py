@@ -19,9 +19,22 @@ trading-loop writes stay consistent.
 import os
 import sys
 import threading
+import time
 from decimal import Decimal, InvalidOperation
 from urllib.parse import urlparse
 from dotenv import dotenv_values, load_dotenv, set_key
+
+
+def _set_key_with_windows_retry(path: str, key: str, value: str) -> None:
+    """Retry transient Windows sharing failures during dotenv's atomic replace."""
+    for attempt in range(6):
+        try:
+            set_key(path, key, value)
+            return
+        except PermissionError:
+            if os.name != "nt" or attempt == 5:
+                raise
+            time.sleep(0.05 * (attempt + 1))
 
 
 # Splash remains an optional publication path in this beta. The release fence
@@ -333,6 +346,9 @@ class Config:
         if _liquidity_mode_raw not in ("two_sided", "buy_only", "sell_only"):
             _liquidity_mode_raw = "two_sided"
         self.LIQUIDITY_MODE = _liquidity_mode_raw
+        # User's saved choice to quote passive ladders in a thin RED market.
+        # The live wallet/run authority and price evidence remain separate.
+        self.THIN_MARKET_ENABLED = _bool("THIN_MARKET_ENABLED", False)
         # Read the raw ENABLE flags, then override if LIQUIDITY_MODE pins
         # a single side. A misconfigured env (e.g. mode=buy_only with
         # ENABLE_BUY=False) always resolves in favour of LIQUIDITY_MODE
@@ -983,6 +999,7 @@ class Config:
         self.SPLASH_RECEIVE_MAX_BACKLOG = _int("SPLASH_RECEIVE_MAX_BACKLOG", 250)
         self.SPLASH_BINARY_PATH = _str("SPLASH_BINARY_PATH", "")
         self.SPLASH_P2P_PORT = _int("SPLASH_P2P_PORT", 11511)
+        self.SPLASH_KNOWN_PEER = _str("SPLASH_KNOWN_PEER", "").strip()
         self.SPLASH_AUTO_START = _bool("SPLASH_AUTO_START", True)
         self.SPLASH_TESTNET = _bool("SPLASH_TESTNET", False)
 
@@ -1061,6 +1078,7 @@ class Config:
         "ENABLE_BUY",
         "ENABLE_SELL",
         "LIQUIDITY_MODE",
+        "THIN_MARKET_ENABLED",
         "LOOP_SECONDS",
         "MIN_TRADE_XCH",
         "MAX_TRADE_XCH",
@@ -1485,7 +1503,7 @@ class Config:
                 }
 
                 # Write to .env file
-                set_key(_ENV_PATH, key, value)
+                _set_key_with_windows_retry(_ENV_PATH, key, value)
 
                 # Reload all settings from disk (RLock re-entry is fine)
                 self.reload()
@@ -1576,7 +1594,7 @@ class Config:
                     disk_values = {}
                 old_value = str(disk_values.get(key, getattr(self, key, "")))
 
-                set_key(_ENV_PATH, key, value)
+                _set_key_with_windows_retry(_ENV_PATH, key, value)
                 self._pending_restart_changes = True
                 self._pending_restart_keys.add(key)
 

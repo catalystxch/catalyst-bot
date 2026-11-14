@@ -164,6 +164,63 @@ class TestCheckResume(_TempDB):
         resp = self._check([])
         self.assertFalse(resp.get_json().get("can_resume"))
 
+    def test_zero_offer_saved_approved_run_requests_safe_auto_resume(self):
+        """An approved continuous run can restart after a fresh empty book read."""
+        from config import cfg
+        from follow_restart_intent import bind_follow_restart_intent
+
+        identity = {
+            "network": "mainnet",
+            "wallet_type": "sage",
+            "wallet_fingerprint": 123,
+            "wallet_id": 2,
+            "xch_wallet_id": 1,
+            "asset_id": _FAKE_ASSET,
+        }
+        scope = {
+            "identity": identity,
+            "configuration_sha256": "c" * 64,
+        }
+        run_id = "d" * 64
+        intent = bind_follow_restart_intent(
+            run_id=run_id,
+            identity=identity,
+            configuration_sha256=scope["configuration_sha256"],
+            now_epoch=1234,
+        )
+        with (
+            patch("api_server.bot", None),
+            patch.object(cfg, "CAT_ASSET_ID", _FAKE_ASSET),
+            patch("api_server._fresh_start_is_set", return_value=False),
+            patch("chia_node.is_startup_authorised", return_value=True),
+            patch("wallet.get_all_offers", return_value=[]),
+            patch("wallet.classify_offers_from_list", return_value=([], [], [])),
+            patch("wallet.preflight_wallet_identity", return_value={"success": True}),
+            patch(
+                "wallet.get_wallet_sync_status",
+                return_value={
+                    "reachable": True,
+                    "synced": True,
+                    "sync_state": "synced",
+                },
+            ),
+            patch("wallet.get_pending_transactions", return_value=[]),
+            patch(
+                "follow_principal.reviewed_follow_start_readiness",
+                return_value={"ready": True, "run_id": run_id, "scope": scope},
+            ),
+            patch(
+                "follow_restart_intent.read_follow_restart_intent", return_value=intent
+            ),
+        ):
+            body = self._get("/api/check-resume", environ_base=_LOOPBACK).get_json()
+
+        self.assertFalse(body["can_resume"])
+        self.assertFalse(body["has_session"])
+        self.assertTrue(body["auto_resume_requested"])
+        self.assertTrue(body["automatic_resume_pending"])
+        self.assertEqual(body["offer_count"], 0)
+
     def test_check_returns_200(self):
         resp = self._check([])
         self.assertEqual(resp.status_code, 200)
@@ -243,7 +300,7 @@ class TestResumePath(_TempDB):
 
 @unittest.skipIf(_SKIP is not None, f"modules unavailable: {_SKIP}")
 class TestFreshStartPath(_TempDB):
-    """fresh-start must clear session data from DB and set the flag."""
+    """fresh-start opens a new session while preserving durable history."""
 
     def _fresh_start(self):
         return self.client.post(
@@ -256,13 +313,24 @@ class TestFreshStartPath(_TempDB):
         resp = self._fresh_start()
         self.assertTrue(resp.get_json().get("success"))
 
+    def test_fresh_start_requires_open_offers_to_be_cancelled(self):
+        with patch(
+            "blueprints.session.get_open_offers", return_value=[{"trade_id": "live"}]
+        ):
+            resp = self._fresh_start()
+        self.assertEqual(resp.status_code, 409)
+        self.assertEqual(
+            resp.get_json().get("reason"), "OPEN_OFFERS_REQUIRE_CANCELLATION"
+        )
+        self.assertFalse(api_server._fresh_start_is_set())
+
     def test_fresh_start_preserves_authoritative_fills(self):
-        """Task 9 fill history makes the broad fresh reset fail closed."""
+        """Historical fills remain available to position and proof checks."""
         self._seed_fill()
         self.assertEqual(self._fill_count(), 1)
         resp = self._fresh_start()
-        self.assertEqual(resp.status_code, 409)
-        self.assertFalse(resp.get_json().get("success"))
+        self.assertEqual(resp.status_code, 200)
+        self.assertTrue(resp.get_json().get("success"))
         self.assertEqual(self._fill_count(), 1)
 
     def test_fresh_start_sets_flag(self):
@@ -285,11 +353,11 @@ class TestFreshStartPath(_TempDB):
         self.assertFalse(resp.get_json().get("can_resume"))
 
     def test_response_reports_no_authoritative_fills_cleared(self):
-        """A refused reset reports that no authoritative fills were deleted."""
+        """A fresh session reports that no authoritative fills were deleted."""
         self._seed_fill()
         resp = self._fresh_start()
         body = resp.get_json()
-        self.assertEqual(resp.status_code, 409)
+        self.assertEqual(resp.status_code, 200)
         self.assertEqual(body.get("fills_cleared"), 0)
         self.assertEqual(self._fill_count(), 1)
 

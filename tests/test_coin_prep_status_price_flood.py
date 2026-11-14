@@ -282,6 +282,12 @@ def test_start_bot_gate_fetches_fresh_price_when_cache_empty(monkeypatch):
         "_enforce_post_tibet_start_migration",
         lambda _asset_id: {"can_start": True, "reason_code": "MIGRATION_COMPLETE"},
     )
+    # Fresh-price behavior is downstream of the separately tested native review.
+    monkeypatch.setattr(
+        bot_blueprint,
+        "_reviewed_follow_start_readiness",
+        lambda *_a, **_kw: {"ready": True},
+    )
 
     assert coin_manager.get_tier_sizes_mojos_from_cfg(is_cat=False)
     assert coin_manager.get_tier_sizes_mojos_from_cfg(is_cat=True)

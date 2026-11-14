@@ -33,6 +33,8 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 
+from follow_run_terms import CONTINUOUS_RUN_EXPIRY
+
 
 # ---------------------------------------------------------------------------
 # Coin ID normalization — Sage returns without 0x, DB stores with 0x
@@ -335,7 +337,11 @@ def _authority_sql_wallet_resolution_shape(outcome: Any, evidence_json: Any) -> 
         return int(
             outcome == "RELEASED_NO_EFFECT"
             and evidence.get("effect_attempted") is False
-            and evidence.get("reason_code") == "PRE_DISPATCH_RETRY_CONTRACT_COLLISION"
+            and evidence.get("reason_code")
+            in {
+                "PRE_DISPATCH_RETRY_CONTRACT_COLLISION",
+                "PRE_DISPATCH_PREP_NO_EFFECT_CONFIRMED",
+            }
             and type(evidence.get("authority_sha256")) is str
             and re.fullmatch(r"[0-9a-f]{64}", evidence["authority_sha256"]) is not None
             and type(evidence.get("adapter_operation")) is str
@@ -1736,6 +1742,23 @@ CREATE TABLE IF NOT EXISTS fee_approvals (
               AND cancellation_reserve_mojos<=total_fee_mojos),
     UNIQUE(scope_sha256, version)
 );
+-- New policy is an immutable property of an approval. Older rows have no
+-- marker and therefore retain their original bounded semantics.
+CREATE TABLE IF NOT EXISTS unbounded_fee_approvals (
+    approval_id TEXT PRIMARY KEY NOT NULL REFERENCES fee_approvals(approval_id)
+);
+CREATE TRIGGER IF NOT EXISTS unbounded_fee_approvals_no_update
+BEFORE UPDATE ON unbounded_fee_approvals BEGIN
+    SELECT RAISE(ABORT, 'unbounded fee approvals are immutable');
+END;
+CREATE TRIGGER IF NOT EXISTS unbounded_fee_approvals_no_delete
+BEFORE DELETE ON unbounded_fee_approvals BEGIN
+    SELECT RAISE(ABORT, 'unbounded fee approvals are immutable');
+END;
+CREATE TRIGGER IF NOT EXISTS unbounded_fee_approvals_no_replace
+BEFORE INSERT ON unbounded_fee_approvals
+WHEN EXISTS (SELECT 1 FROM unbounded_fee_approvals WHERE approval_id=NEW.approval_id)
+BEGIN SELECT RAISE(ABORT, 'unbounded fee approvals are append-only'); END;
 CREATE TABLE IF NOT EXISTS approved_fee_reservations (
     operation_id TEXT PRIMARY KEY NOT NULL
         CHECK((length(operation_id)=64 AND operation_id NOT GLOB '*[^0-9a-f]*')
@@ -1862,15 +1885,40 @@ AND NOT EXISTS (
     SELECT 1
     FROM approved_fee_reservations AS reservation
     JOIN offer_cancel_cohort_manifests AS manifest
-      ON reservation.operation_id=catalyst_sha256(
-          'coin-prep-cancel:' || manifest.cohort_id
-      )
+      ON reservation.cancellation=1
     WHERE reservation.operation_id=NEW.operation_id
-      AND reservation.cancellation=1
       AND catalyst_sha256(NEW.evidence_json)=NEW.evidence_id
       AND json_extract(NEW.evidence_json, '$.schema_version')=1
-      AND json_extract(NEW.evidence_json, '$.kind')=
-          'coin_prep_cancellation_fee_outcome'
+      AND (
+          (
+              json_extract(NEW.evidence_json, '$.kind')=
+                  'coin_prep_cancellation_fee_outcome'
+              AND reservation.operation_id=catalyst_sha256(
+                  'coin-prep-cancel:' || manifest.cohort_id
+              )
+          )
+          OR (
+              json_extract(NEW.evidence_json, '$.kind')=
+                  'follow_cancellation_fee_outcome'
+              AND EXISTS (
+                  SELECT 1 FROM follow_run_authorities AS run
+                  WHERE run.run_id=json_extract(
+                      NEW.evidence_json, '$.follow_run_id'
+                  )
+                    AND (
+                        run.approval_id=reservation.approval_id
+                        OR EXISTS (
+                            SELECT 1 FROM follow_fee_ceiling_revisions AS revision
+                            WHERE revision.run_id=run.run_id
+                              AND revision.approval_id=reservation.approval_id
+                        )
+                    )
+                    AND reservation.operation_id=catalyst_sha256(
+                        'follow-cancel:' || run.run_id || ':' || manifest.cohort_id
+                    )
+              )
+          )
+      )
       AND json_extract(NEW.evidence_json, '$.state')=NEW.state
       AND json_extract(NEW.evidence_json, '$.operation_id')=NEW.operation_id
       AND json_extract(NEW.evidence_json, '$.cohort_id')=manifest.cohort_id
@@ -1931,7 +1979,24 @@ AND NOT EXISTS (
                      OR (
                          terminal.phase='RECONCILED'
                          AND terminal.outcome='CANCEL_FAILED'
-                         AND terminal.reason_code='SAGE_RELAY_REJECTED'
+                         AND (
+                             terminal.reason_code='SAGE_RELAY_REJECTED'
+                             OR (
+                                 terminal.reason_code='FOLLOW_PREDISPATCH_NO_EFFECT'
+                                 AND json_extract(
+                                     terminal.evidence_json, '$.effect_attempted'
+                                 )=0
+                                 AND json_type(
+                                     terminal.evidence_json, '$.wallet_evidence'
+                                 )='object'
+                                 AND json_extract(
+                                     terminal.evidence_json,
+                                     '$.wallet_evidence_sha256'
+                                 )=catalyst_sha256(json_extract(
+                                     terminal.evidence_json, '$.wallet_evidence'
+                                 ))
+                             )
+                         )
                          AND terminal.blocks_mutation=0
                      )
                  )
@@ -2024,6 +2089,293 @@ WHEN NOT EXISTS (
 )
 BEGIN
     SELECT RAISE(ABORT, 'fee consent lacks matching current preview');
+END;
+
+-- A reviewed Follow run owns one immutable financial scope across restarts.
+-- This row is authority metadata, never by itself a wallet dispatch permit.
+CREATE TABLE IF NOT EXISTS follow_run_reviews (
+    review_id TEXT PRIMARY KEY NOT NULL
+        CHECK(length(review_id)=64 AND review_id NOT GLOB '*[^0-9a-f]*'),
+    review_sha256 TEXT NOT NULL
+        CHECK(length(review_sha256)=64 AND review_sha256 NOT GLOB '*[^0-9a-f]*'),
+    approval_id TEXT NOT NULL REFERENCES coin_prep_fee_consents(approval_id),
+    identity_sha256 TEXT NOT NULL
+        CHECK(length(identity_sha256)=64 AND identity_sha256 NOT GLOB '*[^0-9a-f]*'),
+    identity_json TEXT NOT NULL CHECK(json_valid(identity_json) AND json_type(identity_json)='object'),
+    configuration_sha256 TEXT NOT NULL
+        CHECK(length(configuration_sha256)=64 AND configuration_sha256 NOT GLOB '*[^0-9a-f]*'),
+    principal_review_sha256 TEXT NOT NULL
+        CHECK(length(principal_review_sha256)=64 AND principal_review_sha256 NOT GLOB '*[^0-9a-f]*'),
+    buy_limit INTEGER NOT NULL CHECK(typeof(buy_limit)='integer' AND buy_limit>0),
+    sell_limit INTEGER NOT NULL CHECK(typeof(sell_limit)='integer' AND sell_limit>0),
+    started_at_epoch INTEGER NOT NULL CHECK(typeof(started_at_epoch)='integer' AND started_at_epoch>=0),
+    expires_at_epoch INTEGER NOT NULL CHECK(typeof(expires_at_epoch)='integer' AND expires_at_epoch>started_at_epoch),
+    maximum_fee_mojos INTEGER NOT NULL CHECK(typeof(maximum_fee_mojos)='integer' AND maximum_fee_mojos>=0),
+    protected_shutdown_fee_mojos INTEGER NOT NULL
+        CHECK(typeof(protected_shutdown_fee_mojos)='integer'
+              AND protected_shutdown_fee_mojos>0
+              AND protected_shutdown_fee_mojos<=maximum_fee_mojos),
+    review_expires_at_epoch INTEGER NOT NULL
+        CHECK(typeof(review_expires_at_epoch)='integer'
+              AND review_expires_at_epoch>started_at_epoch)
+);
+CREATE TRIGGER IF NOT EXISTS follow_run_reviews_no_update
+BEFORE UPDATE ON follow_run_reviews BEGIN
+    SELECT RAISE(ABORT, 'Follow run review is immutable');
+END;
+CREATE TRIGGER IF NOT EXISTS follow_run_reviews_no_delete
+BEFORE DELETE ON follow_run_reviews BEGIN
+    SELECT RAISE(ABORT, 'Follow run review is immutable');
+END;
+CREATE TRIGGER IF NOT EXISTS follow_run_reviews_identity_guard
+BEFORE INSERT ON follow_run_reviews
+WHEN catalyst_sha256(NEW.identity_json) IS NOT NEW.identity_sha256
+BEGIN SELECT RAISE(ABORT, 'Follow review identity mismatch'); END;
+CREATE TABLE IF NOT EXISTS follow_run_authorities (
+    run_id TEXT PRIMARY KEY NOT NULL
+        CHECK(length(run_id)=64 AND run_id NOT GLOB '*[^0-9a-f]*'),
+    consent_id TEXT UNIQUE NOT NULL REFERENCES follow_run_reviews(review_id)
+        CHECK(length(consent_id)=64 AND consent_id NOT GLOB '*[^0-9a-f]*'),
+    approval_id TEXT NOT NULL REFERENCES coin_prep_fee_consents(approval_id),
+    identity_sha256 TEXT NOT NULL
+        CHECK(length(identity_sha256)=64 AND identity_sha256 NOT GLOB '*[^0-9a-f]*'),
+    identity_json TEXT NOT NULL CHECK(json_valid(identity_json) AND json_type(identity_json)='object'),
+    configuration_sha256 TEXT NOT NULL
+        CHECK(length(configuration_sha256)=64 AND configuration_sha256 NOT GLOB '*[^0-9a-f]*'),
+    principal_review_sha256 TEXT NOT NULL
+        CHECK(length(principal_review_sha256)=64 AND principal_review_sha256 NOT GLOB '*[^0-9a-f]*'),
+    buy_limit INTEGER NOT NULL CHECK(typeof(buy_limit)='integer' AND buy_limit>0),
+    sell_limit INTEGER NOT NULL CHECK(typeof(sell_limit)='integer' AND sell_limit>0),
+    started_at_epoch INTEGER NOT NULL CHECK(typeof(started_at_epoch)='integer' AND started_at_epoch>=0),
+    expires_at_epoch INTEGER NOT NULL CHECK(typeof(expires_at_epoch)='integer' AND expires_at_epoch>started_at_epoch),
+    maximum_fee_mojos INTEGER NOT NULL CHECK(typeof(maximum_fee_mojos)='integer' AND maximum_fee_mojos>=0),
+    protected_shutdown_fee_mojos INTEGER NOT NULL
+        CHECK(typeof(protected_shutdown_fee_mojos)='integer'
+              AND protected_shutdown_fee_mojos>0
+              AND protected_shutdown_fee_mojos<=maximum_fee_mojos)
+);
+CREATE INDEX IF NOT EXISTS idx_follow_run_authorities_identity
+    ON follow_run_authorities(identity_sha256, started_at_epoch DESC);
+CREATE INDEX IF NOT EXISTS idx_follow_run_authorities_approval
+    ON follow_run_authorities(approval_id);
+CREATE TRIGGER IF NOT EXISTS follow_run_authorities_no_update
+BEFORE UPDATE ON follow_run_authorities BEGIN
+    SELECT RAISE(ABORT, 'Follow run authority is immutable');
+END;
+CREATE TRIGGER IF NOT EXISTS follow_run_authorities_no_delete
+BEFORE DELETE ON follow_run_authorities BEGIN
+    SELECT RAISE(ABORT, 'Follow run authority is immutable');
+END;
+CREATE TRIGGER IF NOT EXISTS follow_run_authorities_identity_guard
+BEFORE INSERT ON follow_run_authorities
+WHEN catalyst_sha256(NEW.identity_json) IS NOT NEW.identity_sha256
+BEGIN SELECT RAISE(ABORT, 'Follow run identity mismatch'); END;
+CREATE TABLE IF NOT EXISTS follow_run_reapprovals (
+    run_id TEXT NOT NULL REFERENCES follow_run_authorities(run_id),
+    review_id TEXT PRIMARY KEY NOT NULL REFERENCES follow_run_reviews(review_id),
+    prior_principal_sha256 TEXT NOT NULL
+        CHECK(length(prior_principal_sha256)=64 AND prior_principal_sha256 NOT GLOB '*[^0-9a-f]*'),
+    principal_review_sha256 TEXT NOT NULL
+        CHECK(length(principal_review_sha256)=64 AND principal_review_sha256 NOT GLOB '*[^0-9a-f]*'),
+    confirmed_at_epoch INTEGER NOT NULL
+        CHECK(typeof(confirmed_at_epoch)='integer' AND confirmed_at_epoch>=0)
+);
+CREATE TRIGGER IF NOT EXISTS follow_run_reapprovals_no_update
+BEFORE UPDATE ON follow_run_reapprovals BEGIN
+    SELECT RAISE(ABORT, 'Follow reapproval is immutable');
+END;
+CREATE TRIGGER IF NOT EXISTS follow_run_reapprovals_no_delete
+BEFORE DELETE ON follow_run_reapprovals BEGIN
+    SELECT RAISE(ABORT, 'Follow reapproval is immutable');
+END;
+CREATE TABLE IF NOT EXISTS follow_run_stops (
+    run_id TEXT PRIMARY KEY NOT NULL REFERENCES follow_run_authorities(run_id),
+    stopped_at_epoch INTEGER NOT NULL
+        CHECK(typeof(stopped_at_epoch)='integer' AND stopped_at_epoch>=0)
+);
+CREATE TRIGGER IF NOT EXISTS follow_run_stops_no_update
+BEFORE UPDATE ON follow_run_stops BEGIN
+    SELECT RAISE(ABORT, 'Follow run stop is immutable');
+END;
+CREATE TRIGGER IF NOT EXISTS follow_run_stops_no_delete
+BEFORE DELETE ON follow_run_stops BEGIN
+    SELECT RAISE(ABORT, 'Follow run stop is immutable');
+END;
+CREATE TABLE IF NOT EXISTS follow_fee_ceiling_reviews (
+    review_id TEXT PRIMARY KEY NOT NULL
+        CHECK(length(review_id)=64 AND review_id NOT GLOB '*[^0-9a-f]*'),
+    review_sha256 TEXT NOT NULL
+        CHECK(length(review_sha256)=64 AND review_sha256 NOT GLOB '*[^0-9a-f]*'),
+    run_id TEXT NOT NULL REFERENCES follow_run_authorities(run_id),
+    identity_sha256 TEXT NOT NULL
+        CHECK(length(identity_sha256)=64 AND identity_sha256 NOT GLOB '*[^0-9a-f]*'),
+    scope_sha256 TEXT NOT NULL
+        CHECK(length(scope_sha256)=64 AND scope_sha256 NOT GLOB '*[^0-9a-f]*'),
+    plan_sha256 TEXT NOT NULL
+        CHECK(length(plan_sha256)=64 AND plan_sha256 NOT GLOB '*[^0-9a-f]*'),
+    configuration_sha256 TEXT NOT NULL
+        CHECK(length(configuration_sha256)=64 AND configuration_sha256 NOT GLOB '*[^0-9a-f]*'),
+    prior_revision INTEGER NOT NULL CHECK(typeof(prior_revision)='integer' AND prior_revision>=0),
+    prior_maximum_fee_mojos INTEGER NOT NULL CHECK(typeof(prior_maximum_fee_mojos)='integer' AND prior_maximum_fee_mojos>0),
+    proposed_maximum_fee_mojos INTEGER NOT NULL CHECK(typeof(proposed_maximum_fee_mojos)='integer' AND proposed_maximum_fee_mojos>0),
+    protected_shutdown_fee_mojos INTEGER NOT NULL CHECK(typeof(protected_shutdown_fee_mojos)='integer' AND protected_shutdown_fee_mojos>0),
+    observed_fee_principal_mojos INTEGER NOT NULL CHECK(typeof(observed_fee_principal_mojos)='integer' AND observed_fee_principal_mojos>=0),
+    reviewed_spent_fee_mojos INTEGER NOT NULL CHECK(typeof(reviewed_spent_fee_mojos)='integer' AND reviewed_spent_fee_mojos>=0),
+    reviewed_held_fee_mojos INTEGER NOT NULL CHECK(typeof(reviewed_held_fee_mojos)='integer' AND reviewed_held_fee_mojos>=0),
+    reviewed_at_epoch INTEGER NOT NULL CHECK(typeof(reviewed_at_epoch)='integer' AND reviewed_at_epoch>=0),
+    expires_at_epoch INTEGER NOT NULL CHECK(typeof(expires_at_epoch)='integer' AND expires_at_epoch>reviewed_at_epoch)
+);
+CREATE TRIGGER IF NOT EXISTS follow_fee_ceiling_reviews_no_update
+BEFORE UPDATE ON follow_fee_ceiling_reviews BEGIN
+    SELECT RAISE(ABORT, 'Follow fee ceiling review is immutable');
+END;
+CREATE TRIGGER IF NOT EXISTS follow_fee_ceiling_reviews_no_delete
+BEFORE DELETE ON follow_fee_ceiling_reviews BEGIN
+    SELECT RAISE(ABORT, 'Follow fee ceiling review is immutable');
+END;
+CREATE TABLE IF NOT EXISTS follow_fee_ceiling_revisions (
+    run_id TEXT NOT NULL REFERENCES follow_run_authorities(run_id),
+    revision INTEGER NOT NULL CHECK(typeof(revision)='integer' AND revision>=1),
+    review_id TEXT UNIQUE NOT NULL REFERENCES follow_fee_ceiling_reviews(review_id),
+    approval_id TEXT UNIQUE NOT NULL REFERENCES fee_approvals(approval_id),
+    maximum_fee_mojos INTEGER NOT NULL CHECK(typeof(maximum_fee_mojos)='integer' AND maximum_fee_mojos>0),
+    protected_shutdown_fee_mojos INTEGER NOT NULL CHECK(typeof(protected_shutdown_fee_mojos)='integer' AND protected_shutdown_fee_mojos>0),
+    confirmed_at_epoch INTEGER NOT NULL CHECK(typeof(confirmed_at_epoch)='integer' AND confirmed_at_epoch>=0),
+    PRIMARY KEY(run_id, revision)
+);
+CREATE TRIGGER IF NOT EXISTS follow_fee_ceiling_revisions_binding_guard
+BEFORE INSERT ON follow_fee_ceiling_revisions
+WHEN NOT EXISTS (
+    SELECT 1 FROM follow_fee_ceiling_reviews AS review
+    JOIN follow_run_authorities AS run ON run.run_id=review.run_id
+    JOIN fee_approvals AS initial ON initial.approval_id=run.approval_id
+    JOIN fee_approvals AS revised ON revised.approval_id=NEW.approval_id
+    WHERE review.review_id=NEW.review_id AND review.run_id=NEW.run_id
+      AND review.prior_revision+1=NEW.revision
+      AND review.proposed_maximum_fee_mojos=NEW.maximum_fee_mojos
+      AND review.protected_shutdown_fee_mojos=NEW.protected_shutdown_fee_mojos
+      AND review.scope_sha256=initial.scope_sha256
+      AND review.plan_sha256=initial.plan_sha256
+      AND review.identity_sha256=run.identity_sha256
+      AND review.configuration_sha256=run.configuration_sha256
+      AND revised.scope_sha256=initial.scope_sha256
+      AND revised.plan_sha256=initial.plan_sha256
+      AND revised.total_fee_mojos=NEW.maximum_fee_mojos
+      AND revised.cancellation_reserve_mojos>=NEW.protected_shutdown_fee_mojos
+      AND NEW.confirmed_at_epoch>=review.reviewed_at_epoch
+      AND NEW.confirmed_at_epoch<review.expires_at_epoch
+)
+BEGIN SELECT RAISE(ABORT, 'Follow fee ceiling revision binding mismatch'); END;
+CREATE TRIGGER IF NOT EXISTS follow_fee_ceiling_revisions_no_update
+BEFORE UPDATE ON follow_fee_ceiling_revisions BEGIN
+    SELECT RAISE(ABORT, 'Follow fee ceiling revision is immutable');
+END;
+CREATE TRIGGER IF NOT EXISTS follow_fee_ceiling_revisions_no_delete
+BEFORE DELETE ON follow_fee_ceiling_revisions BEGIN
+    SELECT RAISE(ABORT, 'Follow fee ceiling revision is immutable');
+END;
+
+-- A fee-prep RBF rescue is a separate, one-shot wallet effect. The original
+-- prep contract remains immutable even if its replacement wins on-chain.
+CREATE TABLE IF NOT EXISTS coin_prep_rbf_attempts (
+    attempt_id TEXT PRIMARY KEY NOT NULL CHECK(length(attempt_id)=64),
+    operation_id TEXT NOT NULL,
+    original_transaction_id TEXT NOT NULL CHECK(length(original_transaction_id)=64),
+    unsigned_sha256 TEXT NOT NULL CHECK(length(unsigned_sha256)=64),
+    review_sha256 TEXT NOT NULL CHECK(length(review_sha256)=64),
+    fee_mojos INTEGER NOT NULL CHECK(fee_mojos>=10000000),
+    original_outputs_json TEXT NOT NULL CHECK(json_valid(original_outputs_json)),
+    successor_outputs_json TEXT NOT NULL CHECK(json_valid(successor_outputs_json)),
+    wallet_identity_sha256 TEXT NOT NULL CHECK(length(wallet_identity_sha256)=64),
+    latch_generation INTEGER NOT NULL CHECK(latch_generation>=1),
+    reviewed_at TEXT NOT NULL,
+    review_expires_at TEXT NOT NULL
+);
+CREATE TRIGGER IF NOT EXISTS coin_prep_rbf_attempts_no_update
+BEFORE UPDATE ON coin_prep_rbf_attempts BEGIN
+    SELECT RAISE(ABORT, 'coin prep RBF attempt is immutable');
+END;
+CREATE TRIGGER IF NOT EXISTS coin_prep_rbf_attempts_no_delete
+BEFORE DELETE ON coin_prep_rbf_attempts BEGIN
+    SELECT RAISE(ABORT, 'coin prep RBF attempt is immutable');
+END;
+CREATE TABLE IF NOT EXISTS coin_prep_rbf_sign_intents (
+    attempt_id TEXT PRIMARY KEY NOT NULL
+        REFERENCES coin_prep_rbf_attempts(attempt_id),
+    operation_id TEXT NOT NULL,
+    lease_version INTEGER NOT NULL CHECK(lease_version>=1),
+    owner_run_id TEXT NOT NULL,
+    started_at TEXT NOT NULL
+);
+CREATE TRIGGER IF NOT EXISTS coin_prep_rbf_sign_intents_no_update
+BEFORE UPDATE ON coin_prep_rbf_sign_intents BEGIN
+    SELECT RAISE(ABORT, 'coin prep RBF sign intent is immutable');
+END;
+CREATE TRIGGER IF NOT EXISTS coin_prep_rbf_sign_intents_no_delete
+BEFORE DELETE ON coin_prep_rbf_sign_intents BEGIN
+    SELECT RAISE(ABORT, 'coin prep RBF sign intent is immutable');
+END;
+CREATE TABLE IF NOT EXISTS coin_prep_rbf_sign_owners (
+    attempt_id TEXT PRIMARY KEY NOT NULL
+        REFERENCES coin_prep_rbf_sign_intents(attempt_id),
+    owner_pid INTEGER NOT NULL CHECK(owner_pid>0),
+    owner_host TEXT NOT NULL,
+    lease_acquired_at TEXT NOT NULL
+);
+CREATE TRIGGER IF NOT EXISTS coin_prep_rbf_sign_owners_no_update
+BEFORE UPDATE ON coin_prep_rbf_sign_owners BEGIN
+    SELECT RAISE(ABORT, 'coin prep RBF signer identity is immutable');
+END;
+CREATE TRIGGER IF NOT EXISTS coin_prep_rbf_sign_owners_no_delete
+BEFORE DELETE ON coin_prep_rbf_sign_owners BEGIN
+    SELECT RAISE(ABORT, 'coin prep RBF signer identity is immutable');
+END;
+CREATE TABLE IF NOT EXISTS coin_prep_rbf_sign_no_submit (
+    attempt_id TEXT PRIMARY KEY NOT NULL
+        REFERENCES coin_prep_rbf_sign_intents(attempt_id),
+    receipt_json TEXT NOT NULL CHECK(json_valid(receipt_json)),
+    receipt_sha256 TEXT NOT NULL CHECK(length(receipt_sha256)=64),
+    recorded_at TEXT NOT NULL
+);
+CREATE TRIGGER IF NOT EXISTS coin_prep_rbf_sign_no_submit_no_update
+BEFORE UPDATE ON coin_prep_rbf_sign_no_submit BEGIN
+    SELECT RAISE(ABORT, 'coin prep RBF no-submit receipt is immutable');
+END;
+CREATE TRIGGER IF NOT EXISTS coin_prep_rbf_sign_no_submit_no_delete
+BEFORE DELETE ON coin_prep_rbf_sign_no_submit BEGIN
+    SELECT RAISE(ABORT, 'coin prep RBF no-submit receipt is immutable');
+END;
+CREATE TABLE IF NOT EXISTS coin_prep_rbf_dispatches (
+    attempt_id TEXT PRIMARY KEY NOT NULL
+        REFERENCES coin_prep_rbf_attempts(attempt_id),
+    operation_id TEXT NOT NULL UNIQUE,
+    lease_version INTEGER NOT NULL CHECK(lease_version>=1),
+    owner_run_id TEXT NOT NULL,
+    started_at TEXT NOT NULL
+);
+CREATE TRIGGER IF NOT EXISTS coin_prep_rbf_dispatches_no_update
+BEFORE UPDATE ON coin_prep_rbf_dispatches BEGIN
+    SELECT RAISE(ABORT, 'coin prep RBF dispatch is immutable');
+END;
+CREATE TRIGGER IF NOT EXISTS coin_prep_rbf_dispatches_no_delete
+BEFORE DELETE ON coin_prep_rbf_dispatches BEGIN
+    SELECT RAISE(ABORT, 'coin prep RBF dispatch is immutable');
+END;
+CREATE TABLE IF NOT EXISTS coin_prep_rbf_resolutions (
+    attempt_id TEXT PRIMARY KEY NOT NULL
+        REFERENCES coin_prep_rbf_attempts(attempt_id),
+    winner TEXT NOT NULL CHECK(winner IN ('ORIGINAL','SUCCESSOR')),
+    winner_transaction_id TEXT NOT NULL CHECK(length(winner_transaction_id)=64),
+    outcome_evidence_sha256 TEXT NOT NULL CHECK(length(outcome_evidence_sha256)=64),
+    resolved_at TEXT NOT NULL
+);
+CREATE TRIGGER IF NOT EXISTS coin_prep_rbf_resolutions_no_update
+BEFORE UPDATE ON coin_prep_rbf_resolutions BEGIN
+    SELECT RAISE(ABORT, 'coin prep RBF resolution is immutable');
+END;
+CREATE TRIGGER IF NOT EXISTS coin_prep_rbf_resolutions_no_delete
+BEFORE DELETE ON coin_prep_rbf_resolutions BEGIN
+    SELECT RAISE(ABORT, 'coin prep RBF resolution is immutable');
 END;
 """
 
@@ -2268,6 +2620,56 @@ CREATE TRIGGER IF NOT EXISTS offer_reconciliation_coin_outcomes_no_delete
 BEFORE DELETE ON offer_reconciliation_coin_outcomes
 BEGIN
     SELECT RAISE(ABORT, 'offer_reconciliation_coin_outcomes is append-only');
+END;
+
+-- A cancellation performed directly in Sage is terminal wallet history, not a
+-- CATalyst Task 8 wallet effect or a new Follow run fee. Keep its proven fee in
+-- a separate immutable audit row in the same transaction as Task 9 settlement.
+CREATE TABLE IF NOT EXISTS offer_external_cancel_fee_audits (
+    intent_id            TEXT PRIMARY KEY REFERENCES offer_intents(intent_id),
+    terminal_event_id    TEXT NOT NULL UNIQUE,
+    trade_id             TEXT NOT NULL,
+    wallet_fingerprint_hash TEXT NOT NULL,
+    network              TEXT NOT NULL,
+    transaction_id       TEXT,
+    spend_identity       TEXT,
+    confirmed_height     INTEGER NOT NULL CHECK(confirmed_height > 0),
+    fee_mojos            INTEGER NOT NULL CHECK(fee_mojos >= 0),
+    evidence_sha256      TEXT NOT NULL CHECK(length(evidence_sha256) = 64),
+    recorded_at          TEXT NOT NULL,
+    CHECK(transaction_id IS NOT NULL OR spend_identity IS NOT NULL)
+);
+CREATE TRIGGER IF NOT EXISTS offer_external_cancel_fee_audits_no_update
+BEFORE UPDATE ON offer_external_cancel_fee_audits BEGIN
+    SELECT RAISE(ABORT, 'external cancellation fee audit is immutable');
+END;
+CREATE TRIGGER IF NOT EXISTS offer_external_cancel_fee_audits_no_delete
+BEFORE DELETE ON offer_external_cancel_fee_audits BEGIN
+    SELECT RAISE(ABORT, 'external cancellation fee audit is immutable');
+END;
+CREATE TRIGGER IF NOT EXISTS offer_external_cancel_fee_audits_proof_guard
+BEFORE INSERT ON offer_external_cancel_fee_audits
+WHEN NOT EXISTS (
+    SELECT 1 FROM offer_operation_journal AS event
+    JOIN offer_intents AS intent ON intent.intent_id=NEW.intent_id
+    WHERE event.event_id=NEW.terminal_event_id
+      AND event.operation_id='reconcile:' || NEW.intent_id
+      AND event.intent_id=NEW.intent_id
+      AND event.operation_type='RECONCILE'
+      AND event.phase='FINALIZED'
+      AND event.outcome='CANCELLED_PROVEN'
+      AND event.reason_code='EXACT_EXTERNAL_CANCEL_RETURN_PROOF'
+      AND event.transaction_id IS NEW.transaction_id
+      AND event.spend_identity IS NEW.spend_identity
+      AND event.evidence_sha256=NEW.evidence_sha256
+      AND event.created_at=NEW.recorded_at
+      AND intent.sage_trade_id=NEW.trade_id
+      AND intent.wallet_fingerprint_hash=NEW.wallet_fingerprint_hash
+      AND intent.network=NEW.network
+      AND intent.lifecycle_state='terminal'
+)
+BEGIN
+    SELECT RAISE(ABORT, 'external cancellation fee lacks terminal proof');
 END;
 CREATE TRIGGER IF NOT EXISTS offer_reconciliation_coin_outcomes_proof_guard_v2
 BEFORE INSERT ON offer_reconciliation_coin_outcomes
@@ -2635,8 +3037,9 @@ WHEN catalyst_is_canonical_json(NEW.evidence_json)<>1
       OR (
           NEW.outcome='RELEASED_NO_EFFECT'
           AND json_extract(NEW.evidence_json, '$.effect_attempted')=0
-          AND json_extract(NEW.evidence_json, '$.reason_code')=
-              'PRE_DISPATCH_RETRY_CONTRACT_COLLISION'
+          AND json_extract(NEW.evidence_json, '$.reason_code') IN (
+              'PRE_DISPATCH_RETRY_CONTRACT_COLLISION',
+              'PRE_DISPATCH_PREP_NO_EFFECT_CONFIRMED')
           AND NOT EXISTS (
               SELECT 1 FROM wallet_effect_dispatches AS dispatch
                WHERE dispatch.claim_token=NEW.claim_token
@@ -2654,6 +3057,30 @@ WHEN catalyst_is_canonical_json(NEW.evidence_json)<>1
                  AND authority.authority_sha256=json_extract(
                        NEW.evidence_json, '$.authority_sha256'
                      )
+          )
+          AND (
+              json_extract(NEW.evidence_json, '$.reason_code')=
+                  'PRE_DISPATCH_RETRY_CONTRACT_COLLISION'
+              OR EXISTS (
+                  SELECT 1 FROM coin_prep_operations AS prep
+                   WHERE prep.operation_id=json_extract(
+                           NEW.evidence_json, '$.adapter_operation')
+                     AND prep.effect_claim_token=NEW.claim_token
+                     AND prep.effect_claim_generation=NEW.generation
+                     AND prep.outcome IN ('PREPARED','SUBMITTED_UNKNOWN')
+                     AND (prep.outcome='PREPARED' OR
+                          json_extract(prep.outcome_evidence_json,
+                                       '$.dispatch_outcome')='PREPARED')
+                     AND NOT EXISTS (
+                         SELECT 1 FROM approved_fee_reservations AS hold
+                          WHERE hold.operation_id=prep.operation_id
+                            AND (hold.cancellation<>0 OR
+                                 hold.fee_mojos IS NOT json_extract(
+                                     prep.target_contract_json, '$.fee_mojos')))
+                     AND NOT EXISTS (
+                         SELECT 1 FROM approved_fee_outcomes AS fee_outcome
+                          WHERE fee_outcome.operation_id=prep.operation_id)
+              )
           )
       )
   )
@@ -4052,6 +4479,67 @@ CREATE TABLE IF NOT EXISTS offer_refresh_lineage_blockers (
     recorded_at                TEXT NOT NULL,
     resolved_at                TEXT
 );
+CREATE TABLE IF NOT EXISTS offer_refresh_aborts (
+    abort_id                   TEXT PRIMARY KEY,
+    parent_intent_id           TEXT NOT NULL UNIQUE,
+    child_intent_id            TEXT NOT NULL UNIQUE,
+    campaign_id                TEXT NOT NULL,
+    cancel_operation_id        TEXT NOT NULL UNIQUE,
+    blocking_operation_id      TEXT NOT NULL UNIQUE,
+    latch_generation           INTEGER NOT NULL CHECK(latch_generation > 0),
+    owner_run_id               TEXT NOT NULL,
+    lease_version              INTEGER NOT NULL CHECK(lease_version > 0),
+    lease_acquired_at          TEXT NOT NULL,
+    lease_owner_pid            INTEGER NOT NULL CHECK(lease_owner_pid > 0),
+    lease_owner_host           TEXT NOT NULL,
+    wallet_fingerprint_hash    TEXT NOT NULL,
+    network                    TEXT NOT NULL,
+    asset_id                   TEXT NOT NULL,
+    target_trade_ids_json      TEXT NOT NULL CHECK(json_valid(target_trade_ids_json)),
+    state                      TEXT NOT NULL CHECK(state IN
+                               ('fenced','parent_terminal','cleanup','aborted')),
+    recorded_at                TEXT NOT NULL,
+    updated_at                 TEXT NOT NULL,
+    completed_at               TEXT
+);
+CREATE TABLE IF NOT EXISTS offer_refresh_published_cleanups (
+    abort_id                   TEXT PRIMARY KEY,
+    child_intent_id            TEXT NOT NULL,
+    offer_fingerprint          TEXT NOT NULL CHECK(length(offer_fingerprint)=64),
+    receipts_json             TEXT NOT NULL CHECK(json_valid(receipts_json)),
+    receipts_sha256           TEXT NOT NULL CHECK(length(receipts_sha256)=64),
+    recorded_at                TEXT NOT NULL,
+    FOREIGN KEY(abort_id) REFERENCES offer_refresh_aborts(abort_id)
+);
+CREATE TRIGGER IF NOT EXISTS offer_refresh_published_cleanups_no_update
+BEFORE UPDATE ON offer_refresh_published_cleanups BEGIN
+    SELECT RAISE(ABORT, 'published cleanup proofs are append-only');
+END;
+CREATE TRIGGER IF NOT EXISTS offer_refresh_published_cleanups_no_delete
+BEFORE DELETE ON offer_refresh_published_cleanups BEGIN
+    SELECT RAISE(ABORT, 'published cleanup proofs are append-only');
+END;
+CREATE TABLE IF NOT EXISTS offer_refresh_abort_successions (
+    succession_id              TEXT PRIMARY KEY CHECK(length(succession_id)=64),
+    abort_id                   TEXT NOT NULL,
+    prior_owner_run_id         TEXT NOT NULL,
+    prior_lease_version        INTEGER NOT NULL CHECK(prior_lease_version > 0),
+    successor_owner_run_id     TEXT NOT NULL,
+    successor_lease_version    INTEGER NOT NULL CHECK(successor_lease_version > 0),
+    proof_json                 TEXT NOT NULL CHECK(json_valid(proof_json)),
+    proof_sha256               TEXT NOT NULL CHECK(length(proof_sha256)=64),
+    adopted_at                 TEXT NOT NULL,
+    UNIQUE(abort_id, successor_lease_version),
+    FOREIGN KEY(abort_id) REFERENCES offer_refresh_aborts(abort_id)
+);
+CREATE TRIGGER IF NOT EXISTS offer_refresh_abort_successions_no_update
+BEFORE UPDATE ON offer_refresh_abort_successions BEGIN
+    SELECT RAISE(ABORT, 'refresh abort successions are append-only');
+END;
+CREATE TRIGGER IF NOT EXISTS offer_refresh_abort_successions_no_delete
+BEFORE DELETE ON offer_refresh_abort_successions BEGIN
+    SELECT RAISE(ABORT, 'refresh abort successions are append-only');
+END;
 
 -- v1.4 provider evidence. Raw evidence is bounded and redacted before this
 -- database boundary; exact digests make retries idempotent.
@@ -4073,6 +4561,8 @@ CREATE TABLE IF NOT EXISTS market_provider_observations (
 );
 CREATE INDEX IF NOT EXISTS idx_market_provider_observations_asset_time
     ON market_provider_observations(asset_id, observed_at DESC);
+CREATE INDEX IF NOT EXISTS idx_market_provider_observations_time
+    ON market_provider_observations(observed_at);
 
 -- Immutable fill-candidate evidence.  Observed/Probable rows are diagnostic
 -- only; database checks make it impossible to mark them as economic authority.
@@ -4245,7 +4735,8 @@ CREATE TABLE IF NOT EXISTS bootstrap_campaigns (
     revision                       INTEGER NOT NULL DEFAULT 0 CHECK(revision >= 0),
     stop_reason                    TEXT,
     stopped_at                     TEXT,
-    updated_at                     TEXT NOT NULL
+    updated_at                     TEXT NOT NULL,
+    state_revision                 INTEGER NOT NULL DEFAULT 0 CHECK(state_revision >= 0)
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_bootstrap_campaigns_one_active
     ON bootstrap_campaigns(network, wallet_fingerprint, asset_id)
@@ -4300,6 +4791,120 @@ END;
 
 
 _STABILITY_REQUIRED_COLUMNS = {
+    "coin_prep_rbf_attempts": {
+        "attempt_id",
+        "operation_id",
+        "original_transaction_id",
+        "unsigned_sha256",
+        "review_sha256",
+        "fee_mojos",
+        "original_outputs_json",
+        "successor_outputs_json",
+        "wallet_identity_sha256",
+        "latch_generation",
+        "reviewed_at",
+        "review_expires_at",
+    },
+    "coin_prep_rbf_dispatches": {
+        "attempt_id",
+        "operation_id",
+        "lease_version",
+        "owner_run_id",
+        "started_at",
+    },
+    "coin_prep_rbf_sign_intents": {
+        "attempt_id",
+        "operation_id",
+        "lease_version",
+        "owner_run_id",
+        "started_at",
+    },
+    "coin_prep_rbf_sign_owners": {
+        "attempt_id",
+        "owner_pid",
+        "owner_host",
+        "lease_acquired_at",
+    },
+    "coin_prep_rbf_sign_no_submit": {
+        "attempt_id",
+        "receipt_json",
+        "receipt_sha256",
+        "recorded_at",
+    },
+    "coin_prep_rbf_resolutions": {
+        "attempt_id",
+        "winner",
+        "winner_transaction_id",
+        "outcome_evidence_sha256",
+        "resolved_at",
+    },
+    "unbounded_fee_approvals": {"approval_id"},
+    "follow_fee_ceiling_reviews": {
+        "review_id",
+        "review_sha256",
+        "run_id",
+        "identity_sha256",
+        "scope_sha256",
+        "plan_sha256",
+        "configuration_sha256",
+        "prior_revision",
+        "prior_maximum_fee_mojos",
+        "proposed_maximum_fee_mojos",
+        "protected_shutdown_fee_mojos",
+        "observed_fee_principal_mojos",
+        "reviewed_spent_fee_mojos",
+        "reviewed_held_fee_mojos",
+        "reviewed_at_epoch",
+        "expires_at_epoch",
+    },
+    "follow_fee_ceiling_revisions": {
+        "run_id",
+        "revision",
+        "review_id",
+        "approval_id",
+        "maximum_fee_mojos",
+        "protected_shutdown_fee_mojos",
+        "confirmed_at_epoch",
+    },
+    "follow_run_reviews": {
+        "review_id",
+        "review_sha256",
+        "approval_id",
+        "identity_sha256",
+        "identity_json",
+        "configuration_sha256",
+        "principal_review_sha256",
+        "buy_limit",
+        "sell_limit",
+        "started_at_epoch",
+        "expires_at_epoch",
+        "maximum_fee_mojos",
+        "protected_shutdown_fee_mojos",
+        "review_expires_at_epoch",
+    },
+    "follow_run_stops": {"run_id", "stopped_at_epoch"},
+    "follow_run_reapprovals": {
+        "run_id",
+        "review_id",
+        "prior_principal_sha256",
+        "principal_review_sha256",
+        "confirmed_at_epoch",
+    },
+    "follow_run_authorities": {
+        "run_id",
+        "consent_id",
+        "approval_id",
+        "identity_sha256",
+        "identity_json",
+        "configuration_sha256",
+        "principal_review_sha256",
+        "buy_limit",
+        "sell_limit",
+        "started_at_epoch",
+        "expires_at_epoch",
+        "maximum_fee_mojos",
+        "protected_shutdown_fee_mojos",
+    },
     "coin_prep_fee_sessions": {
         "session_id",
         "identity_sha256",
@@ -4455,6 +5060,19 @@ _STABILITY_REQUIRED_COLUMNS = {
         "outcome",
         "disposition",
         "terminal_event_id",
+        "evidence_sha256",
+        "recorded_at",
+    },
+    "offer_external_cancel_fee_audits": {
+        "intent_id",
+        "terminal_event_id",
+        "trade_id",
+        "wallet_fingerprint_hash",
+        "network",
+        "transaction_id",
+        "spend_identity",
+        "confirmed_height",
+        "fee_mojos",
         "evidence_sha256",
         "recorded_at",
     },
@@ -4914,6 +5532,47 @@ _STABILITY_REQUIRED_COLUMNS = {
         "recorded_at",
         "resolved_at",
     },
+    "offer_refresh_aborts": {
+        "abort_id",
+        "parent_intent_id",
+        "child_intent_id",
+        "campaign_id",
+        "cancel_operation_id",
+        "blocking_operation_id",
+        "latch_generation",
+        "owner_run_id",
+        "lease_version",
+        "lease_acquired_at",
+        "lease_owner_pid",
+        "lease_owner_host",
+        "wallet_fingerprint_hash",
+        "network",
+        "asset_id",
+        "target_trade_ids_json",
+        "state",
+        "recorded_at",
+        "updated_at",
+        "completed_at",
+    },
+    "offer_refresh_published_cleanups": {
+        "abort_id",
+        "child_intent_id",
+        "offer_fingerprint",
+        "receipts_json",
+        "receipts_sha256",
+        "recorded_at",
+    },
+    "offer_refresh_abort_successions": {
+        "succession_id",
+        "abort_id",
+        "prior_owner_run_id",
+        "prior_lease_version",
+        "successor_owner_run_id",
+        "successor_lease_version",
+        "proof_json",
+        "proof_sha256",
+        "adopted_at",
+    },
     "bootstrap_campaigns": {
         "campaign_id",
         "network",
@@ -4947,6 +5606,7 @@ _STABILITY_REQUIRED_COLUMNS = {
         "stop_reason",
         "stopped_at",
         "updated_at",
+        "state_revision",
     },
     "bootstrap_campaign_events": {
         "event_id",
@@ -5307,8 +5967,9 @@ WHEN catalyst_is_canonical_json(NEW.evidence_json)<>1
       OR (
           NEW.outcome='RELEASED_NO_EFFECT'
           AND json_extract(NEW.evidence_json, '$.effect_attempted')=0
-          AND json_extract(NEW.evidence_json, '$.reason_code')=
-              'PRE_DISPATCH_RETRY_CONTRACT_COLLISION'
+          AND json_extract(NEW.evidence_json, '$.reason_code') IN (
+              'PRE_DISPATCH_RETRY_CONTRACT_COLLISION',
+              'PRE_DISPATCH_PREP_NO_EFFECT_CONFIRMED')
           AND NOT EXISTS (
               SELECT 1 FROM wallet_effect_dispatches AS dispatch
                WHERE dispatch.claim_token=NEW.claim_token
@@ -5326,6 +5987,30 @@ WHEN catalyst_is_canonical_json(NEW.evidence_json)<>1
                  AND authority.authority_sha256=json_extract(
                        NEW.evidence_json, '$.authority_sha256'
                      )
+          )
+          AND (
+              json_extract(NEW.evidence_json, '$.reason_code')=
+                  'PRE_DISPATCH_RETRY_CONTRACT_COLLISION'
+              OR EXISTS (
+                  SELECT 1 FROM coin_prep_operations AS prep
+                   WHERE prep.operation_id=json_extract(
+                           NEW.evidence_json, '$.adapter_operation')
+                     AND prep.effect_claim_token=NEW.claim_token
+                     AND prep.effect_claim_generation=NEW.generation
+                     AND prep.outcome IN ('PREPARED','SUBMITTED_UNKNOWN')
+                     AND (prep.outcome='PREPARED' OR
+                          json_extract(prep.outcome_evidence_json,
+                                       '$.dispatch_outcome')='PREPARED')
+                     AND NOT EXISTS (
+                         SELECT 1 FROM approved_fee_reservations AS hold
+                          WHERE hold.operation_id=prep.operation_id
+                            AND (hold.cancellation<>0 OR
+                                 hold.fee_mojos IS NOT json_extract(
+                                     prep.target_contract_json, '$.fee_mojos')))
+                     AND NOT EXISTS (
+                         SELECT 1 FROM approved_fee_outcomes AS fee_outcome
+                          WHERE fee_outcome.operation_id=prep.operation_id)
+              )
           )
       )
   )
@@ -5814,6 +6499,7 @@ def _validate_stability_schema(conn: sqlite3.Connection) -> None:
     _require_unique_key(conn, "offer_refresh_lineage_commits", ("cancel_event_id",))
     _require_unique_key(conn, "offer_refresh_lineage_commits", ("terminal_event_id",))
     _require_unique_key(conn, "bootstrap_participation", ("campaign_id", "report_id"))
+    _require_unique_key(conn, "coin_prep_rbf_dispatches", ("operation_id",))
 
     stability_tables_by_owner = {
         _sqlite_identifier_fold(table_name): table_name
@@ -6345,6 +7031,85 @@ _FEE_SESSION_COMPLETION_POLICY_SHA256 = hashlib.sha256(
     b"coin-prep-fee-session-completion:v1:journal-and-current-target-proof"
 ).hexdigest()
 _FEE_SESSION_COMPLETION_TABLES = frozenset({"coin_prep_fee_session_completions"})
+_FOLLOW_SCHEMA_MIGRATION_KEY = "follow-run-authority-schema"
+_FOLLOW_SCHEMA_VERSION = 1
+_FOLLOW_SCHEMA_POLICY_SHA256 = hashlib.sha256(
+    b"follow-run-authority-schema:v1:review-authority-stop"
+).hexdigest()
+_FOLLOW_SCHEMA_TABLES = frozenset(
+    {"follow_run_reviews", "follow_run_authorities", "follow_run_stops"}
+)
+_FOLLOW_FEE_CEILING_SCHEMA_MIGRATION_KEY = "follow-fee-ceiling-revision-schema"
+_FOLLOW_FEE_CEILING_SCHEMA_VERSION = 2
+_FOLLOW_FEE_CEILING_SCHEMA_POLICY_SHA256 = hashlib.sha256(
+    b"follow-fee-ceiling-revision:v2:immutable-review-ledger-and-revision"
+).hexdigest()
+_FOLLOW_FEE_CEILING_SCHEMA_TABLES = frozenset(
+    {"follow_fee_ceiling_reviews", "follow_fee_ceiling_revisions"}
+)
+_EXTERNAL_CANCEL_AUDIT_MIGRATION_KEY = "external-cancel-fee-audit-schema"
+_EXTERNAL_CANCEL_AUDIT_SCHEMA_VERSION = 1
+_EXTERNAL_CANCEL_AUDIT_POLICY_SHA256 = hashlib.sha256(
+    b"external-cancel-fee-audit:v1:task9-terminal-proof-separated-from-follow-budget"
+).hexdigest()
+_EXTERNAL_CANCEL_AUDIT_TABLES = frozenset({"offer_external_cancel_fee_audits"})
+_COIN_PREP_RBF_SCHEMA_TABLES = frozenset(
+    {
+        "coin_prep_rbf_attempts",
+        "coin_prep_rbf_sign_intents",
+        "coin_prep_rbf_sign_owners",
+        "coin_prep_rbf_sign_no_submit",
+        "coin_prep_rbf_dispatches",
+        "coin_prep_rbf_resolutions",
+    }
+)
+
+
+def _external_cancel_audit_schema_completed(conn: sqlite3.Connection) -> bool:
+    row = conn.execute(
+        "SELECT schema_version, policy_sha256 FROM stability_migration_watermarks "
+        "WHERE migration_key=?",
+        (_EXTERNAL_CANCEL_AUDIT_MIGRATION_KEY,),
+    ).fetchone()
+    if row is None:
+        return False
+    if (
+        row["schema_version"] != _EXTERNAL_CANCEL_AUDIT_SCHEMA_VERSION
+        or row["policy_sha256"] != _EXTERNAL_CANCEL_AUDIT_POLICY_SHA256
+    ):
+        raise RuntimeError("external cancellation audit watermark contradicts policy")
+    return True
+
+
+def _follow_fee_ceiling_schema_completed(conn: sqlite3.Connection) -> bool:
+    row = conn.execute(
+        "SELECT schema_version, policy_sha256 FROM stability_migration_watermarks "
+        "WHERE migration_key=?",
+        (_FOLLOW_FEE_CEILING_SCHEMA_MIGRATION_KEY,),
+    ).fetchone()
+    if row is None:
+        return False
+    if (
+        row["schema_version"] != _FOLLOW_FEE_CEILING_SCHEMA_VERSION
+        or row["policy_sha256"] != _FOLLOW_FEE_CEILING_SCHEMA_POLICY_SHA256
+    ):
+        raise RuntimeError("fee ceiling revision schema watermark contradicts policy")
+    return True
+
+
+def _follow_schema_completed(conn: sqlite3.Connection) -> bool:
+    row = conn.execute(
+        "SELECT schema_version, policy_sha256 FROM stability_migration_watermarks WHERE migration_key=?",
+        (_FOLLOW_SCHEMA_MIGRATION_KEY,),
+    ).fetchone()
+    if row is None:
+        return False
+    if (
+        row["schema_version"] != _FOLLOW_SCHEMA_VERSION
+        or row["policy_sha256"] != _FOLLOW_SCHEMA_POLICY_SHA256
+    ):
+        raise RuntimeError("Follow authority schema watermark contradicts policy")
+    return True
 
 
 def _fee_approval_schema_completed(conn: sqlite3.Connection) -> bool:
@@ -7012,12 +7777,12 @@ def _upgrade_legacy_fee_ledger_schema(conn: sqlite3.Connection) -> None:
     # SQLite attempts to reparse it during ALTER TABLE and rejects the known
     # partially-upgraded shape.  Drop only the exact canonical trigger inside
     # the migration transaction; FEE_SCHEMA_SQL recreates it deterministically.
-    dependent_trigger_name = "coin_prep_fee_session_completions_authority_guard"
-    dependent = conn.execute(
-        "SELECT sql FROM sqlite_master WHERE type='trigger' AND name=?",
-        (dependent_trigger_name,),
-    ).fetchone()
+    dependent_trigger_names = (
+        "coin_prep_fee_session_completions_authority_guard",
+        "follow_fee_ceiling_revisions_binding_guard",
+    )
     drop_dependent_sql = ""
+    restore_wallet_guard_sql = ""
     canonical_db = _sqlite_connect(":memory:")
     try:
         canonical_db.executescript(FEE_SCHEMA_SQL)
@@ -7027,18 +7792,42 @@ def _upgrade_legacy_fee_ledger_schema(conn: sqlite3.Connection) -> None:
                 "AND name IN ('fee_approvals','approved_fee_reservations')"
             ).fetchall()
         )
-        expected_dependent = canonical_db.execute(
-            "SELECT sql FROM sqlite_master WHERE type='trigger' AND name=?",
-            (dependent_trigger_name,),
-        ).fetchone()
+        expected_dependents = {
+            name: canonical_db.execute(
+                "SELECT sql FROM sqlite_master WHERE type='trigger' AND name=?",
+                (name,),
+            ).fetchone()
+            for name in dependent_trigger_names
+        }
     finally:
         canonical_db.close()
-    if dependent is not None:
-        if expected_dependent is None or _normalized_schema_sql(
-            str(dependent[0])
-        ) != _normalized_schema_sql(str(expected_dependent[0])):
-            raise RuntimeError("legacy fee ledger has unknown dependent trigger")
-        drop_dependent_sql = f"DROP TRIGGER {dependent_trigger_name}; "
+    for name in dependent_trigger_names:
+        dependent = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='trigger' AND name=?",
+            (name,),
+        ).fetchone()
+        if dependent is not None:
+            expected = expected_dependents[name]
+            if expected is None or _normalized_schema_sql(
+                str(dependent[0])
+            ) != _normalized_schema_sql(str(expected[0])):
+                raise RuntimeError("legacy fee ledger has unknown dependent trigger")
+            drop_dependent_sql += f"DROP TRIGGER {name}; "
+    # The current wallet-effect resolution guard also reads the fee tables.
+    # The exact PR #218 fixture keeps that guard while replacing its fee
+    # tables, so preserve only our known definition across the DDL swap.
+    wallet_guard_name = "wallet_effect_claim_resolutions_guard"
+    wallet_guard = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='trigger' AND name=?",
+        (wallet_guard_name,),
+    ).fetchone()
+    if wallet_guard is not None:
+        if _normalized_schema_sql(str(wallet_guard[0])) != _normalized_schema_sql(
+            _WALLET_EFFECT_CLAIM_RESOLUTIONS_GUARD_SQL
+        ):
+            raise RuntimeError("legacy fee ledger has unknown wallet guard")
+        drop_dependent_sql += f"DROP TRIGGER {wallet_guard_name}; "
+        restore_wallet_guard_sql = _WALLET_EFFECT_CLAIM_RESOLUTIONS_GUARD_SQL + "; "
     approval_v2 = "fee_approvals_pr218_v2"
     reservation_v2 = "approved_fee_reservations_pr218_v2"
     approval_sql = str(canonical_tables["fee_approvals"]).replace(
@@ -7064,6 +7853,7 @@ def _upgrade_legacy_fee_ledger_schema(conn: sqlite3.Connection) -> None:
             + f"ALTER TABLE {approval_v2} RENAME TO fee_approvals; "
             + f"ALTER TABLE {reservation_v2} RENAME TO approved_fee_reservations; "
             + FEE_SCHEMA_SQL
+            + restore_wallet_guard_sql
         )
         if conn.execute("PRAGMA foreign_key_check").fetchone() is not None:
             raise RuntimeError("legacy fee ledger upgrade broke foreign keys")
@@ -7129,6 +7919,92 @@ def _upgrade_fee_outcome_journal_guard(conn: sqlite3.Connection) -> None:
     actual_sql, expected_sql = str(row[0]), str(expected_row[0])
     if _normalized_schema_sql(actual_sql) == _normalized_schema_sql(expected_sql):
         return
+    follow_guard_sql = """JOIN offer_cancel_cohort_manifests AS manifest
+      ON reservation.cancellation=1
+    WHERE reservation.operation_id=NEW.operation_id
+      AND catalyst_sha256(NEW.evidence_json)=NEW.evidence_id
+      AND json_extract(NEW.evidence_json, '$.schema_version')=1
+      AND (
+          (
+              json_extract(NEW.evidence_json, '$.kind')=
+                  'coin_prep_cancellation_fee_outcome'
+              AND reservation.operation_id=catalyst_sha256(
+                  'coin-prep-cancel:' || manifest.cohort_id
+              )
+          )
+          OR (
+              json_extract(NEW.evidence_json, '$.kind')=
+                  'follow_cancellation_fee_outcome'
+              AND EXISTS (
+                  SELECT 1 FROM follow_run_authorities AS run
+                  WHERE run.run_id=json_extract(
+                      NEW.evidence_json, '$.follow_run_id'
+                  )
+                    AND (
+                        run.approval_id=reservation.approval_id
+                        OR EXISTS (
+                            SELECT 1 FROM follow_fee_ceiling_revisions AS revision
+                            WHERE revision.run_id=run.run_id
+                              AND revision.approval_id=reservation.approval_id
+                        )
+                    )
+                    AND reservation.operation_id=catalyst_sha256(
+                        'follow-cancel:' || run.run_id || ':' || manifest.cohort_id
+                    )
+              )
+          )
+      )"""
+    prior_guard_sql = """JOIN offer_cancel_cohort_manifests AS manifest
+      ON reservation.operation_id=catalyst_sha256(
+          'coin-prep-cancel:' || manifest.cohort_id
+      )
+    WHERE reservation.operation_id=NEW.operation_id
+      AND reservation.cancellation=1
+      AND catalyst_sha256(NEW.evidence_json)=NEW.evidence_id
+      AND json_extract(NEW.evidence_json, '$.schema_version')=1
+      AND json_extract(NEW.evidence_json, '$.kind')=
+          'coin_prep_cancellation_fee_outcome'"""
+    if expected_sql.count(follow_guard_sql) != 1:
+        raise RuntimeError("follow fee outcome guard definition is unavailable")
+    new_no_effect_sql = """AND (
+                             terminal.reason_code='SAGE_RELAY_REJECTED'
+                             OR (
+                                 terminal.reason_code='FOLLOW_PREDISPATCH_NO_EFFECT'
+                                 AND json_extract(
+                                     terminal.evidence_json, '$.effect_attempted'
+                                 )=0
+                                 AND json_type(
+                                     terminal.evidence_json, '$.wallet_evidence'
+                                 )='object'
+                                 AND json_extract(
+                                     terminal.evidence_json,
+                                     '$.wallet_evidence_sha256'
+                                 )=catalyst_sha256(json_extract(
+                                     terminal.evidence_json, '$.wallet_evidence'
+                                 ))
+                             )
+                         )"""
+    prior_no_effect_sql = "AND terminal.reason_code='SAGE_RELAY_REJECTED'"
+    if expected_sql.count(new_no_effect_sql) != 1:
+        raise RuntimeError("pre-dispatch fee outcome guard definition is unavailable")
+    prior_no_effect_guard_sql = expected_sql.replace(
+        new_no_effect_sql, prior_no_effect_sql
+    )
+    prior_follow_guard_sql = follow_guard_sql.replace(
+        """AND (
+                        run.approval_id=reservation.approval_id
+                        OR EXISTS (
+                            SELECT 1 FROM follow_fee_ceiling_revisions AS revision
+                            WHERE revision.run_id=run.run_id
+                              AND revision.approval_id=reservation.approval_id
+                        )
+                    )""",
+        "AND run.approval_id=reservation.approval_id",
+    )
+    if prior_follow_guard_sql == follow_guard_sql:
+        raise RuntimeError("prior Follow fee outcome guard definition is unavailable")
+    prior_follow_sql = expected_sql.replace(follow_guard_sql, prior_follow_guard_sql)
+    prior_current_sql = expected_sql.replace(follow_guard_sql, prior_guard_sql)
     legacy_sql = """
     CREATE TRIGGER approved_fee_outcomes_journal_guard
     BEFORE INSERT ON approved_fee_outcomes
@@ -7174,10 +8050,153 @@ def _upgrade_fee_outcome_journal_guard(conn: sqlite3.Connection) -> None:
         SELECT RAISE(ABORT, 'fee outcome lacks bound journal evidence');
     END
     """
-    if _normalized_schema_sql(actual_sql) != _normalized_schema_sql(legacy_sql):
+    if _normalized_schema_sql(actual_sql) not in {
+        _normalized_schema_sql(legacy_sql),
+        _normalized_schema_sql(prior_follow_sql),
+        _normalized_schema_sql(prior_current_sql),
+        _normalized_schema_sql(prior_no_effect_guard_sql),
+        _normalized_schema_sql(
+            prior_follow_sql.replace(new_no_effect_sql, prior_no_effect_sql)
+        ),
+        _normalized_schema_sql(
+            prior_current_sql.replace(new_no_effect_sql, prior_no_effect_sql)
+        ),
+    }:
         raise RuntimeError("fee outcome journal guard has unknown schema")
     conn.execute("DROP TRIGGER approved_fee_outcomes_journal_guard")
     conn.execute(expected_sql)
+
+
+def _upgrade_follow_run_approval_reuse(conn: sqlite3.Connection) -> None:
+    """Allow a completed Coin Prep approval in sequential stopped Follow runs.
+
+    The run review remains single-use, and the authority transition still
+    rejects an unstopped overlapping run and unresolved wallet effects.
+    """
+    row = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' "
+        "AND name='follow_run_authorities'"
+    ).fetchone()
+    if row is None:
+        return
+    expected_db = _sqlite_connect(":memory:")
+    try:
+        expected_db.executescript(STABILITY_SCHEMA_SQL)
+        canonical = expected_db.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' "
+            "AND name='follow_run_authorities'"
+        ).fetchone()[0]
+    finally:
+        expected_db.close()
+    installed = str(row[0])
+    if _normalized_schema_sql(installed) == _normalized_schema_sql(canonical):
+        return
+    legacy = canonical.replace(
+        "approval_id TEXT NOT NULL REFERENCES coin_prep_fee_consents(approval_id)",
+        "approval_id TEXT UNIQUE NOT NULL REFERENCES coin_prep_fee_consents(approval_id)",
+        1,
+    )
+    legacy_50 = canonical.replace("buy_limit>0", "buy_limit BETWEEN 1 AND 50").replace(
+        "sell_limit>0", "sell_limit BETWEEN 1 AND 50"
+    )
+    legacy_unique_50 = legacy.replace(
+        "buy_limit>0", "buy_limit BETWEEN 1 AND 50"
+    ).replace("sell_limit>0", "sell_limit BETWEEN 1 AND 50")
+    if _normalized_schema_sql(installed) not in {
+        _normalized_schema_sql(legacy),
+        _normalized_schema_sql(legacy_50),
+        _normalized_schema_sql(legacy_unique_50),
+    }:
+        raise RuntimeError("Follow run authority has unknown schema")
+    dependent = conn.execute(
+        "SELECT name,sql FROM sqlite_master WHERE type='trigger' "
+        "AND tbl_name!='follow_run_authorities' "
+        "AND sql LIKE '%follow_run_authorities%' ORDER BY name"
+    ).fetchall()
+    conn.execute("PRAGMA foreign_keys=OFF")
+    try:
+        conn.execute("BEGIN EXCLUSIVE")
+        for trigger in dependent:
+            conn.execute(f'DROP TRIGGER "{trigger[0]}"')
+        replacement = canonical.replace(
+            "follow_run_authorities (", "follow_run_authorities_reuse (", 1
+        )
+        if replacement == canonical:
+            raise RuntimeError("Follow run authority definition unavailable")
+        conn.execute(replacement)
+        conn.execute(
+            "INSERT INTO follow_run_authorities_reuse SELECT * "
+            "FROM follow_run_authorities"
+        )
+        conn.execute("DROP TABLE follow_run_authorities")
+        conn.execute(
+            "ALTER TABLE follow_run_authorities_reuse RENAME TO follow_run_authorities"
+        )
+        for trigger in dependent:
+            conn.execute(str(trigger[1]))
+        if conn.execute("PRAGMA foreign_key_check").fetchone() is not None:
+            raise RuntimeError("Follow run approval reuse broke foreign keys")
+        conn.commit()
+    except Exception:
+        if conn.in_transaction:
+            conn.rollback()
+        raise
+    finally:
+        conn.execute("PRAGMA foreign_keys=ON")
+
+
+def _upgrade_follow_run_review_slot_limit(conn: sqlite3.Connection) -> None:
+    """Expand only the exact legacy Follow review count constraint."""
+    row = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='follow_run_reviews'"
+    ).fetchone()
+    if row is None:
+        return
+    expected_db = _sqlite_connect(":memory:")
+    try:
+        expected_db.executescript(STABILITY_SCHEMA_SQL)
+        canonical = str(
+            expected_db.execute(
+                "SELECT sql FROM sqlite_master WHERE type='table' AND name='follow_run_reviews'"
+            ).fetchone()[0]
+        )
+    finally:
+        expected_db.close()
+    installed = str(row[0])
+    if _normalized_schema_sql(installed) == _normalized_schema_sql(canonical):
+        return
+    legacy = canonical.replace("buy_limit>0", "buy_limit BETWEEN 1 AND 50").replace(
+        "sell_limit>0", "sell_limit BETWEEN 1 AND 50"
+    )
+    if _normalized_schema_sql(installed) != _normalized_schema_sql(legacy):
+        raise RuntimeError("Follow run review has unknown schema")
+    conn.execute("PRAGMA foreign_keys=OFF")
+    try:
+        conn.execute("BEGIN EXCLUSIVE")
+        replacement = canonical.replace(
+            "CREATE TABLE follow_run_reviews (",
+            "CREATE TABLE follow_run_reviews_slot_v2 (",
+            1,
+        )
+        if replacement == canonical:
+            raise RuntimeError("Follow run review definition unavailable")
+        conn.execute(replacement)
+        conn.execute(
+            "INSERT INTO follow_run_reviews_slot_v2 SELECT * FROM follow_run_reviews"
+        )
+        conn.execute("DROP TABLE follow_run_reviews")
+        conn.execute(
+            "ALTER TABLE follow_run_reviews_slot_v2 RENAME TO follow_run_reviews"
+        )
+        if conn.execute("PRAGMA foreign_key_check").fetchone() is not None:
+            raise RuntimeError("Follow run review slot upgrade broke foreign keys")
+        conn.commit()
+    except Exception:
+        if conn.in_transaction:
+            conn.rollback()
+        raise
+    finally:
+        conn.execute("PRAGMA foreign_keys=ON")
 
 
 def _migrate_stability_schema() -> None:
@@ -7191,6 +8210,8 @@ def _migrate_stability_schema() -> None:
         _upgrade_legacy_fee_ledger_schema(conn)
         _upgrade_expired_subsequent_spend_outcome_schema(conn)
         _upgrade_offer_cancel_cohort_member_limit(conn)
+        _upgrade_follow_run_approval_reuse(conn)
+        _upgrade_follow_run_review_slot_limit(conn)
         existing_tables = {
             str(row[0])
             for row in conn.execute(
@@ -7217,6 +8238,15 @@ def _migrate_stability_schema() -> None:
             "offer_reconciliation_coin_outcomes" in missing_stability_tables
         )
         conn.executescript(f"BEGIN EXCLUSIVE;\n{STABILITY_SCHEMA_SQL}")
+        bootstrap_columns = {
+            str(row["name"])
+            for row in conn.execute("PRAGMA table_info(bootstrap_campaigns)").fetchall()
+        }
+        if "state_revision" not in bootstrap_columns:
+            conn.execute(
+                "ALTER TABLE bootstrap_campaigns ADD COLUMN state_revision "
+                "INTEGER NOT NULL DEFAULT 0 CHECK(state_revision >= 0)"
+            )
         _upgrade_fee_session_generation_guard(conn)
         _upgrade_fee_outcome_journal_guard(conn)
         epoch_columns = {
@@ -7411,6 +8441,7 @@ def _migrate_stability_schema() -> None:
         fee_session_completion_completed = _fee_session_completion_schema_completed(
             conn
         )
+        external_audit_completed = _external_cancel_audit_schema_completed(conn)
         if (
             fee_schema_completed
             and missing_stability_tables & _FEE_APPROVAL_SCHEMA_TABLES
@@ -7424,10 +8455,31 @@ def _migrate_stability_schema() -> None:
         missing_post_tibet_tables = missing_stability_tables & _POST_TIBET_SCHEMA_TABLES
         if post_tibet_schema_completed and missing_post_tibet_tables:
             raise RuntimeError("post-TibetSwap schema watermark contradicts schema")
+        follow_schema_completed = _follow_schema_completed(conn)
+        if follow_schema_completed and missing_stability_tables & _FOLLOW_SCHEMA_TABLES:
+            raise RuntimeError("Follow authority schema watermark contradicts schema")
+        ceiling_schema_completed = _follow_fee_ceiling_schema_completed(conn)
+        if (
+            ceiling_schema_completed
+            and missing_stability_tables & _FOLLOW_FEE_CEILING_SCHEMA_TABLES
+        ):
+            raise RuntimeError(
+                "fee ceiling revision schema watermark contradicts schema"
+            )
+        if external_audit_completed and (
+            missing_stability_tables & _EXTERNAL_CANCEL_AUDIT_TABLES
+        ):
+            raise RuntimeError(
+                "external cancellation audit watermark contradicts schema"
+            )
         legacy_missing_tables = missing_stability_tables - (
             {
                 "offer_reconciliation_coin_outcomes",
                 "offer_reconciliation_coin_outcome_quarantine",
+                # Added after the original stability backfill watermark. An
+                # existing profile first receives this proof-only audit table
+                # during its next schema migration.
+                "offer_external_cancel_fee_audits",
                 "authoritative_fill_receipts",
                 "authoritative_round_trip_receipts",
                 "offer_authority_migration_audit",
@@ -7442,6 +8494,16 @@ def _migrate_stability_schema() -> None:
                 "offer_fill_sweep_delivery_claim_attestations",
                 "offer_refresh_lineage_commits",
                 "offer_refresh_lineage_blockers",
+                # Introduced after the original stability backfill watermark.
+                # An existing profile can legitimately lack this table on
+                # its first fenced refresh-abort upgrade.
+                "offer_refresh_aborts",
+                "offer_refresh_published_cleanups",
+                "offer_refresh_abort_successions",
+                # New fee-mode marker on profiles whose original stability
+                # backfill completed before this table existed.
+                "unbounded_fee_approvals",
+                "follow_run_reapprovals",
                 "runtime_recovery_epochs",
                 "runtime_recovery_takeovers",
                 "runtime_recovery_passes",
@@ -7453,6 +8515,10 @@ def _migrate_stability_schema() -> None:
             | _BOOTSTRAP_SCHEMA_TABLES
             | _FEE_APPROVAL_SCHEMA_TABLES
             | _FEE_SESSION_COMPLETION_TABLES
+            | _FOLLOW_SCHEMA_TABLES
+            | _FOLLOW_FEE_CEILING_SCHEMA_TABLES
+            | _EXTERNAL_CANCEL_AUDIT_TABLES
+            | _COIN_PREP_RBF_SCHEMA_TABLES
         )
         if backfills_completed and legacy_missing_tables:
             raise RuntimeError("stability migration watermark contradicts schema")
@@ -7507,6 +8573,41 @@ def _migrate_stability_schema() -> None:
                     _FEE_APPROVAL_SCHEMA_MIGRATION_KEY,
                     _FEE_APPROVAL_SCHEMA_VERSION,
                     _FEE_APPROVAL_SCHEMA_POLICY_SHA256,
+                    _stability_wall_clock(),
+                ),
+            )
+        if not follow_schema_completed:
+            conn.execute(
+                "INSERT INTO stability_migration_watermarks "
+                "(migration_key, schema_version, policy_sha256, completed_at) VALUES (?, ?, ?, ?)",
+                (
+                    _FOLLOW_SCHEMA_MIGRATION_KEY,
+                    _FOLLOW_SCHEMA_VERSION,
+                    _FOLLOW_SCHEMA_POLICY_SHA256,
+                    _stability_wall_clock(),
+                ),
+            )
+        if not ceiling_schema_completed:
+            conn.execute(
+                "INSERT INTO stability_migration_watermarks "
+                "(migration_key, schema_version, policy_sha256, completed_at) "
+                "VALUES (?, ?, ?, ?)",
+                (
+                    _FOLLOW_FEE_CEILING_SCHEMA_MIGRATION_KEY,
+                    _FOLLOW_FEE_CEILING_SCHEMA_VERSION,
+                    _FOLLOW_FEE_CEILING_SCHEMA_POLICY_SHA256,
+                    _stability_wall_clock(),
+                ),
+            )
+        if not external_audit_completed:
+            conn.execute(
+                "INSERT INTO stability_migration_watermarks "
+                "(migration_key, schema_version, policy_sha256, completed_at) "
+                "VALUES (?, ?, ?, ?)",
+                (
+                    _EXTERNAL_CANCEL_AUDIT_MIGRATION_KEY,
+                    _EXTERNAL_CANCEL_AUDIT_SCHEMA_VERSION,
+                    _EXTERNAL_CANCEL_AUDIT_POLICY_SHA256,
                     _stability_wall_clock(),
                 ),
             )
@@ -9137,6 +10238,7 @@ def reset_lifecycle_observability_stats() -> None:
 
 def guarded_reset_authoritative_state(
     *,
+    dry_run: bool = False,
     clear_fills: bool = False,
     clear_round_trips: bool = False,
     clear_coins: bool = False,
@@ -9151,9 +10253,11 @@ def guarded_reset_authoritative_state(
     reset would touch them, their offers, or their reservations, the complete
     transaction is refused with one stable conflict result.  Empty/legacy-only
     housekeeping remains compatible and append-only tables are never deleted.
+    ``dry_run`` evaluates these same checks and rolls back before any mutation.
     """
 
     options = {
+        "dry_run": dry_run,
         "clear_fills": clear_fills,
         "clear_round_trips": clear_round_trips,
         "clear_coins": clear_coins,
@@ -9170,7 +10274,7 @@ def guarded_reset_authoritative_state(
     init_database()
     conn = _stability_connection()
     try:
-        conn.execute("BEGIN IMMEDIATE")
+        conn.execute("BEGIN" if dry_run else "BEGIN IMMEDIATE")
 
         def count(sql: str, params: tuple[Any, ...] = ()) -> int:
             return int(conn.execute(sql, params).fetchone()[0])
@@ -9261,6 +10365,11 @@ def guarded_reset_authoritative_state(
             },
             "inventory_cleared": False,
         }
+        if dry_run:
+            # Preview uses the exact same conflict checks as execution, but
+            # cannot delete history or change any accounting state.
+            conn.rollback()
+            return summary
         # A positive fill count is refused above.  Keeping the statement out
         # entirely ensures no future FK topology can turn reset into data loss.
         if clear_fills and fill_assessment_count:
@@ -10104,8 +11213,12 @@ def upsert_coin(
                 amount_mojos,
             ),
         )
-        if not kwargs.get("_skip_commit"):
-            conn.commit()
+        if kwargs.get("_skip_commit"):
+            # The batch owner commits after every row. Logging here can roll
+            # back that still-open transaction (for example when an optional
+            # debug event is rejected), silently losing earlier batch rows.
+            return True
+        conn.commit()
         # Log the coin lifecycle event with structured data
         if existing is None:
             # Brand new coin
@@ -10152,6 +11265,8 @@ def upsert_coin(
                 conn.rollback()
             except Exception:
                 pass
+        if kwargs.get("_raise_on_error"):
+            raise
         log_event("error", "db_error", f"Failed to upsert coin {coin_id[:16]}...: {e}")
         return False
 
@@ -10168,15 +11283,17 @@ def batch_upsert_coins(coins: list, wallet_type: str = "xch") -> int:
     if type(coins) is not list or not coins:
         return 0
     count = 0
-    failures = 0
-    first_error: Optional[str] = None
     conn = get_connection()
-    if not conn.in_transaction:
-        conn.execute("BEGIN IMMEDIATE")
-    normalized_coin_ids = [norm_coin_id(c["coin_id"]) for c in coins]
-    protection_snapshot = frozenset(
-        _batch_coin_terminal_mutation_protection(conn, normalized_coin_ids)
-    )
+    try:
+        if not conn.in_transaction:
+            conn.execute("BEGIN IMMEDIATE")
+        normalized_coin_ids = [norm_coin_id(c["coin_id"]) for c in coins]
+        protection_snapshot = frozenset(
+            _batch_coin_terminal_mutation_protection(conn, normalized_coin_ids)
+        )
+    except Exception:
+        conn.rollback()
+        raise
     for c in coins:
         try:
             inserted = upsert_coin(
@@ -10187,18 +11304,19 @@ def batch_upsert_coins(coins: list, wallet_type: str = "xch") -> int:
                 purpose=c.get("purpose"),
                 _skip_commit=True,
                 _protection_snapshot=protection_snapshot,
+                _raise_on_error=True,
             )
             if inserted:
                 count += 1
-        except Exception as e:
-            failures += 1
-            if first_error is None:
-                first_error = f"{type(e).__name__}: {e}"
+        except Exception:
+            conn.rollback()
+            raise
     try:
         conn.commit()
     except Exception as e:
         # Commit failure is worse than any individual upsert failure —
         # the whole batch is lost. Log it so it's visible.
+        conn.rollback()
         try:
             log_event(
                 "error",
@@ -10208,17 +11326,7 @@ def batch_upsert_coins(coins: list, wallet_type: str = "xch") -> int:
             )
         except Exception:
             pass
-        return 0
-    if failures > 0:
-        try:
-            log_event(
-                "warning",
-                "batch_upsert_partial_failure",
-                f"batch_upsert_coins ({wallet_type}): {failures}/{len(coins)} "
-                f"failed, first error: {first_error}",
-            )
-        except Exception:
-            pass
+        raise
     return count
 
 
@@ -10618,8 +11726,9 @@ def _authoritative_coin_available_predicate(alias: str = "coins") -> str:
         "           AND effect_dispatch.dispatch_token=json_extract("
         "                 effect_resolution.evidence_json, '$.dispatch_token')) "
         "       OR (effect_dispatch.dispatch_token IS NULL "
-        "           AND json_extract(effect_resolution.evidence_json, '$.reason_code')="
-        "               'PRE_DISPATCH_RETRY_CONTRACT_COLLISION' "
+        "           AND json_extract(effect_resolution.evidence_json, '$.reason_code') IN "
+        "               ('PRE_DISPATCH_RETRY_CONTRACT_COLLISION', "
+        "                'PRE_DISPATCH_PREP_NO_EFFECT_CONFIRMED') "
         "           AND json_extract(effect_resolution.evidence_json, '$.effect_attempted')=0)"
         "      )) "
         "  AND COALESCE(NOT (effect_prep.outcome='FAILED' "
@@ -10673,8 +11782,9 @@ def _active_wallet_effect_coin_ids(conn: sqlite3.Connection) -> set[str]:
         "        AND effect_dispatch.dispatch_token=json_extract("
         "              effect_resolution.evidence_json, '$.dispatch_token')) "
         "    OR (effect_dispatch.dispatch_token IS NULL "
-        "        AND json_extract(effect_resolution.evidence_json, '$.reason_code')="
-        "            'PRE_DISPATCH_RETRY_CONTRACT_COLLISION' "
+        "        AND json_extract(effect_resolution.evidence_json, '$.reason_code') IN "
+        "            ('PRE_DISPATCH_RETRY_CONTRACT_COLLISION', "
+        "             'PRE_DISPATCH_PREP_NO_EFFECT_CONFIRMED') "
         "        AND json_extract(effect_resolution.evidence_json, '$.effect_attempted')=0)"
         "   )) "
         "  AND COALESCE(NOT (effect_prep.outcome='FAILED' "
@@ -11454,6 +12564,208 @@ def retain_wallet_effect_claim_for_reconciliation(
         _release_wallet_effect_process_authority(state)
 
 
+def recover_coin_prep_predispatch_no_effect(
+    operation_id: str, authoritative_view: dict[str, Any]
+) -> bool:
+    """Release an exact PREPARED claim only when dispatch was impossible.
+
+    The selectable wallet view is obtained by the caller through the normal
+    wallet adapter.  Every durable no-dispatch condition is rechecked in the
+    same transaction that appends the claim resolution and terminal journal.
+    """
+
+    from replacement_capacity import verify_coin_prep_no_effect_view
+    import mutation_gate
+
+    safe_operation_id = _fee_operation_identity(operation_id)
+    conn = _stability_connection()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            """
+            SELECT prep.*, claim.source_coin_ids_json AS claim_sources,
+                   claim.fee_coin_ids_json AS claim_fees,
+                   claim.wallet_fingerprint_hash, claim.network,
+                   authority.authority_sha256, claim.operation_id AS claim_operation,
+                   resolution.claim_token AS resolved_claim,
+                   dispatch.claim_token AS dispatched_claim,
+                   hold.operation_id AS fee_hold,
+                   hold.fee_mojos AS held_fee_mojos,
+                   hold.cancellation AS fee_hold_cancellation,
+                   fee_outcome.operation_id AS fee_outcome
+              FROM coin_prep_operations AS prep
+              JOIN wallet_effect_claims AS claim
+                ON claim.claim_token=prep.effect_claim_token
+               AND claim.generation=prep.effect_claim_generation
+              JOIN wallet_effect_claim_authorities AS authority
+                ON authority.claim_token=claim.claim_token
+              LEFT JOIN wallet_effect_claim_resolutions AS resolution
+                ON resolution.claim_token=claim.claim_token
+              LEFT JOIN wallet_effect_dispatches AS dispatch
+                ON dispatch.claim_token=claim.claim_token
+              LEFT JOIN approved_fee_reservations AS hold
+                ON hold.operation_id=prep.operation_id
+              LEFT JOIN approved_fee_outcomes AS fee_outcome
+                ON fee_outcome.operation_id=prep.operation_id
+             WHERE prep.operation_id=?
+            """,
+            (safe_operation_id,),
+        ).fetchone()
+        if row is None:
+            conn.rollback()
+            return False
+        prep = dict(row)
+        identity = json.loads(prep["wallet_identity_json"])
+        sources = json.loads(prep["source_coin_ids_json"])
+        fees = json.loads(prep["claim_fees"])
+        decision = verify_coin_prep_no_effect_view(
+            source_coin_ids=sources,
+            fee_coin_ids=fees,
+            authoritative_view=authoritative_view,
+            expected_wallet_identity=identity,
+        )
+        observed = (
+            _parse_iso_timestamp(
+                authoritative_view.get("observed_at"),
+                "no-effect observation",
+                require_timezone=True,
+            )
+            if decision.confirmed
+            else None
+        )
+        expiry = (
+            _parse_iso_timestamp(
+                authoritative_view.get("expires_at"),
+                "no-effect expiry",
+                require_timezone=True,
+            )
+            if decision.confirmed
+            else None
+        )
+        now = _parse_iso_timestamp(
+            _stability_wall_clock(), "no-effect commit", require_timezone=True
+        )
+        target = json.loads(prep["target_contract_json"])
+        target_fee = target.get(
+            "fee_mojos", target.get("external_fee", {}).get("fee_mojos")
+        )
+        valid_fee_hold = prep["fee_hold"] is None or (
+            prep["fee_hold"] == safe_operation_id
+            and prep["fee_hold_cancellation"] == 0
+            and type(target_fee) is int
+            and prep["held_fee_mojos"] == target_fee
+        )
+        exact = (
+            decision.confirmed is True
+            and observed <= now < expiry
+            and prep["outcome"] in {"PREPARED", "SUBMITTED_UNKNOWN"}
+            and (
+                prep["outcome"] == "PREPARED"
+                or json.loads(prep["outcome_evidence_json"])["dispatch_outcome"]
+                == "PREPARED"
+            )
+            # A final fee reservation is accounting, not wallet dispatch.
+            # Resolve it in this same transaction only with exact no-effect
+            # wallet evidence and a matching, non-cancellation fee contract.
+            and prep["resolved_claim"] is None
+            and prep["dispatched_claim"] is None
+            and valid_fee_hold
+            and prep["fee_outcome"] is None
+            and prep["claim_operation"] == safe_operation_id
+            and json.loads(prep["claim_sources"])
+            == sorted(norm_coin_id(source) for source in sources)
+            and prep["wallet_fingerprint_hash"]
+            == mutation_gate.wallet_fingerprint_hash(identity["fingerprint"])
+            and prep["network"] == identity["network_id"]
+        )
+        if not exact:
+            conn.rollback()
+            return False
+        claim_token = prep["effect_claim_token"]
+        generation = prep["effect_claim_generation"]
+        resolution = {
+            "effect_attempted": False,
+            "reason_code": "PRE_DISPATCH_PREP_NO_EFFECT_CONFIRMED",
+            "authority_sha256": prep["authority_sha256"],
+            "adapter_operation": safe_operation_id,
+            "result_type": "prepare_coin_prep_operation",
+        }
+        resolution_json = _canonical_json_text(
+            resolution, "pre-dispatch no-effect resolution", expected_type=dict
+        )
+        when = _stability_wall_clock()
+        conn.execute(
+            "INSERT INTO wallet_effect_claim_resolutions "
+            "(claim_token,generation,outcome,evidence_json,evidence_sha256,resolved_at) "
+            "VALUES (?,?,'RELEASED_NO_EFFECT',?,?,?)",
+            (
+                claim_token,
+                generation,
+                resolution_json,
+                hashlib.sha256(resolution_json.encode("utf-8")).hexdigest(),
+                when,
+            ),
+        )
+        evidence, _ = _coin_prep_outcome_evidence(
+            "FAILED",
+            {
+                "reason_code": "AUTHORITATIVE_NO_EFFECT_CONFIRMED",
+                "effect_claim_token": claim_token,
+                "effect_claim_generation": generation,
+                "dispatch_outcome": "RELEASED_NO_EFFECT",
+                "effect_attempted": False,
+                "source_coin_ids": sources,
+                "fee_coin_ids": fees,
+                "authoritative_view": authoritative_view,
+                "expected_wallet_identity": identity,
+            },
+        )
+        conn.execute(
+            "UPDATE coin_prep_operations SET outcome='FAILED', "
+            "outcome_evidence_json=?, finalized_at=? "
+            "WHERE operation_id=? AND outcome IN ('PREPARED','SUBMITTED_UNKNOWN')",
+            (evidence, when, safe_operation_id),
+        )
+        if prep["fee_hold"] is not None:
+            conn.execute(
+                "INSERT INTO approved_fee_outcomes "
+                "(operation_id, state, evidence_id, evidence_json) "
+                "VALUES (?, 'RELEASED_NO_EFFECT', ?, ?)",
+                (
+                    safe_operation_id,
+                    hashlib.sha256(evidence.encode("utf-8")).hexdigest(),
+                    evidence,
+                ),
+            )
+        _reconciliation_latch_update(
+            conn,
+            operation_id=safe_operation_id,
+            wallet_fingerprint_hash=prep["wallet_fingerprint_hash"],
+            network=prep["network"],
+            reason_code="COIN_PREP_AUTHORITATIVE_RESOLUTION",
+            reason="pre-dispatch coin prep had no wallet effect",
+            reconciled_at=when,
+            blocking=False,
+            additionally_resolved=(f"wallet-effect:{claim_token}",),
+        )
+        if (
+            _parse_iso_timestamp(
+                _stability_wall_clock(), "no-effect commit", require_timezone=True
+            )
+            >= expiry
+        ):
+            conn.rollback()
+            return False
+        conn.commit()
+        return True
+    except Exception:
+        if conn.in_transaction:
+            conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
 def recover_coin_prep_predispatch_retry_collisions() -> int:
     """Release only the historical retry collision that never crossed dispatch.
 
@@ -11477,10 +12789,21 @@ def recover_coin_prep_predispatch_retry_collisions() -> int:
         if latch_row is None:
             raise RuntimeError("runtime safety latch singleton is missing")
         latch = dict(latch_row)
-        if (
-            latch["state"] != "tripped"
-            or latch["reason"]
-            != "wallet effect authority was retained: COIN_PREP_PREPARED_PERSIST_FAILED"
+        retained_prepare_failure = latch["reason"] in {
+            "wallet effect authority was retained: COIN_PREP_PREPARED_PERSIST_FAILED",
+            "wallet effect authority was retained: DIRECT_BATCH_PREPARED_PERSIST_FAILED",
+        }
+        # An intervening older startup reasserts this exact unresolved claim
+        # with a crash reason. The durable collision/no-dispatch proof below,
+        # not the mutable diagnostic wording, is the recovery authority.
+        reasserted_crash = latch[
+            "reason_code"
+        ] == "WALLET_EFFECT_CRASH_UNRESOLVED_UNRECONCILED" and latch["reason"] == (
+            "restart found a wallet coin effect claim without an exact "
+            "Task 12 no-effect resolution"
+        )
+        if latch["state"] != "tripped" or not (
+            retained_prepare_failure or reasserted_crash
         ):
             conn.commit()
             return 0
@@ -11493,7 +12816,8 @@ def recover_coin_prep_predispatch_retry_collisions() -> int:
                    operation.source_coin_ids_json AS operation_source_coin_ids_json,
                    operation.wallet_identity_json AS operation_wallet_identity_json,
                    operation.outcome_evidence_json,
-                   prior_resolution.outcome AS prior_resolution_outcome
+                   prior_resolution.outcome AS prior_resolution_outcome,
+                   prior_resolution.evidence_json AS prior_resolution_evidence_json
               FROM wallet_effect_claims AS claim
               JOIN wallet_effect_claim_authorities AS authority
                 ON authority.claim_token=claim.claim_token
@@ -11517,6 +12841,9 @@ def recover_coin_prep_predispatch_retry_collisions() -> int:
             blocker = f"wallet-effect:{row['claim_token']}"
             try:
                 prior_evidence = json.loads(row["outcome_evidence_json"] or "null")
+                prior_resolution_evidence = json.loads(
+                    row["prior_resolution_evidence_json"] or "null"
+                )
                 identity = json.loads(row["operation_wallet_identity_json"])
                 evidence_fee_ids = sorted(
                     _reconciliation_coin_identity(value, "coin prep no-effect fee")[1]
@@ -11527,7 +12854,16 @@ def recover_coin_prep_predispatch_retry_collisions() -> int:
                     and prior_evidence.get("reason_code")
                     == "AUTHORITATIVE_NO_EFFECT_CONFIRMED"
                     and prior_evidence.get("effect_attempted") is False
-                    and row["prior_resolution_outcome"] in {"SUBMITTED", "UNKNOWN"}
+                    and (
+                        row["prior_resolution_outcome"] in {"SUBMITTED", "UNKNOWN"}
+                        or (
+                            row["prior_resolution_outcome"] == "RELEASED_NO_EFFECT"
+                            and prior_resolution_evidence.get("reason_code")
+                            == "PRE_DISPATCH_PREP_NO_EFFECT_CONFIRMED"
+                            and prior_resolution_evidence.get("effect_attempted")
+                            is False
+                        )
+                    )
                     and int(row["generation"]) > int(row["prior_claim_generation"])
                     and json.loads(row["source_coin_ids_json"])
                     == sorted(
@@ -12338,7 +13674,10 @@ def _coin_terminal_mutation_is_protected(
 
 
 def _batch_coin_terminal_mutation_protection(
-    conn: sqlite3.Connection, coin_ids: list[str]
+    conn: sqlite3.Connection,
+    coin_ids: list[str],
+    *,
+    include_released_outcomes: bool = True,
 ) -> set[str]:
     """Snapshot every mutation fence once for a wallet coin batch.
 
@@ -12362,7 +13701,10 @@ def _batch_coin_terminal_mutation_protection(
         if row["coin_id"]
     }
     for coin_id in requested & outcome_candidates:
-        if _authoritative_coin_outcome(conn, coin_id) is not None:
+        outcome = _authoritative_coin_outcome(conn, coin_id)
+        if outcome is not None and (
+            include_released_outcomes or outcome["disposition"] == "spent"
+        ):
             protected.add(coin_id)
 
     protected.update(
@@ -12424,6 +13766,24 @@ def get_coin_reconciliation_protected_ids(coin_ids: Any) -> List[str]:
     database mutations without opening the private SQL projection to callers.
     """
 
+    return _get_coin_protected_ids(coin_ids, include_released_outcomes=True)
+
+
+def get_coin_preparation_protected_ids(coin_ids: Any) -> List[str]:
+    """Fence preparation inputs without stranding proven-released coins.
+
+    Callers must independently require fresh authoritative selectable coins.
+    Released terminal history alone is not a spend or an active reservation.
+    Active wallet effects, nonterminal intents, live offer links and permanent
+    spends still dominate release evidence. This read changes no durable state;
+    legacy reconciliation mutation guards deliberately remain stricter.
+    """
+    return _get_coin_protected_ids(coin_ids, include_released_outcomes=False)
+
+
+def _get_coin_protected_ids(
+    coin_ids: Any, *, include_released_outcomes: bool
+) -> List[str]:
     if type(coin_ids) not in {list, tuple, set}:
         raise ValueError("coin_ids must be a bounded collection")
     if len(coin_ids) > 2048:
@@ -12434,7 +13794,11 @@ def get_coin_reconciliation_protected_ids(coin_ids: Any) -> List[str]:
     if not normalized:
         return []
     conn = get_connection()
-    return sorted(_batch_coin_terminal_mutation_protection(conn, normalized))
+    return sorted(
+        _batch_coin_terminal_mutation_protection(
+            conn, normalized, include_released_outcomes=include_released_outcomes
+        )
+    )
 
 
 def free_unreserved_locked_coin_for_reconciliation(coin_id: str) -> bool:
@@ -14115,6 +15479,66 @@ def get_offer_fill_hook_outbox_work(limit: int = 32) -> List[int]:
         raise
     finally:
         conn.close()
+
+
+def get_campaign_deferred_fill_hook_ids(campaign_id: str, revision: int) -> List[int]:
+    """List only pending post-fill work bound to one exact campaign revision."""
+
+    safe_campaign = _reconciliation_coin_identity(campaign_id, "campaign_id")[0]
+    safe_revision = _exact_integer(revision, "revision")
+    purpose = f"bootstrap:{safe_campaign}:revision:{safe_revision}"
+    now = _parse_iso_timestamp(
+        _stability_wall_clock(), "post-fill outbox clock", require_timezone=True
+    )
+    abandoned_before = (
+        now - timedelta(seconds=_AUTHORITATIVE_FILL_HOOK_LEASE_SECONDS)
+    ).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+    rows = (
+        get_connection()
+        .execute(
+            "SELECT DISTINCT receipt.fill_id FROM authoritative_fill_receipts AS receipt "
+            "JOIN offer_intents AS intent ON intent.intent_id=receipt.intent_id "
+            "AND intent.sage_trade_id=receipt.trade_id "
+            "JOIN offer_fill_hook_outbox AS outbox ON outbox.fill_id=receipt.fill_id "
+            "WHERE intent.purpose=? AND intent.lifecycle_state='terminal' "
+            "AND outbox.last_error_code IS NOT 'AUTHORITATIVE_FILL_PROOF_LOST' "
+            "AND (outbox.state='pending' OR "
+            "(outbox.state='running' AND outbox.claimed_at<=?)) "
+            "ORDER BY receipt.fill_id LIMIT 257",
+            (purpose, abandoned_before),
+        )
+        .fetchall()
+    )
+    if len(rows) > 256:
+        raise ValueError("mixed terminal deferred hook scope exceeds bound")
+    return [int(row["fill_id"]) for row in rows]
+
+
+def get_campaign_deferred_fill_hook_count(campaign_id: str, revision: int) -> int:
+    """Count durable pending hook rows for exact authoritative campaign fills."""
+
+    fill_ids = get_campaign_deferred_fill_hook_ids(campaign_id, revision)
+    if not fill_ids:
+        return 0
+    now = _parse_iso_timestamp(
+        _stability_wall_clock(), "post-fill outbox clock", require_timezone=True
+    )
+    abandoned_before = (
+        now - timedelta(seconds=_AUTHORITATIVE_FILL_HOOK_LEASE_SECONDS)
+    ).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+    placeholders = ",".join("?" for _ in fill_ids)
+    row = (
+        get_connection()
+        .execute(
+            f"SELECT COUNT(*) AS pending FROM offer_fill_hook_outbox "
+            f"WHERE fill_id IN ({placeholders}) "
+            "AND last_error_code IS NOT 'AUTHORITATIVE_FILL_PROOF_LOST' "
+            "AND (state='pending' OR (state='running' AND claimed_at<=?))",
+            (*fill_ids, abandoned_before),
+        )
+        .fetchone()
+    )
+    return int(row["pending"])
 
 
 def _offer_fill_hook_acknowledgement(
@@ -19957,6 +21381,7 @@ def get_stats(cat_asset_id: str = None, since: str = None) -> Dict:
     """
     conn = get_connection()
     stats = {}
+    stats["history_scope"] = "fresh_run" if since else "lifetime"
 
     # Open offers count
     live_open_offers = get_open_offers(cat_asset_id=cat_asset_id)
@@ -20519,6 +21944,111 @@ def set_setting(key: str, value: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# Follow run policy — one durable active set of approved material terms
+# ---------------------------------------------------------------------------
+
+
+_ACTIVE_FOLLOW_RUN_POLICY_SETTING = "active_follow_run_policy_v1"
+
+
+def record_active_follow_run_policy(policy) -> bool:
+    """Persist the validated material terms for the currently approved run."""
+    import json
+    from dataclasses import fields
+    from decimal import Decimal
+
+    from follow_run_policy import FollowRunPolicy
+
+    if not isinstance(policy, FollowRunPolicy):
+        raise ValueError("FOLLOW_RUN_POLICY_INVALID")
+
+    def serialize_term(value):
+        if isinstance(value, Decimal):
+            return "0" if value == 0 else format(value.normalize(), "f")
+        return value
+
+    terms = {
+        field.name: serialize_term(getattr(policy, field.name))
+        for field in fields(policy)
+    }
+    envelope = {
+        "version": 1,
+        "terms": terms,
+        "digest": policy.digest,
+    }
+    serialized = json.dumps(
+        envelope, sort_keys=True, separators=(",", ":"), allow_nan=False
+    )
+    if set_setting(_ACTIVE_FOLLOW_RUN_POLICY_SETTING, serialized) is not True:
+        raise ValueError("FOLLOW_RUN_POLICY_PERSIST_FAILED")
+    return True
+
+
+def get_active_follow_run_policy():
+    """Read the active policy; malformed or unverified data fails closed."""
+    try:
+        return _decode_follow_run_policy(get_setting(_ACTIVE_FOLLOW_RUN_POLICY_SETTING))
+    except Exception:
+        return None
+
+
+def _decode_follow_run_policy(raw):
+    """Validate a policy envelope without opening another connection."""
+    import json
+    import re
+    from decimal import Decimal
+
+    from follow_run_policy import FollowRunPolicy
+
+    try:
+        if type(raw) is not str or not raw:
+            return None
+
+        def object_without_duplicate_keys(pairs):
+            result = {}
+            for key, value in pairs:
+                if key in result:
+                    raise ValueError("duplicate JSON key")
+                result[key] = value
+            return result
+
+        envelope = json.loads(
+            raw,
+            object_pairs_hook=object_without_duplicate_keys,
+            parse_constant=lambda _value: (_ for _ in ()).throw(
+                ValueError("invalid JSON number")
+            ),
+        )
+        if (
+            type(envelope) is not dict
+            or set(envelope) != {"version", "terms", "digest"}
+            or type(envelope["version"]) is not int
+            or envelope["version"] != 1
+            or type(envelope["digest"]) is not str
+            or re.fullmatch(r"[0-9a-f]{64}", envelope["digest"]) is None
+            or type(envelope["terms"]) is not dict
+        ):
+            return None
+        terms = dict(envelope["terms"])
+        decimal_names = {"price_anchor", "price_min", "price_max"}
+        for name in decimal_names:
+            if type(terms.get(name)) is not str:
+                return None
+            terms[name] = Decimal(terms[name])
+        policy = FollowRunPolicy(**terms)
+        if policy.digest != envelope["digest"]:
+            return None
+        return policy
+    except Exception:
+        return None
+
+
+def clear_active_follow_run_policy() -> bool:
+    """Clear the active policy using the settings store's durable write path."""
+    return set_setting(_ACTIVE_FOLLOW_RUN_POLICY_SETTING, "") is True
+
+
+# ---------------------------------------------------------------------------
 # V3: Splash Incoming Offers — received from the P2P network
 # ---------------------------------------------------------------------------
 
@@ -20999,6 +22529,8 @@ def _fee_operation_identity(value: Any) -> str:
 def _fee_scope_legacy_cancellation_holds(
     conn: sqlite3.Connection,
     scope: str,
+    *,
+    accounted_scopes: Optional[List[str]] = None,
 ) -> List[Dict[str, Any]]:
     """Project unresolved pre-ledger effects without inventing reservations.
 
@@ -21069,7 +22601,11 @@ def _fee_scope_legacy_cancellation_holds(
             rejected = (
                 terminal["phase"] == "RECONCILED"
                 and terminal["outcome"] == "CANCEL_FAILED"
-                and terminal["reason_code"] == "SAGE_RELAY_REJECTED"
+                and terminal["reason_code"]
+                in {
+                    "SAGE_RELAY_REJECTED",
+                    "FOLLOW_PREDISPATCH_NO_EFFECT",
+                }
                 and terminal["blocks_mutation"] == 0
             )
             confirmed = (
@@ -21095,10 +22631,11 @@ def _fee_scope_legacy_cancellation_holds(
         ).fetchone()
         if reservation is not None:
             if (
-                reservation["scope_sha256"],
+                reservation["scope_sha256"]
+                in (accounted_scopes or _fee_wallet_scopes(conn, scope)),
                 reservation["cancellation"],
                 reservation["fee_mojos"],
-            ) != (scope, 1, fee):
+            ) != (True, 1, fee):
                 raise ValueError("FEE_CANCELLATION_EVIDENCE_CONFLICT")
             continue  # The append-only reservation/outcome already accounts for this batch.
         if states == {"released"} or states == {"spent"} or not attempted:
@@ -21118,7 +22655,131 @@ def _fee_scope_legacy_cancellation_holds(
     return holds
 
 
-def _fee_scope_totals(conn: sqlite3.Connection, scope: str) -> Dict[str, int]:
+def _fee_wallet_scopes(conn, scope: str, scope_json: Optional[str] = None) -> List[str]:
+    """Bind accounting to the trusted fee-paying wallet, not a rotating plan.
+
+    Scope/plan digests remain operation authority. Pair, ticker, campaign and
+    standalone-session changes cannot create another allowance for this wallet.
+    A prospective preview supplies its canonical scope before it is persisted.
+    Legacy unbound ledger callers retain their single-scope contract.
+    """
+    if scope_json is None:
+        row = conn.execute(
+            "SELECT scope_json FROM coin_prep_fee_previews WHERE scope_sha256=? LIMIT 1",
+            (scope,),
+        ).fetchone()
+        if row is None:
+            return [scope]
+        scope_json = row[0]
+    if hashlib.sha256(scope_json.encode()).hexdigest() != scope:
+        raise ValueError("FEE_PREVIEW_CONTRACT_MISMATCH")
+    identity = json.loads(scope_json)
+    fields = ("network", "wallet_type", "wallet_fingerprint", "xch_wallet_id")
+    if not all(key in identity for key in fields):
+        return [scope]
+    rows = conn.execute(
+        "SELECT DISTINCT scope_sha256 FROM coin_prep_fee_previews "
+        "WHERE json_extract(scope_json, '$.network')=? "
+        "AND json_extract(scope_json, '$.wallet_type')=? "
+        "AND json_extract(scope_json, '$.wallet_fingerprint')=? "
+        "AND json_extract(scope_json, '$.xch_wallet_id')=?",
+        tuple(identity[key] for key in fields),
+    ).fetchall()
+    return sorted({scope, *(row[0] for row in rows)})
+
+
+def _fee_wallet_limits(conn, scopes: List[str]) -> Dict[str, int]:
+    """Retain the protected pool and the latest serialized wallet consent.
+
+    Approval versions are local to each scope. The append-only approval
+    ledger's insertion order supplies ordering across scopes, including ties
+    in wall-clock timestamps. No new consent or accounting rows are created.
+    """
+    latest = None
+    protected = 0
+    for scope in scopes:
+        row = conn.execute(
+            "SELECT rowid AS approval_sequence, total_fee_mojos, "
+            "cancellation_reserve_mojos FROM fee_approvals "
+            "WHERE scope_sha256=? ORDER BY rowid DESC LIMIT 1",
+            (scope,),
+        ).fetchone()
+        if row is not None:
+            protected = max(protected, _fee_amount(row["cancellation_reserve_mojos"]))
+            if latest is None or row["approval_sequence"] > latest["approval_sequence"]:
+                latest = row
+    return {
+        "protected_cancellation_fee_mojos": protected,
+        "maximum_fee_mojos": _fee_amount(latest["total_fee_mojos"]) if latest else 0,
+    }
+
+
+def _fee_scope_totals(
+    conn: sqlite3.Connection, scope: str, scope_json: Optional[str] = None
+) -> Dict[str, int]:
+    """Count each original wallet scope once; never copy or reset its ledger."""
+    totals = {
+        "held_fee_mojos": 0,
+        "spent_fee_mojos": 0,
+        "committed_fee_mojos": 0,
+        "noncancellation_committed_fee_mojos": 0,
+    }
+    scopes = _fee_wallet_scopes(conn, scope, scope_json)
+    per_scope = {owned: _fee_single_scope_totals(conn, owned) for owned in scopes}
+    for raw in per_scope.values():
+        for key, value in raw.items():
+            totals[key] += value
+    for campaign, campaign_scopes in _fee_wallet_campaigns(conn, scopes).items():
+        # A campaign's authoritative journal already spans its scope aliases.
+        # Import only the missing spend, once, and leave unsettled ledger
+        # reservations held even when their journal confirmation has arrived.
+        authoritative = _bootstrap_campaign_authoritative_fee_spent_mojos(
+            conn, campaign, held_scopes=scopes
+        )
+        already_spent = sum(
+            per_scope[owned]["spent_fee_mojos"] for owned in campaign_scopes
+        )
+        totals["spent_fee_mojos"] += max(0, authoritative - already_spent)
+        totals["held_fee_mojos"] += sum(
+            row["fee_mojos"]
+            for row in _fee_scope_legacy_cancellation_holds(
+                conn, campaign_scopes[0], accounted_scopes=scopes
+            )
+        )
+    totals["committed_fee_mojos"] = totals["spent_fee_mojos"] + totals["held_fee_mojos"]
+    return totals
+
+
+def _fee_approval_is_unbounded(conn: sqlite3.Connection, approval_id: str) -> bool:
+    return (
+        conn.execute(
+            "SELECT 1 FROM unbounded_fee_approvals WHERE approval_id=?",
+            (approval_id,),
+        ).fetchone()
+        is not None
+    )
+
+
+def _fee_wallet_campaigns(conn, scopes: List[str]) -> Dict[str, List[str]]:
+    campaigns: Dict[str, List[str]] = {}
+    for scope in scopes:
+        ids = {
+            row[0]
+            for row in conn.execute(
+                "SELECT DISTINCT json_extract(scope_json, '$.campaign_id') "
+                "FROM coin_prep_fee_previews WHERE scope_sha256=? "
+                "AND json_extract(scope_json, '$.campaign_id') IS NOT NULL",
+                (scope,),
+            )
+        }
+        if len(ids) > 1:
+            raise ValueError("fee scope has conflicting Bootstrap campaigns")
+        for campaign in ids:
+            campaigns.setdefault(campaign, []).append(scope)
+    return campaigns
+
+
+def _fee_single_scope_totals(conn: sqlite3.Connection, scope: str) -> Dict[str, int]:
     """Exact held/spent sums across every approval version in this scope."""
     held = spent = noncancel = 0
     for row in conn.execute(
@@ -21137,30 +22798,6 @@ def _fee_scope_totals(conn: sqlite3.Connection, scope: str) -> Dict[str, int]:
             held += fee
         if not row[1]:
             noncancel += fee
-    campaign_rows = conn.execute(
-        "SELECT DISTINCT json_extract(scope_json, '$.campaign_id') AS campaign_id "
-        "FROM coin_prep_fee_previews WHERE scope_sha256=? "
-        "AND json_extract(scope_json, '$.campaign_id') IS NOT NULL",
-        (scope,),
-    ).fetchall()
-    campaign_ids = {row[0] for row in campaign_rows}
-    if len(campaign_ids) > 1:
-        raise ValueError("fee scope has conflicting Bootstrap campaigns")
-    if campaign_ids:
-        # Older generic Cancel All effects were journalled authoritatively but
-        # did not create fee reservations.  Carry only that missing difference
-        # into the append-only scope totals: reservations already represented
-        # in both ledgers must never be counted twice.
-        authoritative = _bootstrap_campaign_authoritative_fee_spent_mojos(
-            conn,
-            campaign_ids.pop(),
-            held_scope=scope,
-        )
-        spent += max(0, authoritative - spent)
-        held += sum(
-            row["fee_mojos"]
-            for row in _fee_scope_legacy_cancellation_holds(conn, scope)
-        )
     return {
         "held_fee_mojos": held,
         "spent_fee_mojos": spent,
@@ -21170,19 +22807,22 @@ def _fee_scope_totals(conn: sqlite3.Connection, scope: str) -> Dict[str, int]:
 
 
 def _insert_fee_approval(
-    conn: sqlite3.Connection, scope: str, plan: str, total: int, reserve: int
+    conn: sqlite3.Connection,
+    scope: str,
+    plan: str,
+    total: int,
+    reserve: int,
+    *,
+    unbounded: bool = False,
 ) -> str:
     """Insert an approval inside the caller's already serialized transaction."""
     totals = _fee_scope_totals(conn, scope)
-    protected = conn.execute(
-        "SELECT cancellation_reserve_mojos FROM fee_approvals "
-        "WHERE scope_sha256=? ORDER BY version DESC LIMIT 1",
-        (scope,),
-    ).fetchone()
-    if protected is not None and reserve < protected[0]:
+    limits = _fee_wallet_limits(conn, _fee_wallet_scopes(conn, scope))
+    if reserve < limits["protected_cancellation_fee_mojos"]:
         raise ValueError("FEE_CANCEL_PROTECTION_DECREASED")
-    if totals["committed_fee_mojos"] > total or (
-        totals["noncancellation_committed_fee_mojos"] > total - reserve
+    if not unbounded and (
+        totals["committed_fee_mojos"] > total
+        or (totals["noncancellation_committed_fee_mojos"] > total - reserve)
     ):
         raise ValueError("FEE_BUDGET_EXCEEDED")
     version = conn.execute(
@@ -21194,10 +22834,14 @@ def _insert_fee_approval(
         "INSERT INTO fee_approvals VALUES (?, ?, ?, ?, ?, ?)",
         (approval_id, scope, plan, version, total, reserve),
     )
+    if unbounded:
+        conn.execute("INSERT INTO unbounded_fee_approvals VALUES (?)", (approval_id,))
     return approval_id
 
 
-def get_fee_scope_budget(scope_sha256: str) -> Dict[str, int]:
+def get_fee_scope_budget(
+    scope_sha256: str, *, scope_json: Optional[str] = None
+) -> Dict[str, int]:
     """Read one consistent scope's prior protection and cumulative commitments.
 
     This is disclosure only. Confirmation and dispatch independently recheck
@@ -21207,16 +22851,12 @@ def get_fee_scope_budget(scope_sha256: str) -> Dict[str, int]:
     conn = _stability_read_only_connection()
     try:
         conn.execute("BEGIN")
-        protected = conn.execute(
-            "SELECT cancellation_reserve_mojos FROM fee_approvals "
-            "WHERE scope_sha256=? ORDER BY version DESC LIMIT 1",
-            (scope,),
-        ).fetchone()
+        limits = _fee_wallet_limits(conn, _fee_wallet_scopes(conn, scope, scope_json))
         return {
-            **_fee_scope_totals(conn, scope),
-            "protected_cancellation_fee_mojos": _fee_amount(protected[0])
-            if protected
-            else 0,
+            **_fee_scope_totals(conn, scope, scope_json),
+            "protected_cancellation_fee_mojos": limits[
+                "protected_cancellation_fee_mojos"
+            ],
         }
     finally:
         conn.close()
@@ -21228,18 +22868,23 @@ def create_fee_approval(
     plan_sha256: str,
     total_fee_mojos: int,
     cancellation_reserve_mojos: int,
+    unbounded: bool = False,
 ) -> Dict[str, Any]:
     """Persist a new approval version; never discard earlier commitments."""
     scope = _fee_digest(scope_sha256)
     plan = _fee_digest(plan_sha256)
     total = _fee_amount(total_fee_mojos)
     reserve = _fee_amount(cancellation_reserve_mojos)
+    if type(unbounded) is not bool:
+        raise ValueError("unbounded fee mode must be a boolean")
     if reserve > total:
         raise ValueError("cancellation reserve exceeds total fee ceiling")
     conn = _stability_connection()
     try:
         conn.execute("BEGIN IMMEDIATE")
-        approval_id = _insert_fee_approval(conn, scope, plan, total, reserve)
+        approval_id = _insert_fee_approval(
+            conn, scope, plan, total, reserve, unbounded=unbounded
+        )
         conn.commit()
     except BaseException:
         conn.rollback()
@@ -21585,6 +23230,7 @@ def approve_coin_prep_fee_preview(
     now: Optional[int] = None,
     current_fee_funding_mojos: Optional[int] = None,
     current_principal_funded: Optional[bool] = None,
+    unbounded: bool = False,
 ) -> Dict[str, Any]:
     """Atomically bind one deliberate preview confirmation to one approval.
 
@@ -21609,6 +23255,8 @@ def approve_coin_prep_fee_preview(
         and type(current_principal_funded) is not bool
     ):
         raise ValueError("principal funding must be an exact boolean")
+    if type(unbounded) is not bool:
+        raise ValueError("unbounded fee mode must be a boolean")
     if reserve > maximum:
         raise ValueError("FEE_BUDGET_INSUFFICIENT")
     conn = _stability_connection()
@@ -21621,6 +23269,8 @@ def approve_coin_prep_fee_preview(
         ).fetchone()
         if preview is None:
             raise ValueError("FEE_PREVIEW_REQUIRED")
+        if "prestart_review" in json.loads(preview["quote_json"]):
+            raise ValueError("FEE_PRESTART_NATIVE_CONFIRMATION_REQUIRED")
         if preview["scope_sha256"] != scope or preview["plan_sha256"] != plan:
             raise ValueError("FEE_APPROVAL_STALE")
         prior = conn.execute(
@@ -21632,6 +23282,14 @@ def approve_coin_prep_fee_preview(
             if (
                 prior["total_fee_mojos"] != maximum
                 or prior["cancellation_reserve_mojos"] != reserve
+                or (
+                    conn.execute(
+                        "SELECT 1 FROM unbounded_fee_approvals WHERE approval_id=?",
+                        (prior["approval_id"],),
+                    ).fetchone()
+                    is not None
+                )
+                != unbounded
             ):
                 raise ValueError("FEE_CONSENT_CONFLICT")
             approval_id = prior["approval_id"]
@@ -21648,20 +23306,37 @@ def approve_coin_prep_fee_preview(
             cancellation = _fee_amount(quote.get("estimated_cancellation_fee_mojos"))
             funding = _fee_amount(quote.get("fee_funding_mojos"))
             totals = _fee_scope_totals(conn, scope)
-            if (
-                reserve < cancellation
-                or (
+            campaign_scoped = (
+                json.loads(preview["scope_json"]).get("campaign_id") is not None
+            )
+            recovery_action = json.loads(preview["request_options_json"]).get(
+                "cancellation_recovery_action"
+            )
+            if reserve < cancellation or (
+                not unbounded
+                and (
                     maximum - reserve - totals["noncancellation_committed_fee_mojos"]
                     < prep
+                    or maximum - totals["committed_fee_mojos"] < prep + cancellation
+                    or (
+                        campaign_scoped
+                        and recovery_action is None
+                        and maximum - totals["committed_fee_mojos"] < prep + reserve
+                    )
                 )
-                or (maximum - totals["committed_fee_mojos"] < prep + cancellation)
             ):
                 raise ValueError("FEE_BUDGET_INSUFFICIENT")
-            if maximum - totals["committed_fee_mojos"] > min(
+            if unbounded:
+                required_funding = prep + reserve
+            else:
+                required_funding = maximum - totals["committed_fee_mojos"]
+            if required_funding > min(
                 funding, current_funding if current_funding is not None else funding
             ):
                 raise ValueError("FEE_FUNDING_INSUFFICIENT")
-            approval_id = _insert_fee_approval(conn, scope, plan, maximum, reserve)
+            approval_id = _insert_fee_approval(
+                conn, scope, plan, maximum, reserve, unbounded=unbounded
+            )
             conn.execute(
                 "INSERT INTO coin_prep_fee_consents VALUES (?, ?, ?)",
                 (preview_id, approval_id, now),
@@ -21678,6 +23353,211 @@ def approve_coin_prep_fee_preview(
         "preview_id": preview_id,
         "idempotent": idempotent,
     }
+
+
+def _prestart_follow_scope_blocked(
+    conn: sqlite3.Connection, scope_sha256: str, asset_id: str
+) -> bool:
+    """Fence live or unsettled Follow effects before a new session cap."""
+    active_run = conn.execute(
+        "SELECT 1 FROM follow_run_authorities AS run "
+        "JOIN fee_approvals AS approval ON approval.approval_id=run.approval_id "
+        "LEFT JOIN follow_run_stops AS stop ON stop.run_id=run.run_id "
+        "WHERE approval.scope_sha256=? AND stop.run_id IS NULL LIMIT 1",
+        (scope_sha256,),
+    ).fetchone()
+    open_offer = conn.execute(
+        "SELECT 1 FROM offers WHERE cat_asset_id=? "
+        "AND status NOT IN ('cancelled','expired','filled') LIMIT 1",
+        (asset_id,),
+    ).fetchone()
+    unresolved_intent = conn.execute(
+        "SELECT 1 FROM offer_intents AS intent "
+        "JOIN follow_run_authorities AS run ON run.run_id=intent.run_id "
+        "JOIN fee_approvals AS approval ON approval.approval_id=run.approval_id "
+        "WHERE approval.scope_sha256=? "
+        "AND intent.lifecycle_state NOT IN "
+        "('terminal','creation_failed','rejected','cancelled','filled','expired') "
+        "LIMIT 1",
+        (scope_sha256,),
+    ).fetchone()
+    unresolved_fee = conn.execute(
+        "SELECT 1 FROM approved_fee_reservations AS reservation "
+        "LEFT JOIN approved_fee_outcomes AS outcome USING(operation_id) "
+        "WHERE reservation.scope_sha256=? AND outcome.operation_id IS NULL LIMIT 1",
+        (scope_sha256,),
+    ).fetchone()
+    return any((active_run, open_offer, unresolved_intent, unresolved_fee))
+
+
+def prestart_follow_scope_blocked(scope_sha256: str, asset_id: str) -> bool:
+    """Read-only early blocker; confirmation repeats this inside its DB lock."""
+    scope = _fee_digest(scope_sha256)
+    asset = _fee_digest(asset_id)
+    conn = _stability_read_only_connection()
+    try:
+        return _prestart_follow_scope_blocked(conn, scope, asset)
+    finally:
+        conn.close()
+
+
+def confirm_prestart_follow_fee_ceiling_review(
+    *, preview_id: str, current_fee_funding_mojos: int
+) -> Dict[str, Any]:
+    """Consume one completed-scope ceiling review under the fee ledger lock.
+
+    This changes consent only. It cannot dispatch a wallet effect or create a
+    Follow run, and it refuses any accounting or session drift after preview.
+    """
+    preview_id = _fee_digest(preview_id)
+    funding = _fee_amount(current_fee_funding_mojos)
+    conn = _stability_connection()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        now = _fee_amount(int(time.time()))
+        preview = conn.execute(
+            "SELECT * FROM coin_prep_fee_previews WHERE preview_id=?", (preview_id,)
+        ).fetchone()
+        if preview is None:
+            raise ValueError("FEE_PREVIEW_REQUIRED")
+        quote = json.loads(preview["quote_json"])
+        review = quote.get("prestart_review")
+        if type(review) is not dict:
+            raise ValueError("FEE_PRESTART_REVIEW_REQUIRED")
+        if (
+            conn.execute(
+                "SELECT 1 FROM coin_prep_fee_consents WHERE preview_id=?", (preview_id,)
+            ).fetchone()
+            is not None
+        ):
+            raise ValueError("FEE_PRESTART_REVIEW_USED")
+        if not preview["observed_at"] <= now < preview["expires_at"]:
+            raise ValueError("FEE_PREVIEW_STALE")
+        prior_id = _fee_digest(review.get("prior_approval_id"))
+        prior = conn.execute(
+            "SELECT * FROM fee_approvals WHERE approval_id=?", (prior_id,)
+        ).fetchone()
+        if prior is None:
+            raise ValueError("FEE_APPROVAL_REQUIRED")
+        if (
+            prior["scope_sha256"] != preview["scope_sha256"]
+            or prior["plan_sha256"] != preview["plan_sha256"]
+            or prior["total_fee_mojos"] != review.get("prior_maximum_fee_mojos")
+            or prior["version"]
+            != conn.execute(
+                "SELECT MAX(version) FROM fee_approvals WHERE scope_sha256=?",
+                (prior["scope_sha256"],),
+            ).fetchone()[0]
+        ):
+            raise ValueError("FEE_APPROVAL_STALE")
+        scope = json.loads(preview["scope_json"])
+        session_id = scope.get("session_id")
+        if scope.get("campaign_id") is not None or session_id is None:
+            raise ValueError("FEE_PRESTART_STANDALONE_REQUIRED")
+        completion = conn.execute(
+            "SELECT * FROM coin_prep_fee_session_completions WHERE session_id=?",
+            (session_id,),
+        ).fetchone()
+        session = conn.execute(
+            "SELECT identity_sha256 FROM coin_prep_fee_sessions WHERE session_id=?",
+            (session_id,),
+        ).fetchone()
+        if completion is None or session is None:
+            raise ValueError("FEE_SESSION_INCOMPLETE")
+        latest_session = conn.execute(
+            "SELECT session_id FROM coin_prep_fee_sessions "
+            "WHERE identity_sha256=? ORDER BY generation DESC LIMIT 1",
+            (session["identity_sha256"],),
+        ).fetchone()
+        if (
+            latest_session["session_id"] != session_id
+            or completion["approval_id"] != prior_id
+            or completion["evidence_sha256"] != review.get("completion_evidence_sha256")
+            or completion["scope_sha256"] != prior["scope_sha256"]
+            or completion["plan_sha256"] != prior["plan_sha256"]
+        ):
+            raise ValueError("FEE_APPROVAL_STALE")
+        totals = _fee_scope_totals(conn, prior["scope_sha256"])
+        protected = _fee_amount(review.get("protected_cancellation_fee_mojos"))
+        maximum = _fee_amount(review.get("proposed_maximum_fee_mojos"))
+        if (
+            totals["spent_fee_mojos"] != review.get("spent_fee_mojos")
+            or totals["held_fee_mojos"] != review.get("held_fee_mojos")
+            or prior["cancellation_reserve_mojos"] > protected
+        ):
+            raise ValueError("FEE_PRESTART_ACCOUNTING_CHANGED")
+        # A stopped run may reuse its completed Coin Prep session only after
+        # its tracked offers and effects are terminal.
+        if _prestart_follow_scope_blocked(
+            conn, prior["scope_sha256"], scope["asset_id"]
+        ):
+            raise ValueError("FEE_PRESTART_RUN_EXISTS")
+        if (
+            maximum <= prior["total_fee_mojos"]
+            or maximum < totals["committed_fee_mojos"] + protected
+            or maximum - totals["committed_fee_mojos"]
+            > min(funding, _fee_amount(quote.get("fee_funding_mojos")))
+        ):
+            raise ValueError("FEE_PRESTART_FUNDING_INSUFFICIENT")
+        approval_id = _insert_fee_approval(
+            conn, prior["scope_sha256"], prior["plan_sha256"], maximum, protected
+        )
+        conn.execute(
+            "INSERT INTO coin_prep_fee_consents VALUES (?, ?, ?)",
+            (preview_id, approval_id, now),
+        )
+        conn.commit()
+    except BaseException:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+    return {
+        **get_fee_approval(approval_id),
+        "preview_id": preview_id,
+        "dispatch_authorized": False,
+    }
+
+
+def coin_prep_fee_preview_consumed(preview_id: str) -> bool:
+    """Read single-use consent state without granting any authority."""
+    preview_id = _fee_digest(preview_id)
+    conn = _stability_read_only_connection()
+    try:
+        return (
+            conn.execute(
+                "SELECT 1 FROM coin_prep_fee_consents WHERE preview_id=?", (preview_id,)
+            ).fetchone()
+            is not None
+        )
+    finally:
+        conn.close()
+
+
+def get_latest_prestart_follow_fee_approval(prior_approval_id: str) -> Optional[str]:
+    """Read a completed session's latest native-reviewed initial Follow cap."""
+    prior_approval_id = _fee_digest(prior_approval_id)
+    conn = _stability_read_only_connection()
+    try:
+        row = conn.execute(
+            "SELECT newer.approval_id FROM fee_approvals AS prior "
+            "JOIN fee_approvals AS newer ON newer.scope_sha256=prior.scope_sha256 "
+            "AND newer.plan_sha256=prior.plan_sha256 AND newer.version>prior.version "
+            "JOIN coin_prep_fee_consents AS consent ON consent.approval_id=newer.approval_id "
+            "JOIN coin_prep_fee_previews AS preview ON preview.preview_id=consent.preview_id "
+            "JOIN coin_prep_fee_session_completions AS completion "
+            "ON completion.session_id=json_extract(preview.scope_json, '$.session_id') "
+            "WHERE prior.approval_id=? "
+            "AND completion.approval_id=prior.approval_id "
+            "AND json_extract(preview.quote_json, '$.prestart_review.prior_approval_id')=prior.approval_id "
+            "AND newer.version=(SELECT MAX(latest.version) FROM fee_approvals AS latest "
+            "WHERE latest.scope_sha256=prior.scope_sha256) "
+            "ORDER BY newer.version DESC LIMIT 1",
+            (prior_approval_id,),
+        ).fetchone()
+        return row["approval_id"] if row is not None else None
+    finally:
+        conn.close()
 
 
 def get_coin_prep_fee_approval_context(approval_id: str) -> Dict[str, Any]:
@@ -21698,6 +23578,1239 @@ def get_coin_prep_fee_approval_context(approval_id: str) -> Dict[str, Any]:
         if row is None:
             raise ValueError("FEE_APPROVAL_REQUIRED")
         return dict(row)
+    finally:
+        conn.close()
+
+
+_FOLLOW_IDENTITY_FIELDS = frozenset(
+    {
+        "network",
+        "wallet_type",
+        "wallet_fingerprint",
+        "wallet_id",
+        "xch_wallet_id",
+        "asset_id",
+        "ticker",
+    }
+)
+_FOLLOW_SHUTDOWN_REASONS = frozenset(
+    {"cancel_all", "manual_cancel_all", "reserve_floor_breached"}
+)
+
+
+def _follow_identity_json(identity: dict) -> str:
+    """Use the same closed wallet identity as the native fee consent."""
+    if type(identity) is not dict or set(identity) != _FOLLOW_IDENTITY_FIELDS:
+        raise ValueError("FOLLOW_IDENTITY_INVALID")
+    if (
+        identity["wallet_type"] not in ("sage", "chia")
+        or type(identity["network"]) is not str
+        or re.fullmatch(r"mainnet|testnet[0-9]+", identity["network"]) is None
+        or type(identity["ticker"]) is not str
+        or re.fullmatch(r"[A-Za-z0-9_-]{1,64}", identity["ticker"]) is None
+    ):
+        raise ValueError("FOLLOW_IDENTITY_INVALID")
+    _fee_digest(identity["asset_id"])
+    for key in ("wallet_fingerprint", "wallet_id", "xch_wallet_id"):
+        value = identity[key]
+        if type(value) is not int or not 1 <= value <= (2**32 - 1):
+            raise ValueError("FOLLOW_IDENTITY_INVALID")
+    return json.dumps(identity, sort_keys=True, separators=(",", ":"), allow_nan=False)
+
+
+def create_follow_run_review(
+    *,
+    approval_id: str,
+    identity: dict,
+    configuration_sha256: str,
+    principal_review_sha256: str,
+    buy_limit: int,
+    sell_limit: int,
+    started_at_epoch: int,
+    expires_at_epoch: int,
+    maximum_fee_mojos: int,
+    protected_shutdown_fee_mojos: int,
+    continuous: bool = False,
+) -> Dict[str, Any]:
+    """Freeze server-verified run terms for one short-lived native review.
+
+    This is only durable review data. A separate native confirmation must
+    consume its opaque ID; it never starts trading or grants wallet dispatch.
+    """
+    approval = _fee_digest(approval_id)
+    config_hash = _fee_digest(configuration_sha256)
+    principal_hash = _fee_digest(principal_review_sha256)
+    encoded_identity = _follow_identity_json(identity)
+    identity_hash = hashlib.sha256(encoded_identity.encode("utf-8")).hexdigest()
+    if (
+        any(
+            type(v) is not int or not 1 <= v <= 2**63 - 1
+            for v in (buy_limit, sell_limit)
+        )
+        or type(started_at_epoch) is not int
+        or type(expires_at_epoch) is not int
+        or started_at_epoch < 0
+        or expires_at_epoch <= started_at_epoch
+        or type(continuous) is not bool
+        or not (
+            expires_at_epoch == CONTINUOUS_RUN_EXPIRY
+            if continuous
+            else started_at_epoch < expires_at_epoch <= started_at_epoch + 48 * 3600
+        )
+    ):
+        raise ValueError("FOLLOW_REVIEW_INVALID")
+    maximum = _fee_amount(maximum_fee_mojos)
+    protected = _fee_amount(protected_shutdown_fee_mojos)
+    if maximum == 0 or protected == 0 or protected > maximum:
+        raise ValueError("FOLLOW_FEE_CAP_INVALID")
+    review_id = secrets.token_hex(32)
+    review_terms = {
+        "approval_id": approval,
+        "identity": identity,
+        "configuration_sha256": config_hash,
+        "principal_review_sha256": principal_hash,
+        "buy_limit": buy_limit,
+        "sell_limit": sell_limit,
+        "started_at_epoch": started_at_epoch,
+        "expires_at_epoch": expires_at_epoch,
+        "maximum_fee_mojos": maximum,
+        "protected_shutdown_fee_mojos": protected,
+    }
+    if continuous:
+        review_terms["continuous"] = True
+    review_sha256 = hashlib.sha256(
+        json.dumps(
+            review_terms, sort_keys=True, separators=(",", ":"), allow_nan=False
+        ).encode("utf-8")
+    ).hexdigest()
+    conn = _stability_connection()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        approved = conn.execute(
+            "SELECT approval.*, preview.scope_json FROM fee_approvals AS approval "
+            "JOIN coin_prep_fee_consents AS consent USING(approval_id) "
+            "JOIN coin_prep_fee_previews AS preview USING(preview_id) "
+            "WHERE approval.approval_id=?",
+            (approval,),
+        ).fetchone()
+        if approved is None:
+            raise ValueError("FOLLOW_FEE_APPROVAL_REQUIRED")
+        scope = json.loads(approved["scope_json"])
+        if (
+            any(scope.get(key) != identity[key] for key in _FOLLOW_IDENTITY_FIELDS)
+            or scope.get("campaign_id") is not None
+            or scope.get("session_id") is None
+            or approved["total_fee_mojos"] != maximum
+            or approved["cancellation_reserve_mojos"] < protected
+        ):
+            raise ValueError("FOLLOW_FEE_APPROVAL_MISMATCH")
+        latest = conn.execute(
+            "SELECT MAX(version) FROM fee_approvals WHERE scope_sha256=?",
+            (approved["scope_sha256"],),
+        ).fetchone()[0]
+        if approved["version"] != latest:
+            raise ValueError("FOLLOW_FEE_APPROVAL_STALE")
+        conn.execute(
+            "INSERT INTO follow_run_reviews VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                review_id,
+                review_sha256,
+                approval,
+                identity_hash,
+                encoded_identity,
+                config_hash,
+                principal_hash,
+                buy_limit,
+                sell_limit,
+                started_at_epoch,
+                expires_at_epoch,
+                maximum,
+                protected,
+                started_at_epoch + 300,
+            ),
+        )
+        conn.commit()
+        return {
+            "review_id": review_id,
+            "review_sha256": review_sha256,
+            "dispatch_authorized": False,
+        }
+    except BaseException:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def get_follow_run_review(review_id: str) -> Dict[str, Any]:
+    """Read the immutable native review terms without granting effect authority."""
+    review_id = _fee_digest(review_id)
+    conn = _stability_read_only_connection()
+    try:
+        row = conn.execute(
+            "SELECT review.*, (EXISTS(SELECT 1 FROM follow_run_authorities AS run "
+            "WHERE run.consent_id=review.review_id) OR EXISTS("
+            "SELECT 1 FROM follow_run_reapprovals AS renewal "
+            "WHERE renewal.review_id=review.review_id)) AS consumed "
+            "FROM follow_run_reviews AS review WHERE review.review_id=?",
+            (review_id,),
+        ).fetchone()
+        if row is None:
+            raise ValueError("FOLLOW_REVIEW_REQUIRED")
+        return {
+            **dict(row),
+            "identity": json.loads(row["identity_json"]),
+            "consumed": bool(row["consumed"]),
+            "dispatch_authorized": False,
+        }
+    finally:
+        conn.close()
+
+
+def create_follow_run_authority(
+    *,
+    consent_id: str,
+    review_sha256: str,
+    approval_id: str,
+    identity: dict,
+    configuration_sha256: str,
+    principal_review_sha256: str,
+    buy_limit: int,
+    sell_limit: int,
+    started_at_epoch: int,
+    expires_at_epoch: int,
+    maximum_fee_mojos: int,
+    protected_shutdown_fee_mojos: int,
+    reapprove_run_id: str | None = None,
+    replace_run_id: str | None = None,
+) -> Dict[str, Any]:
+    """Bind an explicit native run review to one already-approved fee scope.
+
+    The caller must supply the reviewed immutable run options. This database
+    transition does not start the bot or authorize a wallet effect.
+    """
+    consent = _fee_digest(consent_id)
+    review_digest = _fee_digest(review_sha256)
+    approval = _fee_digest(approval_id)
+    config_hash = _fee_digest(configuration_sha256)
+    principal_hash = _fee_digest(principal_review_sha256)
+    reapprove = _fee_digest(reapprove_run_id) if reapprove_run_id is not None else None
+    replace = _fee_digest(replace_run_id) if replace_run_id is not None else None
+    if reapprove is not None and replace is not None:
+        raise ValueError("FOLLOW_RUN_OVERLAP")
+    encoded_identity = _follow_identity_json(identity)
+    identity_hash = hashlib.sha256(encoded_identity.encode("utf-8")).hexdigest()
+    if (
+        any(
+            type(value) is not int or not 1 <= value <= 2**63 - 1
+            for value in (buy_limit, sell_limit)
+        )
+        or type(started_at_epoch) is not int
+        or type(expires_at_epoch) is not int
+        or started_at_epoch < 0
+        or expires_at_epoch <= started_at_epoch
+        or (
+            expires_at_epoch != CONTINUOUS_RUN_EXPIRY
+            and expires_at_epoch - started_at_epoch > 48 * 3600
+        )
+    ):
+        raise ValueError("FOLLOW_REVIEW_INVALID")
+    maximum = _fee_amount(maximum_fee_mojos)
+    protected = _fee_amount(protected_shutdown_fee_mojos)
+    if maximum == 0 or protected == 0 or protected > maximum:
+        raise ValueError("FOLLOW_FEE_CAP_INVALID")
+    conn = _stability_connection()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        review = conn.execute(
+            "SELECT * FROM follow_run_reviews WHERE review_id=?", (consent,)
+        ).fetchone()
+        if review is None:
+            raise ValueError("FOLLOW_REVIEW_REQUIRED")
+        if (
+            conn.execute(
+                "SELECT 1 FROM follow_run_authorities WHERE consent_id=? "
+                "UNION SELECT 1 FROM follow_run_reapprovals WHERE review_id=?",
+                (consent, consent),
+            ).fetchone()
+            is not None
+        ):
+            raise ValueError("FOLLOW_REVIEW_USED")
+        if (
+            not review["started_at_epoch"]
+            <= int(time.time())
+            < review["review_expires_at_epoch"]
+        ):
+            raise ValueError("FOLLOW_REVIEW_EXPIRED")
+        if (
+            review["review_sha256"] != review_digest
+            or review["approval_id"] != approval
+            or review["identity_sha256"] != identity_hash
+            or review["identity_json"] != encoded_identity
+            or review["configuration_sha256"] != config_hash
+            or review["principal_review_sha256"] != principal_hash
+            or review["buy_limit"] != buy_limit
+            or review["sell_limit"] != sell_limit
+            or review["started_at_epoch"] != started_at_epoch
+            or review["expires_at_epoch"] != expires_at_epoch
+            or review["maximum_fee_mojos"] != maximum
+            or review["protected_shutdown_fee_mojos"] != protected
+        ):
+            raise ValueError("FOLLOW_REVIEW_CHANGED")
+        approved = conn.execute(
+            "SELECT approval.*, preview.scope_json FROM fee_approvals AS approval "
+            "JOIN coin_prep_fee_consents AS consent USING(approval_id) "
+            "JOIN coin_prep_fee_previews AS preview USING(preview_id) "
+            "WHERE approval.approval_id=?",
+            (approval,),
+        ).fetchone()
+        if approved is None:
+            raise ValueError("FOLLOW_FEE_APPROVAL_REQUIRED")
+        scope = json.loads(approved["scope_json"])
+        if (
+            any(scope.get(key) != identity[key] for key in _FOLLOW_IDENTITY_FIELDS)
+            or scope.get("campaign_id") is not None
+            or scope.get("session_id") is None
+            or approved["total_fee_mojos"] != maximum
+            or approved["cancellation_reserve_mojos"] < protected
+        ):
+            raise ValueError("FOLLOW_FEE_APPROVAL_MISMATCH")
+        latest = conn.execute(
+            "SELECT MAX(version) FROM fee_approvals WHERE scope_sha256=?",
+            (approved["scope_sha256"],),
+        ).fetchone()[0]
+        if approved["version"] != latest:
+            raise ValueError("FOLLOW_FEE_APPROVAL_STALE")
+        totals = _fee_scope_totals(conn, approved["scope_sha256"])
+        if (
+            not _fee_approval_is_unbounded(conn, approval)
+            and totals["committed_fee_mojos"] + protected > maximum
+        ):
+            raise ValueError("FOLLOW_SHUTDOWN_RESERVE_UNFUNDED")
+        if (
+            conn.execute(
+                "SELECT 1 FROM approved_fee_reservations AS reservation "
+                "LEFT JOIN approved_fee_outcomes AS outcome USING(operation_id) "
+                "WHERE reservation.scope_sha256=? AND outcome.operation_id IS NULL LIMIT 1",
+                (approved["scope_sha256"],),
+            ).fetchone()
+            is not None
+        ):
+            raise ValueError("FOLLOW_UNRESOLVED_EFFECT")
+        prior = conn.execute(
+            "SELECT run.* FROM follow_run_authorities AS run "
+            "LEFT JOIN follow_run_stops AS stop USING(run_id) "
+            "WHERE run.identity_sha256=? AND run.expires_at_epoch>? "
+            "AND stop.run_id IS NULL "
+            "ORDER BY run.started_at_epoch DESC LIMIT 1",
+            (identity_hash, started_at_epoch),
+        ).fetchone()
+        if prior is None and (reapprove is not None or replace is not None):
+            raise ValueError("FOLLOW_RUN_OVERLAP")
+        if prior is not None and replace is not None:
+            if (
+                replace != prior["run_id"]
+                or prior["started_at_epoch"] >= started_at_epoch
+                or conn.execute(
+                    "SELECT 1 FROM offers WHERE cat_asset_id=? "
+                    "AND status NOT IN ('cancelled','expired','filled') LIMIT 1",
+                    (identity["asset_id"],),
+                ).fetchone()
+                is not None
+                or conn.execute(
+                    "SELECT 1 FROM offer_intents WHERE run_id=? "
+                    "AND lifecycle_state NOT IN ('terminal','creation_failed') LIMIT 1",
+                    (prior["run_id"],),
+                ).fetchone()
+                is not None
+            ):
+                raise ValueError("FOLLOW_RUN_OVERLAP")
+            conn.execute(
+                "INSERT INTO follow_run_stops VALUES (?,?)",
+                (prior["run_id"], int(time.time())),
+            )
+            prior = None
+        if prior is not None:
+            if (
+                reapprove != prior["run_id"]
+                or prior["approval_id"] != approval
+                or prior["configuration_sha256"] != config_hash
+                or prior["buy_limit"] != buy_limit
+                or prior["sell_limit"] != sell_limit
+                or prior["maximum_fee_mojos"] != maximum
+                or prior["protected_shutdown_fee_mojos"] != protected
+                or prior["started_at_epoch"] >= started_at_epoch
+                or conn.execute(
+                    "SELECT 1 FROM follow_run_stops WHERE run_id=?",
+                    (prior["run_id"],),
+                ).fetchone()
+                is not None
+                or conn.execute(
+                    "SELECT 1 FROM offers WHERE cat_asset_id=? "
+                    "AND status NOT IN ('cancelled','expired','filled') LIMIT 1",
+                    (identity["asset_id"],),
+                ).fetchone()
+                is not None
+                or conn.execute(
+                    "SELECT 1 FROM offer_intents WHERE run_id=? "
+                    "AND lifecycle_state NOT IN ('terminal','creation_failed') LIMIT 1",
+                    (prior["run_id"],),
+                ).fetchone()
+                is not None
+            ):
+                raise ValueError("FOLLOW_RUN_OVERLAP")
+            latest = conn.execute(
+                "SELECT principal_review_sha256 FROM follow_run_reapprovals "
+                "WHERE run_id=? ORDER BY confirmed_at_epoch DESC, rowid DESC LIMIT 1",
+                (prior["run_id"],),
+            ).fetchone()
+            prior_hash = (
+                latest["principal_review_sha256"]
+                if latest is not None
+                else prior["principal_review_sha256"]
+            )
+            if prior_hash == principal_hash:
+                raise ValueError("FOLLOW_RUN_OVERLAP")
+            conn.execute(
+                "INSERT INTO follow_run_reapprovals VALUES (?,?,?,?,?)",
+                (
+                    prior["run_id"],
+                    consent,
+                    prior_hash,
+                    principal_hash,
+                    started_at_epoch,
+                ),
+            )
+            conn.commit()
+            return {
+                "run_id": prior["run_id"],
+                "consent_id": consent,
+                "dispatch_authorized": False,
+            }
+        run_id = secrets.token_hex(32)
+        conn.execute(
+            "INSERT INTO follow_run_authorities VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                run_id,
+                consent,
+                approval,
+                identity_hash,
+                encoded_identity,
+                config_hash,
+                principal_hash,
+                buy_limit,
+                sell_limit,
+                started_at_epoch,
+                expires_at_epoch,
+                maximum,
+                protected,
+            ),
+        )
+        conn.commit()
+        return {"run_id": run_id, "consent_id": consent, "dispatch_authorized": False}
+    except BaseException:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def get_unexpired_follow_run_marker(
+    *, asset_id: str, now_epoch: int
+) -> Optional[Dict[str, Any]]:
+    """Identify a reviewed Follow run without granting creation authority.
+
+    This deliberately survives a Stop and ignores mutable configuration. It
+    lets the canonical offer boundary fence legacy, unscoped producers while
+    a reviewed run still covers this asset.
+    """
+    asset = _fee_digest(asset_id)
+    if type(now_epoch) is not int or now_epoch < 0:
+        raise ValueError("FOLLOW_TIME_INVALID")
+    conn = _stability_read_only_connection()
+    try:
+        _validate_stability_schema(conn)
+        row = conn.execute(
+            "SELECT run.run_id, run.expires_at_epoch, "
+            "stop.stopped_at_epoch IS NOT NULL AS stopped "
+            "FROM follow_run_authorities AS run "
+            "LEFT JOIN follow_run_stops AS stop USING(run_id) "
+            "WHERE json_extract(run.identity_json, '$.asset_id')=? "
+            "AND run.started_at_epoch<=? AND run.expires_at_epoch>? "
+            "ORDER BY run.started_at_epoch DESC LIMIT 1",
+            (asset, now_epoch, now_epoch),
+        ).fetchone()
+        if row is None:
+            return None
+        result = dict(row)
+        result["stopped"] = bool(result["stopped"])
+        return result
+    finally:
+        conn.close()
+
+
+def get_follow_creation_authority(
+    *,
+    identity: dict,
+    configuration_sha256: str,
+    now_epoch: int,
+) -> Dict[str, Any]:
+    """Read one matching, funded run; this is never wallet dispatch authority."""
+    encoded_identity = _follow_identity_json(identity)
+    identity_hash = hashlib.sha256(encoded_identity.encode("utf-8")).hexdigest()
+    config_hash = _fee_digest(configuration_sha256)
+    if type(now_epoch) is not int or now_epoch < 0:
+        raise ValueError("FOLLOW_TIME_INVALID")
+    result = {
+        "ready": False,
+        "reason_code": "FOLLOW_AUTHORITY_REQUIRED",
+        "run_id": None,
+        "approval_id": None,
+        "identity": None,
+        "configuration_sha256": None,
+        "principal_review_sha256": None,
+        "buy_limit": None,
+        "sell_limit": None,
+        "expires_at_epoch": None,
+        "maximum_fee_mojos": None,
+        "protected_shutdown_fee_mojos": None,
+        "consent_id": None,
+    }
+    conn = _stability_read_only_connection()
+    try:
+        conn.execute("BEGIN")
+        _validate_stability_schema(conn)
+        row = conn.execute(
+            "SELECT run.*, approval.scope_sha256, approval.plan_sha256, "
+            "approval.version, approval.total_fee_mojos, "
+            "approval.cancellation_reserve_mojos "
+            "FROM follow_run_authorities AS run "
+            "JOIN fee_approvals AS approval USING(approval_id) "
+            "WHERE run.identity_sha256=? "
+            "ORDER BY run.started_at_epoch DESC LIMIT 1",
+            (identity_hash,),
+        ).fetchone()
+        if row is None:
+            return result
+        unbounded = _fee_approval_is_unbounded(conn, row["approval_id"])
+        result.update(
+            {
+                "run_id": row["run_id"],
+                "approval_id": row["approval_id"],
+                "identity": identity,
+                "configuration_sha256": row["configuration_sha256"],
+                "principal_review_sha256": row["principal_review_sha256"],
+                "buy_limit": row["buy_limit"],
+                "sell_limit": row["sell_limit"],
+                "expires_at_epoch": row["expires_at_epoch"],
+                "maximum_fee_mojos": row["maximum_fee_mojos"],
+                "unbounded": unbounded,
+                "protected_shutdown_fee_mojos": row["protected_shutdown_fee_mojos"],
+                "consent_id": row["consent_id"],
+            }
+        )
+        reapproval = conn.execute(
+            "SELECT review_id, prior_principal_sha256, principal_review_sha256 "
+            "FROM follow_run_reapprovals WHERE run_id=? "
+            "ORDER BY confirmed_at_epoch DESC, rowid DESC LIMIT 1",
+            (row["run_id"],),
+        ).fetchone()
+        if reapproval is not None:
+            result["consent_id"] = reapproval["review_id"]
+            result["principal_review_sha256"] = reapproval["principal_review_sha256"]
+        if row["configuration_sha256"] != config_hash:
+            result["reason_code"] = "FOLLOW_CONFIGURATION_CHANGED"
+        elif (
+            now_epoch < row["started_at_epoch"] or now_epoch >= row["expires_at_epoch"]
+        ):
+            result["reason_code"] = "FOLLOW_RUN_EXPIRED"
+        elif (
+            conn.execute(
+                "SELECT 1 FROM follow_run_stops WHERE run_id=?",
+                (row["run_id"],),
+            ).fetchone()
+            is not None
+        ):
+            result["reason_code"] = "FOLLOW_RUN_STOPPED"
+        elif row["total_fee_mojos"] != row["maximum_fee_mojos"] or (
+            row["cancellation_reserve_mojos"] < row["protected_shutdown_fee_mojos"]
+        ):
+            result["reason_code"] = "FOLLOW_FEE_APPROVAL_MISMATCH"
+        else:
+            latest = conn.execute(
+                "SELECT MAX(version) FROM fee_approvals WHERE scope_sha256=?",
+                (row["scope_sha256"],),
+            ).fetchone()[0]
+            unresolved = conn.execute(
+                "SELECT 1 FROM approved_fee_reservations AS reservation "
+                "LEFT JOIN approved_fee_outcomes AS outcome USING(operation_id) "
+                "WHERE reservation.scope_sha256=? AND outcome.operation_id IS NULL "
+                "LIMIT 1",
+                (row["scope_sha256"],),
+            ).fetchone()
+            totals = _fee_scope_totals(conn, row["scope_sha256"])
+            if latest != row["version"]:
+                effective = get_effective_follow_fee_policy(
+                    run_id=row["run_id"], identity=identity, now_epoch=now_epoch
+                )
+                if effective["revision"] < 1:
+                    result["reason_code"] = "FOLLOW_FEE_APPROVAL_STALE"
+                elif not effective["ready"]:
+                    result["reason_code"] = effective["reason_code"]
+                else:
+                    result.update(
+                        {
+                            "ready": True,
+                            "reason_code": None,
+                            "approval_id": effective["approval_id"],
+                            "maximum_fee_mojos": effective["maximum_fee_mojos"],
+                            "unbounded": effective.get("unbounded") is True,
+                            "protected_shutdown_fee_mojos": effective[
+                                "protected_shutdown_fee_mojos"
+                            ],
+                        }
+                    )
+            elif unresolved is not None:
+                result["reason_code"] = "FOLLOW_UNRESOLVED_EFFECT"
+            elif not unbounded and (
+                totals["committed_fee_mojos"] + row["protected_shutdown_fee_mojos"]
+                > row["maximum_fee_mojos"]
+            ):
+                result["reason_code"] = "FOLLOW_SHUTDOWN_RESERVE_UNFUNDED"
+            else:
+                result["ready"] = True
+                result["reason_code"] = None
+        return result
+    finally:
+        conn.close()
+
+
+def get_follow_cleanup_authority(
+    *,
+    run_id: str,
+    identity: dict,
+    now_epoch: int,
+    _own_unresolved_operation_id: str | None = None,
+) -> Dict[str, Any]:
+    """Read the original fee scope for stopped or expired Follow cleanup.
+
+    Stopping and expiry remove creation rights, but neither may substitute a
+    new approval or silently discard the old run's cumulative fee accounting.
+    This read grants no wallet dispatch authority.
+    """
+    run = _fee_digest(run_id)
+    encoded_identity = _follow_identity_json(identity)
+    identity_hash = hashlib.sha256(encoded_identity.encode("utf-8")).hexdigest()
+    if type(now_epoch) is not int or now_epoch < 0:
+        raise ValueError("FOLLOW_TIME_INVALID")
+    own_operation = (
+        _fee_operation_identity(_own_unresolved_operation_id)
+        if _own_unresolved_operation_id is not None
+        else None
+    )
+    result: Dict[str, Any] = {
+        "ready": False,
+        "reason_code": "FOLLOW_AUTHORITY_REQUIRED",
+        "run_id": run,
+        "approval_id": None,
+        "scope_sha256": None,
+        "plan_sha256": None,
+        "target_seconds": None,
+        "maximum_fee_mojos": None,
+        "protected_shutdown_fee_mojos": None,
+        "spent_fee_mojos": None,
+        "held_fee_mojos": None,
+        "remaining_fee_mojos": None,
+        "dispatch_authorized": False,
+    }
+    conn = _stability_read_only_connection()
+    try:
+        conn.execute("BEGIN")
+        _validate_stability_schema(conn)
+        row = conn.execute(
+            "SELECT run.*, approval.scope_sha256, approval.plan_sha256, "
+            "approval.version, approval.total_fee_mojos, "
+            "approval.cancellation_reserve_mojos, preview.scope_json, "
+            "preview.plan_json "
+            "FROM follow_run_authorities AS run "
+            "JOIN fee_approvals AS approval USING(approval_id) "
+            "JOIN coin_prep_fee_consents AS consent USING(approval_id) "
+            "JOIN coin_prep_fee_previews AS preview USING(preview_id) "
+            "WHERE run.run_id=?",
+            (run,),
+        ).fetchone()
+        if row is None:
+            return result
+        result.update(
+            {
+                "approval_id": row["approval_id"],
+                "scope_sha256": row["scope_sha256"],
+                "plan_sha256": row["plan_sha256"],
+                "maximum_fee_mojos": row["maximum_fee_mojos"],
+                "protected_shutdown_fee_mojos": row["protected_shutdown_fee_mojos"],
+            }
+        )
+        scope = json.loads(row["scope_json"])
+        plan = json.loads(row["plan_json"])
+        target_seconds = plan.get("target_seconds")
+        if (
+            type(target_seconds) is not int
+            or target_seconds < 1
+            or hashlib.sha256(row["scope_json"].encode("utf-8")).hexdigest()
+            != row["scope_sha256"]
+            or hashlib.sha256(row["plan_json"].encode("utf-8")).hexdigest()
+            != row["plan_sha256"]
+        ):
+            result["reason_code"] = "FOLLOW_FEE_APPROVAL_MISMATCH"
+            return result
+        result["target_seconds"] = target_seconds
+        if (
+            row["identity_sha256"] != identity_hash
+            or row["identity_json"] != encoded_identity
+        ):
+            result["reason_code"] = "FOLLOW_IDENTITY_MISMATCH"
+        elif any(scope.get(key) != identity[key] for key in _FOLLOW_IDENTITY_FIELDS):
+            result["reason_code"] = "FOLLOW_IDENTITY_MISMATCH"
+        elif now_epoch < row["started_at_epoch"]:
+            result["reason_code"] = "FOLLOW_RUN_NOT_STARTED"
+        elif (
+            row["total_fee_mojos"] != row["maximum_fee_mojos"]
+            or row["cancellation_reserve_mojos"] < row["protected_shutdown_fee_mojos"]
+        ):
+            result["reason_code"] = "FOLLOW_FEE_APPROVAL_MISMATCH"
+        else:
+            totals = _fee_scope_totals(conn, row["scope_sha256"])
+            committed = totals["committed_fee_mojos"]
+            result.update(
+                {
+                    "spent_fee_mojos": totals["spent_fee_mojos"],
+                    "held_fee_mojos": totals["held_fee_mojos"],
+                    "unbounded": _fee_approval_is_unbounded(conn, row["approval_id"]),
+                    "remaining_fee_mojos": max(0, row["maximum_fee_mojos"] - committed),
+                }
+            )
+            unresolved = conn.execute(
+                "SELECT 1 FROM approved_fee_reservations AS reservation "
+                "LEFT JOIN approved_fee_outcomes AS outcome USING(operation_id) "
+                "WHERE reservation.scope_sha256=? AND outcome.operation_id IS NULL "
+                "AND (? IS NULL OR reservation.operation_id<>?) "
+                "LIMIT 1",
+                (row["scope_sha256"], own_operation, own_operation),
+            ).fetchone()
+            if unresolved is not None:
+                result["reason_code"] = "FOLLOW_UNRESOLVED_EFFECT"
+            elif committed > row[
+                "maximum_fee_mojos"
+            ] and not _fee_approval_is_unbounded(conn, row["approval_id"]):
+                result["reason_code"] = "FOLLOW_FEE_CAP_EXCEEDED"
+            else:
+                result["ready"] = True
+                result["reason_code"] = None
+        return result
+    finally:
+        conn.close()
+
+
+def get_effective_follow_fee_policy(
+    *,
+    run_id: str,
+    identity: dict,
+    now_epoch: int,
+    _own_unresolved_operation_id: str | None = None,
+) -> Dict[str, Any]:
+    """Read the revision chain and lifetime ledger without dispatch authority."""
+
+    policy = get_follow_cleanup_authority(
+        run_id=run_id,
+        identity=identity,
+        now_epoch=now_epoch,
+        _own_unresolved_operation_id=_own_unresolved_operation_id,
+    )
+    policy = {**policy, "revision": 0, "dispatch_authorized": False}
+    conn = _stability_read_only_connection()
+    try:
+        conn.execute("BEGIN")
+        run = conn.execute(
+            "SELECT run.identity_sha256,run.configuration_sha256,"
+            "run.started_at_epoch,run.expires_at_epoch,initial.version "
+            "FROM follow_run_authorities AS run "
+            "JOIN fee_approvals AS initial USING(approval_id) WHERE run.run_id=?",
+            (run_id,),
+        ).fetchone()
+        revisions = conn.execute(
+            "SELECT revision.*, review.*, approval.scope_sha256 AS approval_scope,"
+            "approval.plan_sha256 AS approval_plan,approval.total_fee_mojos,"
+            "approval.cancellation_reserve_mojos,approval.version "
+            "FROM follow_fee_ceiling_revisions AS revision "
+            "JOIN follow_fee_ceiling_reviews AS review USING(review_id) "
+            "JOIN fee_approvals AS approval ON approval.approval_id=revision.approval_id "
+            "WHERE revision.run_id=? ORDER BY revision.revision",
+            (run_id,),
+        ).fetchall()
+        if not revisions:
+            return policy
+        if run is None or policy["reason_code"] not in (
+            None,
+            "FOLLOW_FEE_CAP_EXCEEDED",
+            "FOLLOW_UNRESOLVED_EFFECT",
+        ):
+            return {
+                **policy,
+                "ready": False,
+                "reason_code": "FOLLOW_FEE_REVISION_INVALID",
+            }
+        expected_identity = hashlib.sha256(
+            _follow_identity_json(identity).encode("utf-8")
+        ).hexdigest()
+        prior_maximum = policy["maximum_fee_mojos"]
+        prior_version = run["version"]
+        for number, row in enumerate(revisions, start=1):
+            if (
+                row["revision"] != number
+                or row["prior_revision"] != number - 1
+                or row["prior_maximum_fee_mojos"] != prior_maximum
+                or row["run_id"] != run_id
+                or row["identity_sha256"] != expected_identity
+                or row["identity_sha256"] != run["identity_sha256"]
+                or row["configuration_sha256"] != run["configuration_sha256"]
+                or row["scope_sha256"] != policy["scope_sha256"]
+                or row["plan_sha256"] != policy["plan_sha256"]
+                or row["approval_scope"] != policy["scope_sha256"]
+                or row["approval_plan"] != policy["plan_sha256"]
+                or row["total_fee_mojos"] != row["maximum_fee_mojos"]
+                or row["cancellation_reserve_mojos"]
+                < row["protected_shutdown_fee_mojos"]
+                or row["proposed_maximum_fee_mojos"] != row["maximum_fee_mojos"]
+                or row["version"] <= prior_version
+                or not run["started_at_epoch"]
+                <= row["confirmed_at_epoch"]
+                < run["expires_at_epoch"]
+                or not row["reviewed_at_epoch"]
+                <= row["confirmed_at_epoch"]
+                < row["expires_at_epoch"]
+                or _follow_fee_ceiling_review_digest(row) != row["review_sha256"]
+            ):
+                return {
+                    **policy,
+                    "ready": False,
+                    "reason_code": "FOLLOW_FEE_REVISION_INVALID",
+                }
+            prior_maximum = row["maximum_fee_mojos"]
+            prior_version = row["version"]
+        latest_version = conn.execute(
+            "SELECT MAX(version) FROM fee_approvals WHERE scope_sha256=?",
+            (policy["scope_sha256"],),
+        ).fetchone()[0]
+        if prior_version != latest_version:
+            return {
+                **policy,
+                "ready": False,
+                "reason_code": "FOLLOW_FEE_REVISION_STALE",
+            }
+        last = revisions[-1]
+        committed = policy["spent_fee_mojos"] + policy["held_fee_mojos"]
+        if committed > prior_maximum:
+            return {**policy, "ready": False, "reason_code": "FOLLOW_FEE_CAP_EXCEEDED"}
+        return {
+            **policy,
+            "ready": policy["reason_code"] != "FOLLOW_UNRESOLVED_EFFECT",
+            "reason_code": (
+                "FOLLOW_UNRESOLVED_EFFECT"
+                if policy["reason_code"] == "FOLLOW_UNRESOLVED_EFFECT"
+                else None
+            ),
+            "revision": last["revision"],
+            "approval_id": last["approval_id"],
+            "maximum_fee_mojos": prior_maximum,
+            "protected_shutdown_fee_mojos": last["protected_shutdown_fee_mojos"],
+            "remaining_fee_mojos": prior_maximum - committed,
+        }
+    finally:
+        conn.close()
+
+
+_FOLLOW_FEE_CEILING_REVIEW_TERMS = (
+    "run_id",
+    "identity_sha256",
+    "scope_sha256",
+    "plan_sha256",
+    "configuration_sha256",
+    "prior_revision",
+    "prior_maximum_fee_mojos",
+    "proposed_maximum_fee_mojos",
+    "protected_shutdown_fee_mojos",
+    "observed_fee_principal_mojos",
+    "reviewed_spent_fee_mojos",
+    "reviewed_held_fee_mojos",
+    "reviewed_at_epoch",
+    "expires_at_epoch",
+)
+
+
+def _follow_fee_ceiling_review_digest(terms: dict) -> str:
+    bound = {key: terms[key] for key in _FOLLOW_FEE_CEILING_REVIEW_TERMS}
+    return hashlib.sha256(
+        json.dumps(bound, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+
+
+def create_follow_fee_ceiling_review(
+    *,
+    run_id: str,
+    identity: dict,
+    configuration_sha256: str,
+    proposed_maximum_fee_mojos: int,
+    observed_fee_principal_mojos: int,
+    now_epoch: int,
+) -> Dict[str, Any]:
+    """Freeze an exact fee change for later native confirmation, without effect.
+
+    A trusted service must supply the observed protected fee principal from a
+    current wallet and Coin Prep read. This function never approves a fee.
+    """
+
+    run = _fee_digest(run_id)
+    config_hash = _fee_digest(configuration_sha256)
+    encoded_identity = _follow_identity_json(identity)
+    identity_hash = hashlib.sha256(encoded_identity.encode("utf-8")).hexdigest()
+    proposed = _fee_amount(proposed_maximum_fee_mojos)
+    observed_principal = _fee_amount(observed_fee_principal_mojos)
+    if type(now_epoch) is not int or now_epoch < 0 or proposed == 0:
+        raise ValueError("FOLLOW_FEE_REVISION_INVALID")
+    policy = get_effective_follow_fee_policy(
+        run_id=run, identity=identity, now_epoch=now_epoch
+    )
+    if policy.get("ready") is not True:
+        raise ValueError("FOLLOW_FEE_REVISION_AUTHORITY_REQUIRED")
+    if policy.get("unbounded") is True:
+        raise ValueError("FOLLOW_FEE_REVISION_UNAVAILABLE")
+    prior_revision = policy["revision"]
+    prior_maximum = policy["maximum_fee_mojos"]
+    protected = policy["protected_shutdown_fee_mojos"]
+    committed = policy["spent_fee_mojos"] + policy["held_fee_mojos"]
+    if (
+        proposed == prior_maximum
+        or committed + protected > proposed
+        or observed_principal < proposed - committed
+    ):
+        raise ValueError("FOLLOW_FEE_REVISION_UNFUNDED")
+    review_id = secrets.token_hex(32)
+    terms = {
+        "run_id": run,
+        "identity_sha256": identity_hash,
+        "scope_sha256": policy["scope_sha256"],
+        "plan_sha256": policy["plan_sha256"],
+        "configuration_sha256": config_hash,
+        "prior_revision": prior_revision,
+        "prior_maximum_fee_mojos": prior_maximum,
+        "proposed_maximum_fee_mojos": proposed,
+        "protected_shutdown_fee_mojos": protected,
+        "observed_fee_principal_mojos": observed_principal,
+        "reviewed_spent_fee_mojos": policy["spent_fee_mojos"],
+        "reviewed_held_fee_mojos": policy["held_fee_mojos"],
+        "reviewed_at_epoch": now_epoch,
+        "expires_at_epoch": now_epoch + 300,
+    }
+    review_sha256 = _follow_fee_ceiling_review_digest(terms)
+    conn = _stability_connection()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        current = conn.execute(
+            "SELECT run.*, approval.scope_sha256, approval.plan_sha256 "
+            "FROM follow_run_authorities AS run "
+            "JOIN fee_approvals AS approval USING(approval_id) "
+            "WHERE run.run_id=?",
+            (run,),
+        ).fetchone()
+        stopped = conn.execute(
+            "SELECT 1 FROM follow_run_stops WHERE run_id=?", (run,)
+        ).fetchone()
+        latest = conn.execute(
+            "SELECT revision,maximum_fee_mojos,approval_id "
+            "FROM follow_fee_ceiling_revisions WHERE run_id=? "
+            "ORDER BY revision DESC LIMIT 1",
+            (run,),
+        ).fetchone()
+        totals = _fee_scope_totals(conn, policy["scope_sha256"])
+        if (
+            current is None
+            or (stopped is not None and proposed < prior_maximum)
+            or (latest["revision"] if latest else 0) != prior_revision
+            or (latest["maximum_fee_mojos"] if latest else current["maximum_fee_mojos"])
+            != prior_maximum
+            or (latest["approval_id"] if latest else current["approval_id"])
+            != policy["approval_id"]
+            or not current["started_at_epoch"]
+            <= now_epoch
+            < current["expires_at_epoch"]
+            or current["identity_sha256"] != identity_hash
+            or current["configuration_sha256"] != config_hash
+            or current["scope_sha256"] != policy["scope_sha256"]
+            or current["plan_sha256"] != policy["plan_sha256"]
+            or (prior_revision == 0 and current["maximum_fee_mojos"] != prior_maximum)
+            or totals["committed_fee_mojos"] != committed
+            or totals["committed_fee_mojos"] + protected > proposed
+        ):
+            raise ValueError("FOLLOW_FEE_REVISION_CHANGED")
+        conn.execute(
+            "INSERT INTO follow_fee_ceiling_reviews VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                review_id,
+                review_sha256,
+                run,
+                identity_hash,
+                policy["scope_sha256"],
+                policy["plan_sha256"],
+                config_hash,
+                prior_revision,
+                prior_maximum,
+                proposed,
+                protected,
+                observed_principal,
+                policy["spent_fee_mojos"],
+                policy["held_fee_mojos"],
+                now_epoch,
+                now_epoch + 300,
+            ),
+        )
+        conn.commit()
+        return {
+            "review_id": review_id,
+            "review_sha256": review_sha256,
+            "dispatch_authorized": False,
+        }
+    except BaseException:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def get_follow_fee_ceiling_review(review_id: str) -> Dict[str, Any]:
+    """Read a proposed ceiling change without confirming or dispatching."""
+
+    review = _fee_digest(review_id)
+    conn = _stability_read_only_connection()
+    try:
+        row = conn.execute(
+            "SELECT review.*, EXISTS(SELECT 1 FROM follow_fee_ceiling_revisions "
+            "AS revision WHERE revision.review_id=review.review_id) AS consumed "
+            "FROM follow_fee_ceiling_reviews AS review WHERE review.review_id=?",
+            (review,),
+        ).fetchone()
+        if row is None:
+            raise ValueError("FOLLOW_FEE_REVISION_REVIEW_REQUIRED")
+        if _follow_fee_ceiling_review_digest(row) != row["review_sha256"]:
+            raise ValueError("FOLLOW_FEE_REVISION_REVIEW_MISMATCH")
+        return {
+            **dict(row),
+            "consumed": bool(row["consumed"]),
+            "dispatch_authorized": False,
+        }
+    finally:
+        conn.close()
+
+
+def confirm_follow_fee_ceiling_review(
+    *,
+    review_id: str,
+    review_sha256: str,
+    identity: dict,
+    configuration_sha256: str,
+    observed_fee_principal_mojos: int,
+    now_epoch: int,
+) -> Dict[str, Any]:
+    """Consume one exact native-reviewed ceiling in a serialized DB transaction.
+
+    The trusted native service must re-read the wallet fee principal and pass
+    its exact value. This function does not reserve, dispatch, or start trading.
+    """
+
+    review = _fee_digest(review_id)
+    digest = _fee_digest(review_sha256)
+    config_hash = _fee_digest(configuration_sha256)
+    encoded_identity = _follow_identity_json(identity)
+    identity_hash = hashlib.sha256(encoded_identity.encode("utf-8")).hexdigest()
+    principal = _fee_amount(observed_fee_principal_mojos)
+    if type(now_epoch) is not int or now_epoch < 0:
+        raise ValueError("FOLLOW_FEE_REVISION_INVALID")
+    conn = _stability_connection()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            "SELECT * FROM follow_fee_ceiling_reviews WHERE review_id=?", (review,)
+        ).fetchone()
+        if row is None:
+            raise ValueError("FOLLOW_FEE_REVISION_REVIEW_REQUIRED")
+        if conn.execute(
+            "SELECT 1 FROM follow_fee_ceiling_revisions WHERE review_id=?", (review,)
+        ).fetchone():
+            raise ValueError("FOLLOW_FEE_REVISION_REVIEW_USED")
+        if (
+            row["review_sha256"] != digest
+            or _follow_fee_ceiling_review_digest(row) != digest
+            or row["identity_sha256"] != identity_hash
+            or row["configuration_sha256"] != config_hash
+            or row["observed_fee_principal_mojos"] != principal
+        ):
+            raise ValueError("FOLLOW_FEE_REVISION_REVIEW_CHANGED")
+        if not row["reviewed_at_epoch"] <= now_epoch < row["expires_at_epoch"]:
+            raise ValueError("FOLLOW_FEE_REVISION_REVIEW_EXPIRED")
+        run = conn.execute(
+            "SELECT run.*, approval.scope_sha256,approval.plan_sha256 "
+            "FROM follow_run_authorities AS run "
+            "JOIN fee_approvals AS approval USING(approval_id) "
+            "WHERE run.run_id=?",
+            (row["run_id"],),
+        ).fetchone()
+        latest = conn.execute(
+            "SELECT * FROM follow_fee_ceiling_revisions WHERE run_id=? "
+            "ORDER BY revision DESC LIMIT 1",
+            (row["run_id"],),
+        ).fetchone()
+        stopped = conn.execute(
+            "SELECT 1 FROM follow_run_stops WHERE run_id=?", (row["run_id"],)
+        ).fetchone()
+        if (
+            run is None
+            or (
+                stopped is not None
+                and row["proposed_maximum_fee_mojos"] < row["prior_maximum_fee_mojos"]
+            )
+            or not run["started_at_epoch"] <= now_epoch < run["expires_at_epoch"]
+            or run["identity_sha256"] != identity_hash
+            or run["configuration_sha256"] != config_hash
+            or run["scope_sha256"] != row["scope_sha256"]
+            or run["plan_sha256"] != row["plan_sha256"]
+            or (latest["revision"] if latest else 0) != row["prior_revision"]
+            or (latest["maximum_fee_mojos"] if latest else run["maximum_fee_mojos"])
+            != row["prior_maximum_fee_mojos"]
+        ):
+            raise ValueError("FOLLOW_FEE_REVISION_REVIEW_CHANGED")
+        previous_approval = latest["approval_id"] if latest else run["approval_id"]
+        latest_approval = conn.execute(
+            "SELECT approval_id FROM fee_approvals WHERE scope_sha256=? "
+            "ORDER BY version DESC LIMIT 1",
+            (row["scope_sha256"],),
+        ).fetchone()
+        totals = _fee_scope_totals(conn, row["scope_sha256"])
+        committed = totals["committed_fee_mojos"]
+        proposed = row["proposed_maximum_fee_mojos"]
+        if (
+            latest_approval is None
+            or latest_approval["approval_id"] != previous_approval
+            or totals["spent_fee_mojos"] != row["reviewed_spent_fee_mojos"]
+            or totals["held_fee_mojos"] != row["reviewed_held_fee_mojos"]
+            or proposed == row["prior_maximum_fee_mojos"]
+            or proposed < committed + row["protected_shutdown_fee_mojos"]
+            or principal < proposed - committed
+        ):
+            raise ValueError("FOLLOW_FEE_REVISION_REVIEW_CHANGED")
+        approval_id = _insert_fee_approval(
+            conn,
+            row["scope_sha256"],
+            row["plan_sha256"],
+            proposed,
+            row["protected_shutdown_fee_mojos"],
+        )
+        revision = row["prior_revision"] + 1
+        conn.execute(
+            "INSERT INTO follow_fee_ceiling_revisions VALUES (?,?,?,?,?,?,?)",
+            (
+                row["run_id"],
+                revision,
+                review,
+                approval_id,
+                proposed,
+                row["protected_shutdown_fee_mojos"],
+                now_epoch,
+            ),
+        )
+        conn.commit()
+        return {
+            "run_id": row["run_id"],
+            "revision": revision,
+            "approval_id": approval_id,
+            "maximum_fee_mojos": proposed,
+            "protected_shutdown_fee_mojos": row["protected_shutdown_fee_mojos"],
+            "dispatch_authorized": False,
+        }
+    except BaseException:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def get_follow_run_identity(run_id: str) -> Dict[str, Any]:
+    """Read a run's immutable wallet identity for stopped-run fee cleanup.
+
+    This is not creation, approval or wallet-effect authority. Callers must
+    still require the exact current approval, journal and wallet binding.
+    """
+
+    run = _fee_digest(run_id)
+    conn = _stability_read_only_connection()
+    try:
+        row = conn.execute(
+            "SELECT identity_json,identity_sha256 FROM follow_run_authorities "
+            "WHERE run_id=?",
+            (run,),
+        ).fetchone()
+        if row is None:
+            raise ValueError("FOLLOW_AUTHORITY_REQUIRED")
+        encoded = row["identity_json"]
+        try:
+            identity = json.loads(encoded)
+            canonical = _follow_identity_json(identity)
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise ValueError("FOLLOW_IDENTITY_MISMATCH") from exc
+        if canonical != encoded or (
+            hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+            != row["identity_sha256"]
+        ):
+            raise ValueError("FOLLOW_IDENTITY_MISMATCH")
+        return identity
+    finally:
+        conn.close()
+
+
+def stop_follow_run_authority(*, run_id: str, stopped_at_epoch: int) -> Dict[str, Any]:
+    """Stop new creation without destroying the approved cleanup scope."""
+    run = _fee_digest(run_id)
+    if type(stopped_at_epoch) is not int or stopped_at_epoch < 0:
+        raise ValueError("FOLLOW_TIME_INVALID")
+    conn = _stability_connection()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        authority = conn.execute(
+            "SELECT started_at_epoch FROM follow_run_authorities WHERE run_id=?",
+            (run,),
+        ).fetchone()
+        if authority is None:
+            raise ValueError("FOLLOW_AUTHORITY_REQUIRED")
+        if stopped_at_epoch < authority["started_at_epoch"]:
+            raise ValueError("FOLLOW_TIME_INVALID")
+        prior = conn.execute(
+            "SELECT stopped_at_epoch FROM follow_run_stops WHERE run_id=?",
+            (run,),
+        ).fetchone()
+        if prior is None:
+            conn.execute(
+                "INSERT INTO follow_run_stops VALUES (?,?)", (run, stopped_at_epoch)
+            )
+        conn.commit()
+        return {
+            "run_id": run,
+            "stopped_at_epoch": (
+                prior["stopped_at_epoch"] if prior else stopped_at_epoch
+            ),
+            "idempotent": prior is not None,
+            "dispatch_authorized": False,
+        }
+    except BaseException:
+        conn.rollback()
+        raise
     finally:
         conn.close()
 
@@ -21736,15 +24849,31 @@ def get_fee_approval(approval_id: str) -> Dict[str, Any]:
         if row is None:
             raise ValueError("FEE_APPROVAL_REQUIRED")
         result = dict(row)
-        result.update(_fee_scope_totals(conn, row["scope_sha256"]))
-        result["remaining_fee_mojos"] = (
-            row["total_fee_mojos"] - result["committed_fee_mojos"]
+        unbounded = (
+            conn.execute(
+                "SELECT 1 FROM unbounded_fee_approvals WHERE approval_id=?",
+                (approval_id,),
+            ).fetchone()
+            is not None
         )
-        result["remaining_preparation_fee_mojos"] = min(
-            result["remaining_fee_mojos"],
-            row["total_fee_mojos"]
-            - row["cancellation_reserve_mojos"]
-            - result["noncancellation_committed_fee_mojos"],
+        result["unbounded"] = unbounded
+        result.update(_fee_scope_totals(conn, row["scope_sha256"]))
+        limits = _fee_wallet_limits(conn, _fee_wallet_scopes(conn, row["scope_sha256"]))
+        maximum = min(row["total_fee_mojos"], limits["maximum_fee_mojos"])
+        protected = max(
+            row["cancellation_reserve_mojos"],
+            limits["protected_cancellation_fee_mojos"],
+        )
+        remaining = maximum - result["committed_fee_mojos"]
+        remaining_preparation = min(
+            remaining,
+            maximum - protected - result["noncancellation_committed_fee_mojos"],
+        )
+        # These legacy-shaped values remain informational for older clients;
+        # unbounded callers must branch on `unbounded`, never use them to gate.
+        result["remaining_fee_mojos"] = max(0, remaining) if unbounded else remaining
+        result["remaining_preparation_fee_mojos"] = (
+            max(0, remaining_preparation) if unbounded else remaining_preparation
         )
         return result
     finally:
@@ -21804,23 +24933,37 @@ def get_coin_prep_fee_approval_status(approval_id: str) -> Dict[str, Any]:
             session_completed = session["completed_session_id"] is not None
             session_current = session["current_session_id"] == session_id
 
-        rows = conn.execute(
-            "SELECT reservation.fee_mojos, reservation.cancellation, "
-            "outcome.state AS accounting_outcome, prep.outcome AS effect_outcome, "
-            "CASE WHEN dispatch.dispatch_token IS NULL THEN 0 ELSE 1 END AS dispatched "
-            "FROM approved_fee_reservations AS reservation "
-            "LEFT JOIN approved_fee_outcomes AS outcome USING(operation_id) "
-            "LEFT JOIN coin_prep_operations AS prep USING(operation_id) "
-            "LEFT JOIN wallet_effect_dispatches AS dispatch "
-            "ON dispatch.adapter_operation=reservation.operation_id "
-            "WHERE reservation.scope_sha256=? "
-            "ORDER BY reservation.rowid",
-            (context["scope_sha256"],),
-        ).fetchall()
+        def reservation_rows(owned_scope):
+            return conn.execute(
+                "SELECT reservation.fee_mojos, reservation.cancellation, "
+                "outcome.state AS accounting_outcome, prep.outcome AS effect_outcome, "
+                "CASE WHEN dispatch.dispatch_token IS NULL THEN 0 ELSE 1 END AS dispatched "
+                "FROM approved_fee_reservations AS reservation "
+                "LEFT JOIN approved_fee_outcomes AS outcome USING(operation_id) "
+                "LEFT JOIN coin_prep_operations AS prep USING(operation_id) "
+                "LEFT JOIN wallet_effect_dispatches AS dispatch "
+                "ON dispatch.adapter_operation=reservation.operation_id "
+                "WHERE reservation.scope_sha256=? "
+                "ORDER BY reservation.rowid",
+                (owned_scope,),
+            ).fetchall()
+
+        scopes = _fee_wallet_scopes(conn, context["scope_sha256"])
+        rows = reservation_rows(context["scope_sha256"])
         unresolved = [row for row in rows if row["accounting_outcome"] is None]
-        unresolved.extend(
-            _fee_scope_legacy_cancellation_holds(conn, context["scope_sha256"])
-        )
+        for owned_scope in scopes:
+            if owned_scope != context["scope_sha256"]:
+                unresolved.extend(
+                    row
+                    for row in reservation_rows(owned_scope)
+                    if row["accounting_outcome"] is None
+                )
+        for campaign_scopes in _fee_wallet_campaigns(conn, scopes).values():
+            unresolved.extend(
+                _fee_scope_legacy_cancellation_holds(
+                    conn, campaign_scopes[0], accounted_scopes=scopes
+                )
+            )
         confirmed_count = sum(
             1 for row in rows if row["accounting_outcome"] == "CONFIRMED_SPENT"
         )
@@ -21828,12 +24971,19 @@ def get_coin_prep_fee_approval_status(approval_id: str) -> Dict[str, Any]:
             1 for row in rows if row["accounting_outcome"] == "RELEASED_NO_EFFECT"
         )
         totals = _fee_scope_totals(conn, context["scope_sha256"])
-        remaining = int(context["total_fee_mojos"]) - totals["committed_fee_mojos"]
+        limits = _fee_wallet_limits(
+            conn, _fee_wallet_scopes(conn, context["scope_sha256"])
+        )
+        maximum = min(int(context["total_fee_mojos"]), limits["maximum_fee_mojos"])
+        unbounded = _fee_approval_is_unbounded(conn, approval_id)
+        protected = max(
+            int(context["cancellation_reserve_mojos"]),
+            limits["protected_cancellation_fee_mojos"],
+        )
+        remaining = maximum - totals["committed_fee_mojos"]
         remaining_preparation = min(
             remaining,
-            int(context["total_fee_mojos"])
-            - int(context["cancellation_reserve_mojos"])
-            - totals["noncancellation_committed_fee_mojos"],
+            maximum - protected - totals["noncancellation_committed_fee_mojos"],
         )
         stale = (
             int(context["version"]) != int(context["latest_version"])
@@ -21857,11 +25007,13 @@ def get_coin_prep_fee_approval_status(approval_id: str) -> Dict[str, Any]:
                 "cancellation": bool(pending["cancellation"]),
                 "effect_state": effect_state,
             }
+            # An unresolved hold is still part of the durable recovery state.
+            # Unbounded fee policy removes only the cumulative arithmetic cap.
         elif session_completed:
             effect_state = "complete"
         elif stale:
             effect_state = "stale"
-        elif remaining_preparation <= 0:
+        elif remaining_preparation <= 0 and not unbounded:
             effect_state = "paused_budget"
         else:
             effect_state = "approved"
@@ -21879,10 +25031,13 @@ def get_coin_prep_fee_approval_status(approval_id: str) -> Dict[str, Any]:
             "session_completed": session_completed,
             "stale": stale,
             "total_fee_mojos": int(context["total_fee_mojos"]),
+            "unbounded": unbounded,
             "cancellation_reserve_mojos": int(context["cancellation_reserve_mojos"]),
             **totals,
-            "remaining_fee_mojos": remaining,
-            "remaining_preparation_fee_mojos": remaining_preparation,
+            "remaining_fee_mojos": max(0, remaining) if unbounded else remaining,
+            "remaining_preparation_fee_mojos": (
+                max(0, remaining_preparation) if unbounded else remaining_preparation
+            ),
             "reservation_count": len(rows),
             "unresolved_operation_count": len(unresolved),
             "confirmed_operation_count": confirmed_count,
@@ -21927,7 +25082,15 @@ def reserve_approved_fee(
 
 
 def _reserve_approved_fee_locked(
-    conn, approval_id, scope, plan, operation, fee, cancellation
+    conn,
+    approval_id,
+    scope,
+    plan,
+    operation,
+    fee,
+    cancellation,
+    *,
+    allow_superseded_follow_cancellation=False,
 ):
     """Shared ledger arithmetic; caller owns the IMMEDIATE write transaction."""
     approval = conn.execute(
@@ -21940,6 +25103,21 @@ def _reserve_approved_fee_locked(
     ).fetchone()[0]
     if approval["scope_sha256"] != scope or approval["plan_sha256"] != plan:
         raise ValueError("FEE_APPROVAL_STALE")
+    if allow_superseded_follow_cancellation:
+        follow_approval = conn.execute(
+            "SELECT 1 FROM follow_run_authorities WHERE approval_id=? "
+            "AND maximum_fee_mojos=? "
+            "UNION ALL SELECT 1 FROM follow_fee_ceiling_revisions "
+            "WHERE approval_id=? AND maximum_fee_mojos=? LIMIT 1",
+            (
+                approval_id,
+                approval["total_fee_mojos"],
+                approval_id,
+                approval["total_fee_mojos"],
+            ),
+        ).fetchone()
+        if not cancellation or follow_approval is None:
+            raise ValueError("FEE_FOLLOW_AUTHORITY_REQUIRED")
     existing = conn.execute(
         "SELECT * FROM approved_fee_reservations WHERE operation_id=?", (operation,)
     ).fetchone()
@@ -21952,13 +25130,38 @@ def _reserve_approved_fee_locked(
         ):
             raise ValueError("FEE_OPERATION_CONFLICT")
         return {**dict(existing), "idempotent": True}
-    if approval["version"] != latest:
+    # A Follow cancellation already passed the exact run, identity and
+    # journal checks in its caller. Later unrelated approvals must not strand
+    # exact cleanup; the caller's selected effective run cap bounds this hold.
+    if approval["version"] != latest and not (
+        allow_superseded_follow_cancellation and cancellation
+    ):
         raise ValueError("FEE_APPROVAL_STALE")
     totals = _fee_scope_totals(conn, scope)
-    if totals["committed_fee_mojos"] + fee > approval["total_fee_mojos"] or (
-        not cancellation
-        and totals["noncancellation_committed_fee_mojos"] + fee
-        > approval["total_fee_mojos"] - approval["cancellation_reserve_mojos"]
+    limits = _fee_wallet_limits(conn, _fee_wallet_scopes(conn, scope))
+    unbounded = (
+        conn.execute(
+            "SELECT 1 FROM unbounded_fee_approvals WHERE approval_id=?",
+            (approval_id,),
+        ).fetchone()
+        is not None
+    )
+    maximum = (
+        None
+        if unbounded
+        else min(approval["total_fee_mojos"], limits["maximum_fee_mojos"])
+    )
+    protection = max(
+        approval["cancellation_reserve_mojos"],
+        limits["protected_cancellation_fee_mojos"],
+    )
+    if not unbounded and (
+        totals["committed_fee_mojos"] + fee > maximum
+        or (
+            not cancellation
+            and totals["noncancellation_committed_fee_mojos"] + fee
+            > maximum - protection
+        )
     ):
         raise ValueError("FEE_BUDGET_EXCEEDED")
     conn.execute(
@@ -22014,6 +25217,26 @@ def get_coin_prep_fee_dispatch_claim(
         conn.close()
 
 
+def _prep_claim_has_ineligible_reserve(conn, claim, approved_plan):
+    """Keep fixed reserves protected while allowing zero-floor top-up change."""
+
+    floors = approved_plan.get("reserve_floors_mojos", {})
+    source_ids = set(json.loads(claim["source_coin_ids_json"]))
+    rows = conn.execute(
+        "SELECT coin.coin_id, coin.wallet_type, coin.purpose "
+        "FROM wallet_effect_claim_coins AS effect_coin "
+        "JOIN coins AS coin ON coin.coin_id=effect_coin.coin_id "
+        "WHERE effect_coin.claim_token=? AND coin.designation='reserve'",
+        (claim["claim_token"],),
+    )
+    return any(
+        row["coin_id"] not in source_ids
+        or row["purpose"] != "top_up"
+        or floors.get(row["wallet_type"]) != 0
+        for row in rows
+    )
+
+
 def _recheck_held_prep_fee_locked(conn, operation_id, claim_token, generation, context):
     """Recheck held prep consent/quote/cohort after acquiring the dispatch lock.
 
@@ -22034,7 +25257,7 @@ def _recheck_held_prep_fee_locked(conn, operation_id, claim_token, generation, c
     if type(quote) is not dict or quote.get("available") is not True:
         raise ValueError("FEE_ESTIMATE_UNAVAILABLE")
     try:
-        fee, cost, target, observed, expiry = (
+        recommended_fee, cost, target, observed, expiry = (
             _fee_amount(quote.get(key))
             for key in (
                 "fee_mojos",
@@ -22046,13 +25269,19 @@ def _recheck_held_prep_fee_locked(conn, operation_id, claim_token, generation, c
         )
     except ValueError as exc:
         raise ValueError("FEE_QUOTE_INVALID") from exc
+    try:
+        executed_fee = _fee_amount(context.get("executed_fee_mojos"))
+    except ValueError as exc:
+        raise ValueError("FEE_QUOTE_INVALID") from exc
     if (
         cost == 0
         or quote.get("source") not in ("coinset", "full_node_rpc")
         or expiry != observed + 60
-        or fee != hold["fee_mojos"]
+        or executed_fee > recommended_fee
     ):
         raise ValueError("FEE_QUOTE_INVALID")
+    if executed_fee != hold["fee_mojos"]:
+        raise ValueError("FEE_EFFECT_CONTRACT_MISMATCH")
     if not observed <= int(time.time()) < expiry:
         raise ValueError("FEE_QUOTE_STALE")
     consent = conn.execute(
@@ -22095,21 +25324,14 @@ def _recheck_held_prep_fee_locked(conn, operation_id, claim_token, generation, c
         "AND resolution.claim_token IS NULL AND dispatch.claim_token IS NULL",
         (claim_token, generation, operation_id),
     ).fetchone()
-    if (
-        claim is None
-        or conn.execute(
-            "SELECT 1 FROM wallet_effect_claim_coins AS effect_coin "
-            "JOIN coins AS coin ON coin.coin_id=effect_coin.coin_id "
-            "WHERE effect_coin.claim_token=? AND coin.designation='reserve' LIMIT 1",
-            (claim_token,),
-        ).fetchone()
-        is not None
+    if claim is None or _prep_claim_has_ineligible_reserve(
+        conn, claim, json.loads(consent["plan_json"])
     ):
         raise ValueError("FEE_EFFECT_NOT_DISPATCHABLE")
     contract = json.loads(operation["target_contract_json"])
     if (
         contract.get("fee_mojos", contract.get("external_fee", {}).get("fee_mojos"))
-        != fee
+        != executed_fee
     ):
         raise ValueError("FEE_EFFECT_CONTRACT_MISMATCH")
 
@@ -22121,6 +25343,7 @@ def reserve_coin_prep_fee_for_dispatch(
     plan_sha256: str,
     operation_id: str,
     final_quote: Dict[str, Any],
+    executed_fee_mojos: int,
 ) -> Dict[str, Any]:
     """Hold a final prep fee against consent and its undispatched exact journal.
 
@@ -22132,6 +25355,8 @@ def reserve_coin_prep_fee_for_dispatch(
     claim and constructed additions must already be journaled. Recovery reads
     existing holds separately: even a matching reservation cannot be replayed.
     This prep-only boundary never borrows the protected cancellation allowance.
+    The network quote is a recommendation; the exact journaled effect may pay
+    less when a signed Follow per-transaction maximum applies.
     """
     approval_id = _fee_digest(approval_id)
     scope = _fee_digest(scope_sha256)
@@ -22140,7 +25365,8 @@ def reserve_coin_prep_fee_for_dispatch(
     if type(final_quote) is not dict or final_quote.get("available") is not True:
         raise ValueError("FEE_ESTIMATE_UNAVAILABLE")
     try:
-        fee = _fee_amount(final_quote.get("fee_mojos"))
+        recommended_fee = _fee_amount(final_quote.get("fee_mojos"))
+        fee = _fee_amount(executed_fee_mojos)
         cost = _fee_amount(final_quote.get("cost"))
         target_seconds = _fee_amount(final_quote.get("target_seconds"))
         observed_at = _fee_amount(final_quote.get("observed_at"))
@@ -22149,6 +25375,7 @@ def reserve_coin_prep_fee_for_dispatch(
         raise ValueError("FEE_QUOTE_INVALID") from exc
     if (
         cost == 0
+        or fee > recommended_fee
         or final_quote.get("source") not in ("coinset", "full_node_rpc")
         or expires_at != observed_at + 60
     ):
@@ -22212,14 +25439,8 @@ def reserve_coin_prep_fee_for_dispatch(
         # Reserve designations may change after service inventory checks. Do
         # not use availability-filtered get_reserve_coins here: own claimed
         # roots are intentionally unavailable to unrelated planners.
-        if (
-            conn.execute(
-                "SELECT 1 FROM wallet_effect_claim_coins AS effect_coin "
-                "JOIN coins AS coin ON coin.coin_id=effect_coin.coin_id "
-                "WHERE effect_coin.claim_token=? AND coin.designation='reserve' LIMIT 1",
-                (claim["claim_token"],),
-            ).fetchone()
-            is not None
+        if _prep_claim_has_ineligible_reserve(
+            conn, claim, json.loads(consent["plan_json"])
         ):
             raise ValueError("FEE_EFFECT_NOT_DISPATCHABLE")
         target = json.loads(operation["target_contract_json"])
@@ -22447,6 +25668,515 @@ def reserve_coin_prep_cancellation_fee(
         conn.close()
 
 
+def _follow_cancellation_fee_operation_id(run_id: str, manifest: dict) -> str:
+    return _fee_operation_identity(
+        hashlib.sha256(
+            f"follow-cancel:{run_id}:{manifest['cohort_id']}".encode("utf-8")
+        ).hexdigest()
+    )
+
+
+def reserve_follow_cancellation_fee(
+    *,
+    run_id: str,
+    identity: dict,
+    manifest_json: Dict[str, Any],
+    batch_contract: Dict[str, Any],
+    final_quote: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Atomically hold one exact Follow cohort against its effective run cap.
+
+    The hold is accounting, not wallet authority. A later final adapter check
+    must prove this same run, journal, quote and still-unsettled hold again.
+    """
+    run = _fee_digest(run_id)
+    encoded_identity = _follow_identity_json(identity)
+    identity_hash = hashlib.sha256(encoded_identity.encode("utf-8")).hexdigest()
+    manifest = validate_offer_cancel_cohort_manifest(manifest_json)
+    operation_id = _follow_cancellation_fee_operation_id(run, manifest)
+    if type(batch_contract) is not dict or set(batch_contract) != {
+        "protocol",
+        "trade_ids",
+        "source_coin_ids",
+        "fee_coin_id",
+        "fee_mojos",
+    }:
+        raise ValueError("FEE_CANCELLATION_PLAN_INVALID")
+    try:
+        fee = _fee_amount(batch_contract["fee_mojos"])
+        trade_ids = [
+            _fee_digest(str(value).lower().removeprefix("0x"))
+            for value in batch_contract["trade_ids"]
+        ]
+        source_ids = [
+            norm_coin_id(value) for value in batch_contract["source_coin_ids"]
+        ]
+        fee_coin_id = norm_coin_id(batch_contract["fee_coin_id"])
+    except (TypeError, ValueError) as exc:
+        raise ValueError("FEE_CANCELLATION_PLAN_INVALID") from exc
+    if (
+        fee == 0
+        or batch_contract["protocol"] != "sage_native_cancel_offers_zero_plus_fee_v1"
+        or type(batch_contract["trade_ids"]) is not list
+        or type(batch_contract["source_coin_ids"]) is not list
+        or len(trade_ids) != manifest["member_count"]
+        or len(source_ids) != manifest["member_count"]
+        or len(set(trade_ids)) != len(trade_ids)
+        or len(set(source_ids)) != len(source_ids)
+        or fee_coin_id in set(source_ids)
+        or trade_ids != [member["trade_id"] for member in manifest["members"]]
+    ):
+        raise ValueError("FEE_CANCELLATION_PLAN_INVALID")
+    if type(final_quote) is not dict or final_quote.get("available") is not True:
+        raise ValueError("FEE_ESTIMATE_UNAVAILABLE")
+    try:
+        quote_fee = _fee_amount(final_quote.get("fee_mojos"))
+        cost = _fee_amount(final_quote.get("cost"))
+        target_seconds = _fee_amount(final_quote.get("target_seconds"))
+        observed_at = _fee_amount(final_quote.get("observed_at"))
+        expires_at = _fee_amount(final_quote.get("expires_at"))
+    except ValueError as exc:
+        raise ValueError("FEE_QUOTE_INVALID") from exc
+    if (
+        quote_fee != fee
+        or cost == 0
+        or final_quote.get("source") not in ("coinset", "full_node_rpc")
+        or expires_at != observed_at + 60
+    ):
+        raise ValueError("FEE_QUOTE_INVALID")
+
+    conn = _stability_connection()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        now = int(time.time())
+        if not observed_at <= now < expires_at:
+            raise ValueError("FEE_QUOTE_STALE")
+        row = conn.execute(
+            "SELECT run.*, approval.scope_sha256, approval.plan_sha256, "
+            "approval.version, approval.total_fee_mojos, "
+            "approval.cancellation_reserve_mojos, preview.scope_json, "
+            "preview.plan_json "
+            "FROM follow_run_authorities AS run "
+            "JOIN fee_approvals AS approval USING(approval_id) "
+            "JOIN coin_prep_fee_consents AS consent USING(approval_id) "
+            "JOIN coin_prep_fee_previews AS preview USING(preview_id) "
+            "WHERE run.run_id=?",
+            (run,),
+        ).fetchone()
+        if row is None:
+            raise ValueError("FEE_FOLLOW_AUTHORITY_REQUIRED")
+        scope = json.loads(row["scope_json"])
+        plan = json.loads(row["plan_json"])
+        if (
+            row["identity_sha256"] != identity_hash
+            or row["identity_json"] != encoded_identity
+            or any(scope.get(key) != identity[key] for key in _FOLLOW_IDENTITY_FIELDS)
+            or scope.get("campaign_id") is not None
+            or scope.get("session_id") is None
+            or row["total_fee_mojos"] != row["maximum_fee_mojos"]
+            or row["cancellation_reserve_mojos"] < row["protected_shutdown_fee_mojos"]
+            or plan.get("target_seconds") != target_seconds
+            or hashlib.sha256(row["scope_json"].encode("utf-8")).hexdigest()
+            != row["scope_sha256"]
+            or hashlib.sha256(row["plan_json"].encode("utf-8")).hexdigest()
+            != row["plan_sha256"]
+        ):
+            raise ValueError("FEE_FOLLOW_AUTHORITY_REQUIRED")
+        if now < row["started_at_epoch"]:
+            raise ValueError("FOLLOW_RUN_NOT_STARTED")
+        if (
+            conn.execute(
+                "SELECT 1 FROM approved_fee_reservations WHERE operation_id=?",
+                (operation_id,),
+            ).fetchone()
+            is not None
+        ):
+            raise ValueError("FEE_OPERATION_REPLAY")
+        effective = get_effective_follow_fee_policy(
+            run_id=run, identity=identity, now_epoch=now
+        )
+        if effective.get("ready") is not True:
+            raise ValueError(
+                effective.get("reason_code") or "FEE_FOLLOW_AUTHORITY_REQUIRED"
+            )
+        latest_revision = conn.execute(
+            "SELECT * FROM follow_fee_ceiling_revisions WHERE run_id=? "
+            "ORDER BY revision DESC LIMIT 1",
+            (run,),
+        ).fetchone()
+        if (
+            effective["scope_sha256"] != row["scope_sha256"]
+            or effective["plan_sha256"] != row["plan_sha256"]
+            or effective["revision"]
+            != (latest_revision["revision"] if latest_revision else 0)
+            or effective["approval_id"]
+            != (
+                latest_revision["approval_id"]
+                if latest_revision
+                else row["approval_id"]
+            )
+            or effective["maximum_fee_mojos"]
+            != (
+                latest_revision["maximum_fee_mojos"]
+                if latest_revision
+                else row["maximum_fee_mojos"]
+            )
+        ):
+            raise ValueError("FOLLOW_FEE_REVISION_CHANGED")
+        if (
+            conn.execute(
+                "SELECT 1 FROM approved_fee_reservations AS reservation "
+                "LEFT JOIN approved_fee_outcomes AS outcome USING(operation_id) "
+                "WHERE reservation.scope_sha256=? AND outcome.operation_id IS NULL "
+                "LIMIT 1",
+                (row["scope_sha256"],),
+            ).fetchone()
+            is not None
+        ):
+            raise ValueError("FOLLOW_UNRESOLVED_EFFECT")
+        durable_manifest = conn.execute(
+            "SELECT manifest_sequence,cohort_id,manifest_sha256,member_count,"
+            "manifest_json,created_at FROM offer_cancel_cohort_manifests "
+            "WHERE cohort_id=?",
+            (manifest["cohort_id"],),
+        ).fetchone()
+        if durable_manifest is None or (
+            _validated_offer_cancel_cohort_manifest_row(dict(durable_manifest))
+            != manifest
+        ):
+            raise ValueError("FEE_CANCELLATION_JOURNAL_REQUIRED")
+        expected_wallet_effect = {
+            "secure": True,
+            "timeout": 60,
+            "fee_mojos": fee,
+            "batch": {k: v for k, v in batch_contract.items() if k != "fee_mojos"},
+        }
+        shutdown_cleanup = True
+        for member, source_id in zip(manifest["members"], source_ids):
+            prepared = conn.execute(
+                "SELECT * FROM offer_operation_journal WHERE event_id=?",
+                (member["prepared_event_id"],),
+            ).fetchone()
+            creation = conn.execute(
+                "SELECT * FROM offer_intents WHERE intent_id=?",
+                (member["intent_id"],),
+            ).fetchone()
+            if prepared is None or creation is None:
+                raise ValueError("FEE_CANCELLATION_JOURNAL_REQUIRED")
+            event = validate_offer_cancel_cohort_prepared_event(
+                dict(prepared), manifest
+            )
+            evidence = json.loads(event["evidence_json"])
+            shutdown_cleanup = (
+                shutdown_cleanup and evidence.get("reason") in _FOLLOW_SHUTDOWN_REASONS
+            )
+            journal = json.loads(event["wallet_identity_json"])
+            binding = journal.get("snapshot", {}).get("binding", {})
+            if (
+                creation["purpose"]
+                not in {
+                    f"follow:{run}:normal_lifecycle",
+                    f"follow:{run}:book_opportunity",
+                }
+                or creation["sage_trade_id"] != member["trade_id"]
+                or creation["network"] != identity["network"]
+                or creation["asset_id"] != identity["asset_id"]
+                or [
+                    norm_coin_id(coin_id)
+                    for coin_id in json.loads(creation["selected_coin_ids_json"])
+                ]
+                != [source_id]
+                or evidence.get("wallet_effect") != expected_wallet_effect
+                or not binding
+                or binding.get("backend") != identity["wallet_type"]
+                or binding.get("fingerprint") != identity["wallet_fingerprint"]
+                or binding.get("network_id") != identity["network"]
+                or conn.execute(
+                    "SELECT 1 FROM offer_cancel_effect_claims "
+                    "WHERE operation_id=? AND attempt=?",
+                    (member["operation_id"], member["attempt"]),
+                ).fetchone()
+                is not None
+            ):
+                raise ValueError("FEE_FOLLOW_AUTHORITY_REQUIRED")
+        fee_coin = conn.execute(
+            "SELECT designation FROM coins WHERE coin_id=?", (fee_coin_id,)
+        ).fetchone()
+        if fee_coin is not None and fee_coin["designation"] == "reserve":
+            raise ValueError("FEE_CANCELLATION_SCOPE_INVALID")
+        # While Follow is active, routine requotes must leave the shutdown
+        # allowance untouched. Stop or finite expiry ends creation rights;
+        # exact journaled cleanup may then spend the same run's allowance.
+        totals = _fee_scope_totals(conn, row["scope_sha256"])
+        committed_after = totals["committed_fee_mojos"] + fee
+        unbounded = _fee_approval_is_unbounded(conn, effective["approval_id"])
+        if not unbounded and committed_after > effective["maximum_fee_mojos"]:
+            raise ValueError("FEE_BUDGET_EXCEEDED")
+        stopped = (
+            conn.execute(
+                "SELECT 1 FROM follow_run_stops WHERE run_id=? AND stopped_at_epoch<=?",
+                (run, now),
+            ).fetchone()
+            is not None
+        )
+        cleanup_eligible = stopped or now >= row["expires_at_epoch"]
+        if (
+            not unbounded
+            and (not cleanup_eligible or not shutdown_cleanup)
+            and committed_after + row["protected_shutdown_fee_mojos"]
+            > effective["maximum_fee_mojos"]
+        ):
+            raise ValueError("FOLLOW_SHUTDOWN_RESERVE_PROTECTED")
+        result = _reserve_approved_fee_locked(
+            conn,
+            effective["approval_id"],
+            row["scope_sha256"],
+            row["plan_sha256"],
+            operation_id,
+            fee,
+            True,
+            allow_superseded_follow_cancellation=True,
+        )
+        conn.commit()
+        return {**result, "dispatch_authorized": False}
+    except BaseException:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def recheck_follow_cancellation_fee_hold(
+    *,
+    run_id: str,
+    identity: dict,
+    manifest_json: Dict[str, Any],
+    batch_contract: Dict[str, Any],
+    final_quote: Dict[str, Any],
+) -> bool:
+    """Read-only final adapter fence for one claimed, unsettled Follow hold."""
+    try:
+        run = _fee_digest(run_id)
+        encoded_identity = _follow_identity_json(identity)
+        identity_hash = hashlib.sha256(encoded_identity.encode("utf-8")).hexdigest()
+        manifest = validate_offer_cancel_cohort_manifest(manifest_json)
+        operation_id = _follow_cancellation_fee_operation_id(run, manifest)
+        if type(batch_contract) is not dict or set(batch_contract) != {
+            "protocol",
+            "trade_ids",
+            "source_coin_ids",
+            "fee_coin_id",
+            "fee_mojos",
+        }:
+            return False
+        fee = _fee_amount(batch_contract["fee_mojos"])
+        trade_ids = [
+            _fee_digest(str(value).lower().removeprefix("0x"))
+            for value in batch_contract["trade_ids"]
+        ]
+        source_ids = [
+            norm_coin_id(value) for value in batch_contract["source_coin_ids"]
+        ]
+        fee_coin_id = norm_coin_id(batch_contract["fee_coin_id"])
+        if (
+            fee == 0
+            or batch_contract["protocol"]
+            != "sage_native_cancel_offers_zero_plus_fee_v1"
+            or type(batch_contract["trade_ids"]) is not list
+            or type(batch_contract["source_coin_ids"]) is not list
+            or trade_ids != [m["trade_id"] for m in manifest["members"]]
+            or len(source_ids) != manifest["member_count"]
+            or len(set(source_ids)) != len(source_ids)
+            or fee_coin_id in set(source_ids)
+            or type(final_quote) is not dict
+            or final_quote.get("available") is not True
+            or final_quote.get("source") not in ("coinset", "full_node_rpc")
+            or final_quote.get("fee_mojos") != fee
+            or type(final_quote.get("cost")) is not int
+            or final_quote["cost"] <= 0
+            or type(final_quote.get("target_seconds")) is not int
+            or final_quote["target_seconds"] <= 0
+            or type(final_quote.get("observed_at")) is not int
+            or type(final_quote.get("expires_at")) is not int
+        ):
+            return False
+        now = int(time.time())
+        if not (
+            final_quote["observed_at"] <= now < final_quote["expires_at"]
+            and final_quote["expires_at"] == final_quote["observed_at"] + 60
+        ):
+            return False
+        conn = _stability_read_only_connection()
+        try:
+            conn.execute("BEGIN")
+            row = conn.execute(
+                "SELECT run.*, approval.scope_sha256, approval.plan_sha256, "
+                "approval.version, approval.total_fee_mojos, "
+                "approval.cancellation_reserve_mojos, preview.scope_json, "
+                "preview.plan_json "
+                "FROM follow_run_authorities AS run "
+                "JOIN fee_approvals AS approval USING(approval_id) "
+                "JOIN coin_prep_fee_consents AS consent USING(approval_id) "
+                "JOIN coin_prep_fee_previews AS preview USING(preview_id) "
+                "WHERE run.run_id=?",
+                (run,),
+            ).fetchone()
+            if row is None:
+                return False
+            scope = json.loads(row["scope_json"])
+            plan = json.loads(row["plan_json"])
+            hold = conn.execute(
+                "SELECT reservation.*, outcome.state AS accounting_outcome "
+                "FROM approved_fee_reservations AS reservation "
+                "LEFT JOIN approved_fee_outcomes AS outcome USING(operation_id) "
+                "WHERE reservation.operation_id=?",
+                (operation_id,),
+            ).fetchone()
+            effective = get_effective_follow_fee_policy(
+                run_id=run,
+                identity=identity,
+                now_epoch=now,
+                _own_unresolved_operation_id=operation_id,
+            )
+            revision = conn.execute(
+                "SELECT * FROM follow_fee_ceiling_revisions WHERE run_id=? "
+                "ORDER BY revision DESC LIMIT 1",
+                (run,),
+            ).fetchone()
+            if (
+                effective.get("ready") is not True
+                or effective["revision"] != (revision["revision"] if revision else 0)
+                or effective["approval_id"]
+                != (revision["approval_id"] if revision else row["approval_id"])
+                or row["identity_sha256"] != identity_hash
+                or row["identity_json"] != encoded_identity
+                or any(
+                    scope.get(key) != identity[key] for key in _FOLLOW_IDENTITY_FIELDS
+                )
+                or scope.get("campaign_id") is not None
+                or scope.get("session_id") is None
+                or row["total_fee_mojos"] != row["maximum_fee_mojos"]
+                or row["cancellation_reserve_mojos"]
+                < row["protected_shutdown_fee_mojos"]
+                or plan.get("target_seconds") != final_quote["target_seconds"]
+                or hashlib.sha256(row["scope_json"].encode("utf-8")).hexdigest()
+                != row["scope_sha256"]
+                or hashlib.sha256(row["plan_json"].encode("utf-8")).hexdigest()
+                != row["plan_sha256"]
+                or now < row["started_at_epoch"]
+                or hold is None
+                or hold["approval_id"] != effective["approval_id"]
+                or hold["scope_sha256"] != row["scope_sha256"]
+                or hold["plan_sha256"] != row["plan_sha256"]
+                or hold["fee_mojos"] != fee
+                or hold["cancellation"] != 1
+                or hold["accounting_outcome"] is not None
+            ):
+                return False
+            totals = _fee_scope_totals(conn, row["scope_sha256"])
+            if totals["committed_fee_mojos"] > effective[
+                "maximum_fee_mojos"
+            ] and not _fee_approval_is_unbounded(conn, effective["approval_id"]):
+                return False
+            stopped = (
+                conn.execute(
+                    "SELECT 1 FROM follow_run_stops WHERE run_id=? "
+                    "AND stopped_at_epoch<=?",
+                    (run, now),
+                ).fetchone()
+                is not None
+            )
+            other = conn.execute(
+                "SELECT 1 FROM approved_fee_reservations AS reservation "
+                "LEFT JOIN approved_fee_outcomes AS outcome USING(operation_id) "
+                "WHERE reservation.scope_sha256=? AND reservation.operation_id<>? "
+                "AND outcome.operation_id IS NULL LIMIT 1",
+                (row["scope_sha256"], operation_id),
+            ).fetchone()
+            if other is not None:
+                return False
+            durable = conn.execute(
+                "SELECT manifest_sequence,cohort_id,manifest_sha256,member_count,"
+                "manifest_json,created_at FROM offer_cancel_cohort_manifests "
+                "WHERE cohort_id=?",
+                (manifest["cohort_id"],),
+            ).fetchone()
+            if durable is None or (
+                _validated_offer_cancel_cohort_manifest_row(dict(durable)) != manifest
+            ):
+                return False
+            expected_wallet_effect = {
+                "secure": True,
+                "timeout": 60,
+                "fee_mojos": fee,
+                "batch": {k: v for k, v in batch_contract.items() if k != "fee_mojos"},
+            }
+            shutdown_cleanup = True
+            for member, source_id in zip(manifest["members"], source_ids):
+                prepared = conn.execute(
+                    "SELECT * FROM offer_operation_journal WHERE event_id=?",
+                    (member["prepared_event_id"],),
+                ).fetchone()
+                creation = conn.execute(
+                    "SELECT * FROM offer_intents WHERE intent_id=?",
+                    (member["intent_id"],),
+                ).fetchone()
+                claim = conn.execute(
+                    "SELECT 1 FROM offer_cancel_effect_claims "
+                    "WHERE operation_id=? AND attempt=?",
+                    (member["operation_id"], member["attempt"]),
+                ).fetchone()
+                if prepared is None or creation is None or claim is None:
+                    return False
+                event = validate_offer_cancel_cohort_prepared_event(
+                    dict(prepared), manifest
+                )
+                evidence = json.loads(event["evidence_json"])
+                shutdown_cleanup = (
+                    shutdown_cleanup
+                    and evidence.get("reason") in _FOLLOW_SHUTDOWN_REASONS
+                )
+                journal = json.loads(event["wallet_identity_json"])
+                binding = journal.get("snapshot", {}).get("binding", {})
+                if (
+                    creation["purpose"]
+                    not in {
+                        f"follow:{run}:normal_lifecycle",
+                        f"follow:{run}:book_opportunity",
+                    }
+                    or creation["sage_trade_id"] != member["trade_id"]
+                    or creation["network"] != identity["network"]
+                    or creation["asset_id"] != identity["asset_id"]
+                    or [
+                        norm_coin_id(coin_id)
+                        for coin_id in json.loads(creation["selected_coin_ids_json"])
+                    ]
+                    != [source_id]
+                    or evidence.get("wallet_effect") != expected_wallet_effect
+                    or binding.get("backend") != identity["wallet_type"]
+                    or binding.get("fingerprint") != identity["wallet_fingerprint"]
+                    or binding.get("network_id") != identity["network"]
+                ):
+                    return False
+            cleanup_eligible = stopped or now >= row["expires_at_epoch"]
+            if (
+                not _fee_approval_is_unbounded(conn, effective["approval_id"])
+                and (not cleanup_eligible or not shutdown_cleanup)
+                and totals["committed_fee_mojos"]
+                + effective["protected_shutdown_fee_mojos"]
+                > effective["maximum_fee_mojos"]
+            ):
+                return False
+            fee_coin = conn.execute(
+                "SELECT designation FROM coins WHERE coin_id=?", (fee_coin_id,)
+            ).fetchone()
+            return fee_coin is None or fee_coin["designation"] != "reserve"
+        finally:
+            conn.close()
+    except Exception:
+        return False
+
+
 def _coin_prep_cancellation_fee_operation_id(manifest: Dict[str, Any]) -> str:
     return _fee_operation_identity(
         hashlib.sha256(
@@ -22514,8 +26244,76 @@ def get_unsettled_coin_prep_cancellation_manifests() -> List[Dict[str, Any]]:
         conn.close()
 
 
+def get_unsettled_follow_cancellation_manifests() -> List[Dict[str, Any]]:
+    """Read exact unsettled Follow holds for proof-only restart accounting.
+
+    This grants no wallet signing or cancellation retry authority. Every
+    returned run/cohort is bound to an approved run revision and reservation.
+    """
+
+    conn = _stability_read_only_connection()
+    try:
+        rows = conn.execute(
+            "SELECT run.run_id, manifest.manifest_sequence, manifest.cohort_id, "
+            "manifest.manifest_sha256, manifest.member_count, "
+            "manifest.manifest_json, manifest.created_at "
+            "FROM approved_fee_reservations AS reservation "
+            "JOIN follow_run_authorities AS run "
+            "ON (run.approval_id=reservation.approval_id OR EXISTS ("
+            "SELECT 1 FROM follow_fee_ceiling_revisions AS revision "
+            "WHERE revision.run_id=run.run_id "
+            "AND revision.approval_id=reservation.approval_id)) "
+            "JOIN offer_cancel_cohort_manifests AS manifest "
+            "ON reservation.operation_id=catalyst_sha256("
+            "'follow-cancel:' || run.run_id || ':' || manifest.cohort_id) "
+            "LEFT JOIN approved_fee_outcomes AS outcome "
+            "ON outcome.operation_id=reservation.operation_id "
+            "WHERE reservation.cancellation=1 AND outcome.operation_id IS NULL "
+            "ORDER BY manifest.manifest_sequence LIMIT ?",
+            (_CANCEL_COHORT_MEMBER_LIMIT + 1,),
+        ).fetchall()
+        if len(rows) > _CANCEL_COHORT_MEMBER_LIMIT:
+            raise RuntimeError("unsettled Follow fee recovery limit exceeded")
+        return [
+            {
+                "run_id": _fee_digest(row["run_id"]),
+                "manifest": _validated_offer_cancel_cohort_manifest_row(
+                    {
+                        key: row[key]
+                        for key in (
+                            "manifest_sequence",
+                            "cohort_id",
+                            "manifest_sha256",
+                            "member_count",
+                            "manifest_json",
+                            "created_at",
+                        )
+                    }
+                ),
+            }
+            for row in rows
+        ]
+    finally:
+        conn.close()
+
+
 def record_coin_prep_cancellation_fee_outcome(
     manifest_json: Dict[str, Any],
+) -> Dict[str, Any]:
+    return _record_protected_cancellation_fee_outcome(manifest_json, run_id=None)
+
+
+def record_follow_cancellation_fee_outcome(
+    *, run_id: str, manifest_json: Dict[str, Any]
+) -> Dict[str, Any]:
+    """Settle a Follow hold only from terminal authoritative cohort proof."""
+    return _record_protected_cancellation_fee_outcome(
+        manifest_json, run_id=_fee_digest(run_id)
+    )
+
+
+def _record_protected_cancellation_fee_outcome(
+    manifest_json: Dict[str, Any], *, run_id: Optional[str]
 ) -> Dict[str, Any]:
     """Settle a protected cancellation hold from immutable journal proof only.
 
@@ -22527,7 +26325,11 @@ def record_coin_prep_cancellation_fee_outcome(
     """
 
     manifest = validate_offer_cancel_cohort_manifest(manifest_json)
-    operation_id = _coin_prep_cancellation_fee_operation_id(manifest)
+    operation_id = (
+        _coin_prep_cancellation_fee_operation_id(manifest)
+        if run_id is None
+        else _follow_cancellation_fee_operation_id(run_id, manifest)
+    )
     conn = _stability_connection()
     try:
         conn.execute("BEGIN IMMEDIATE")
@@ -22537,6 +26339,20 @@ def record_coin_prep_cancellation_fee_outcome(
         ).fetchone()
         if reservation is None or int(reservation["cancellation"]) != 1:
             raise ValueError("FEE_RESERVATION_REQUIRED")
+        if run_id is not None:
+            run = conn.execute(
+                "SELECT approval_id FROM follow_run_authorities WHERE run_id=?",
+                (run_id,),
+            ).fetchone()
+            revised = conn.execute(
+                "SELECT 1 FROM follow_fee_ceiling_revisions "
+                "WHERE run_id=? AND approval_id=?",
+                (run_id, reservation["approval_id"]),
+            ).fetchone()
+            if run is None or (
+                reservation["approval_id"] != run["approval_id"] and revised is None
+            ):
+                raise ValueError("FEE_FOLLOW_AUTHORITY_REQUIRED")
         durable = conn.execute(
             "SELECT manifest_sequence,cohort_id,manifest_sha256,member_count,"
             "manifest_json,created_at FROM offer_cancel_cohort_manifests "
@@ -22551,6 +26367,21 @@ def record_coin_prep_cancellation_fee_outcome(
         states: set[str] = set()
         terminal_members = []
         for member in manifest["members"]:
+            if run_id is not None:
+                creation = conn.execute(
+                    "SELECT purpose,sage_trade_id FROM offer_intents WHERE intent_id=?",
+                    (member["intent_id"],),
+                ).fetchone()
+                if (
+                    creation is None
+                    or creation["purpose"]
+                    not in {
+                        f"follow:{run_id}:normal_lifecycle",
+                        f"follow:{run_id}:book_opportunity",
+                    }
+                    or creation["sage_trade_id"] != member["trade_id"]
+                ):
+                    raise ValueError("FEE_FOLLOW_AUTHORITY_REQUIRED")
             rows = conn.execute(
                 "SELECT * FROM offer_operation_journal "
                 "WHERE operation_id=? AND attempt=? ORDER BY sequence",
@@ -22613,7 +26444,11 @@ def record_coin_prep_cancellation_fee_outcome(
         state = states.pop()
         outcome_evidence = {
             "schema_version": 1,
-            "kind": "coin_prep_cancellation_fee_outcome",
+            "kind": (
+                "coin_prep_cancellation_fee_outcome"
+                if run_id is None
+                else "follow_cancellation_fee_outcome"
+            ),
             "state": state,
             "operation_id": operation_id,
             "cohort_id": manifest["cohort_id"],
@@ -22621,6 +26456,8 @@ def record_coin_prep_cancellation_fee_outcome(
             "fee_mojos": int(reservation["fee_mojos"]),
             "members": terminal_members,
         }
+        if run_id is not None:
+            outcome_evidence["follow_run_id"] = run_id
         encoded = json.dumps(
             outcome_evidence,
             ensure_ascii=True,
@@ -23570,6 +27407,145 @@ def _validated_offer_cancel_cohort_manifest_row(row: Any) -> Dict[str, Any]:
     return manifest
 
 
+def _replacement_claim_failed_without_effect(
+    conn: sqlite3.Connection, child: Dict[str, Any]
+) -> bool:
+    """Ignore only a child whose durable creation proof excludes an offer."""
+
+    if (
+        child["lifecycle_state"] != "creation_failed"
+        or child["sage_trade_id"] is not None
+        or child["offer_text_sha256"] is not None
+        or child["publication_identity"] is not None
+        or child["submitted_at"] is not None
+        or child["confirmed_at"] is not None
+        or child["first_visible_at"] is not None
+        or child["terminal_at"] is None
+    ):
+        return False
+    rows = conn.execute(
+        "SELECT * FROM offer_operation_journal "
+        "WHERE intent_id=? AND operation_type='CREATE' ORDER BY sequence",
+        (child["intent_id"],),
+    ).fetchall()
+    if len(rows) != 2:
+        return False
+    try:
+        prepared, finalized = (
+            validate_offer_operation_event(dict(row)) for row in rows
+        )
+        evidence = json.loads(finalized["evidence_json"])
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+        return False
+    return bool(
+        prepared["phase"] == "PREPARED"
+        and prepared["outcome"] == "PREPARED"
+        and finalized["phase"] == "FINALIZED"
+        and finalized["outcome"] == "FAILED"
+        and finalized["operation_id"] == prepared["operation_id"]
+        and finalized["attempt"] == prepared["attempt"]
+        and finalized["blocks_mutation"] == 0
+        and finalized["transaction_id"] is None
+        and finalized["spend_identity"] is None
+        and type(evidence) is dict
+        and evidence.get("effect_attempted") is False
+    )
+
+
+def _released_follow_predispatch_retry_proven(
+    conn: sqlite3.Connection, prepared: Dict[str, Any], recovered: Dict[str, Any]
+) -> bool:
+    """Require the exact committed no-effect cohort before attempt N+1."""
+
+    from cancel_outcomes import CANCEL_FAILED, cancellation_result
+
+    try:
+        if (
+            recovered["event_id"]
+            != f"{prepared['operation_id']}:attempt:{prepared['attempt']}:reconciled"
+            or recovered["operation_id"] != prepared["operation_id"]
+            or recovered["intent_id"] != prepared["intent_id"]
+            or recovered["attempt"] != prepared["attempt"]
+            or recovered["phase"] != "RECONCILED"
+            or recovered["outcome"] != CANCEL_FAILED
+            or recovered["reason_code"] != "FOLLOW_PREDISPATCH_NO_EFFECT"
+            or recovered["blocks_mutation"] != 0
+            or recovered["transaction_id"] is not None
+            or recovered["spend_identity"] is not None
+            or recovered["wallet_identity_json"] != prepared["wallet_identity_json"]
+        ):
+            return False
+        proof = json.loads(recovered["evidence_json"])
+        prepared_proof = json.loads(prepared["evidence_json"])
+        if type(proof) is not dict or type(prepared_proof) is not dict:
+            return False
+        wallet_proof = proof.get("wallet_evidence")
+        expected_result = cancellation_result(
+            CANCEL_FAILED,
+            method="follow_predispatch_no_effect",
+            raw_response={"reason_code": "FOLLOW_PREDISPATCH_NO_EFFECT"},
+            error="CANCEL_REJECTED",
+        )
+        if (
+            set(proof)
+            != {
+                "trade_id",
+                "attempt",
+                "cohort_id",
+                "member_id",
+                "effect_attempted",
+                "cancel_result",
+                "wallet_evidence",
+                "wallet_evidence_sha256",
+            }
+            or proof["trade_id"] != prepared_proof.get("trade_id")
+            or proof["attempt"] != prepared["attempt"]
+            or proof["cohort_id"] != prepared_proof.get("cohort_id")
+            or proof["member_id"] != prepared_proof.get("member_id")
+            or proof["effect_attempted"] is not False
+            or proof["cancel_result"] != expected_result
+            or type(wallet_proof) is not dict
+            or hashlib.sha256(
+                _canonical_json_text(
+                    wallet_proof, "wallet_evidence", expected_type=dict
+                ).encode("utf-8")
+            ).hexdigest()
+            != proof["wallet_evidence_sha256"]
+        ):
+            return False
+        manifest_row = conn.execute(
+            "SELECT * FROM offer_cancel_cohort_manifests WHERE cohort_id=?",
+            (proof["cohort_id"],),
+        ).fetchone()
+        if manifest_row is None:
+            return False
+        manifest = _validated_offer_cancel_cohort_manifest_row(dict(manifest_row))
+        validate_offer_cancel_cohort_prepared_event(prepared, manifest)
+        creation = conn.execute(
+            "SELECT purpose FROM offer_intents WHERE intent_id=?",
+            (prepared["intent_id"],),
+        ).fetchone()
+        purpose = creation["purpose"] if creation else None
+        parts = purpose.split(":") if type(purpose) is str else []
+        if (
+            len(parts) != 3
+            or parts[0] != "follow"
+            or parts[2] not in {"normal_lifecycle", "book_opportunity"}
+        ):
+            return False
+        fee_proof = get_released_follow_predispatch_cancel_fee_outcome(
+            run_id=parts[1], manifest_json=manifest, connection=conn
+        )
+        return any(
+            member["operation_id"] == prepared["operation_id"]
+            and member["event_id"] == recovered["event_id"]
+            and member["evidence_sha256"] == recovered["evidence_sha256"]
+            for member in fee_proof["members"]
+        )
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+        return False
+
+
 def _prepare_offer_cancel_in_transaction(
     conn: sqlite3.Connection,
     *,
@@ -23594,6 +27570,40 @@ def _prepare_offer_cancel_in_transaction(
     ).fetchone()
     prior_lifecycle_state = None
     if existing is None:
+        registered = conn.execute(
+            "SELECT intent_id, child_intent_id FROM offer_intents "
+            "WHERE sage_trade_id=?",
+            (safe_trade_id,),
+        ).fetchone()
+        if registered is not None:
+            child_id = registered["child_intent_id"]
+            child_claims = conn.execute(
+                "SELECT * FROM offer_intents WHERE parent_intent_id=?",
+                (registered["intent_id"],),
+            ).fetchall()
+            active_claims = [
+                claim
+                for claim in child_claims
+                if not _replacement_claim_failed_without_effect(conn, dict(claim))
+            ]
+            if child_id or active_claims:
+                if registered["intent_id"] != intent_id:
+                    raise ValueError("cancellation intent identity differs")
+                if (
+                    not child_id
+                    or len(active_claims) != 1
+                    or active_claims[0]["intent_id"] != child_id
+                ):
+                    raise ValueError("replacement child lineage is not bound")
+                _parent, child = _refresh_lineage_rows(
+                    conn, registered["intent_id"], child_id
+                )
+                if (
+                    child["lifecycle_state"] != "visible"
+                    or not child["publication_identity"]
+                    or not child["first_visible_at"]
+                ):
+                    raise ValueError("replacement child is not visible")
         prior_rows = conn.execute(
             """
             SELECT * FROM offer_operation_journal
@@ -23619,8 +27629,19 @@ def _prepare_offer_cancel_in_transaction(
                     or prepared_prior["phase"] != "PREPARED"
                     or prepared_prior["outcome"] != "PREPARED"
                     or finalized_prior["attempt"] != prior_attempt
-                    or finalized_prior["phase"] != "FINALIZED"
                 ):
+                    raise ValueError(
+                        "cancellation attempt must follow exact prior failed"
+                    )
+                if finalized_prior["phase"] == "RECONCILED":
+                    if not _released_follow_predispatch_retry_proven(
+                        conn, prepared_prior, finalized_prior
+                    ):
+                        raise ValueError(
+                            "cancellation attempt must follow exact prior failed"
+                        )
+                    continue
+                if finalized_prior["phase"] != "FINALIZED":
                     raise ValueError(
                         "cancellation attempt must follow exact prior failed"
                     )
@@ -24041,7 +28062,26 @@ def get_unresolved_offer_cancel_cohort_manifests() -> List[Dict[str, Any]]:
                 (member["operation_id"], member["attempt"]),
             ).fetchone()
             if finalized is None:
-                has_unresolved = True
+                recovered = conn.execute(
+                    "SELECT * FROM offer_operation_journal "
+                    "WHERE operation_id=? AND attempt=? AND phase='RECONCILED'",
+                    (member["operation_id"], member["attempt"]),
+                ).fetchone()
+                if recovered is None:
+                    has_unresolved = True
+                else:
+                    recovery = validate_offer_operation_event(dict(recovered))
+                    recovery_evidence = json.loads(recovery["evidence_json"])
+                    if (
+                        recovery["outcome"] != "CANCEL_FAILED"
+                        or recovery["reason_code"] != "FOLLOW_PREDISPATCH_NO_EFFECT"
+                        or recovery["blocks_mutation"] != 0
+                        or recovery["transaction_id"] is not None
+                        or recovery_evidence.get("cohort_id") != manifest["cohort_id"]
+                        or recovery_evidence.get("trade_id") != member["trade_id"]
+                        or recovery_evidence.get("wallet_evidence_sha256") is None
+                    ):
+                        raise ValueError("durable pre-dispatch recovery is invalid")
             else:
                 final_event = validate_offer_operation_event(dict(finalized))
                 if (
@@ -24428,6 +28468,8 @@ def _offer_cancel_finalization_values(
 def _finalize_offer_cancel_in_transaction(
     conn: sqlite3.Connection,
     values: Dict[str, Any],
+    *,
+    refresh_abort_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     journal = values["journal"]
     safe_trade_id = values["safe_trade_id"]
@@ -24478,7 +28520,7 @@ def _finalize_offer_cancel_in_transaction(
             )
     else:
         effect_claim = conn.execute(
-            "SELECT recovery_generation FROM offer_cancel_effect_claims "
+            "SELECT recovery_generation,prepared_event_id FROM offer_cancel_effect_claims "
             "WHERE operation_id=? AND attempt=?",
             (safe_operation_id, safe_attempt),
         ).fetchone()
@@ -24486,11 +28528,24 @@ def _finalize_offer_cancel_in_transaction(
             latch = conn.execute(
                 "SELECT generation,state FROM runtime_safety_latch WHERE singleton_id=1"
             ).fetchone()
-            if (
-                latch is None
-                or latch["state"] != "resolved"
-                or int(effect_claim["recovery_generation"]) != int(latch["generation"])
-            ):
+            ordinary_recovery = (
+                latch is not None
+                and latch["state"] == "resolved"
+                and int(effect_claim["recovery_generation"]) == int(latch["generation"])
+            )
+            scoped_abort = (
+                refresh_abort_id is not None
+                and _authorize_refresh_abort_cancel_finalization(
+                    conn,
+                    abort_id=refresh_abort_id,
+                    trade_id=safe_trade_id,
+                    intent_id=safe_intent_id,
+                    operation_id=safe_operation_id,
+                    prepared_event_id=str(effect_claim["prepared_event_id"]),
+                    recovery_generation=int(effect_claim["recovery_generation"]),
+                )
+            )
+            if not ordinary_recovery and not scoped_abort:
                 raise ValueError(
                     "cancellation completion is fenced by runtime recovery"
                 )
@@ -24522,6 +28577,91 @@ def _finalize_offer_cancel_in_transaction(
             (next_lifecycle_state, safe_trade_id),
         )
     return row
+
+
+def _authorize_refresh_abort_cancel_finalization(
+    conn: sqlite3.Connection,
+    *,
+    abort_id: str,
+    trade_id: str,
+    intent_id: str,
+    operation_id: str,
+    prepared_event_id: str,
+    recovery_generation: int,
+) -> bool:
+    """Permit only a claimed Task 8 result under its retained exact abort fence."""
+
+    row = conn.execute(
+        "SELECT * FROM offer_refresh_aborts WHERE abort_id=?", (abort_id,)
+    ).fetchone()
+    if row is None:
+        return False
+    abort = dict(row)
+    fee_hold = _refresh_abort_prepared_fee_hold(
+        conn,
+        prepared_operation_id=operation_id,
+        trade_id=trade_id,
+        intent_id=intent_id,
+        campaign_id=abort["campaign_id"],
+    )
+    if fee_hold is None:
+        raise ValueError("exact cleanup fee reservation is missing")
+    _assert_refresh_abort_effect_scope(conn, {operation_id}, fee_hold)
+    latch_row = conn.execute(
+        "SELECT * FROM runtime_safety_latch WHERE singleton_id=1"
+    ).fetchone()
+    lease_row = conn.execute(
+        "SELECT * FROM runtime_mutation_lease WHERE singleton_id=1"
+    ).fetchone()
+    campaign_row = conn.execute(
+        "SELECT status FROM bootstrap_campaigns WHERE campaign_id=?",
+        (abort["campaign_id"],),
+    ).fetchone()
+    intent_row = conn.execute(
+        "SELECT * FROM offer_intents WHERE intent_id=?", (intent_id,)
+    ).fetchone()
+    child_row = conn.execute(
+        "SELECT * FROM offer_intents WHERE intent_id=?",
+        (abort["child_intent_id"],),
+    ).fetchone()
+    if (
+        latch_row is None
+        or lease_row is None
+        or campaign_row is None
+        or intent_row is None
+        or child_row is None
+    ):
+        return False
+    latch, lease, intent = dict(latch_row), dict(lease_row), dict(intent_row)
+    return bool(
+        abort["state"] == "parent_terminal"
+        and trade_id in json.loads(abort["target_trade_ids_json"])
+        and operation_id == f"cancel:{trade_id}"
+        and prepared_event_id == f"{operation_id}:attempt:1:prepared"
+        and intent["sage_trade_id"] == trade_id
+        and intent["lifecycle_state"] in {"created", "visible", "cancel_requested"}
+        and _refresh_abort_child_is_fenced_or_cancelled(conn, abort, dict(child_row))
+        and child_row["parent_intent_id"] == abort["parent_intent_id"]
+        and intent["wallet_fingerprint_hash"] == abort["wallet_fingerprint_hash"]
+        and intent["network"] == abort["network"]
+        and intent["asset_id"] == abort["asset_id"]
+        and latch["state"] == "tripped"
+        and latch["generation"] == abort["latch_generation"]
+        and recovery_generation == abort["latch_generation"]
+        and set(json.loads(latch["blocking_operation_ids_json"]))
+        == {abort["blocking_operation_id"], operation_id}
+        and lease["active"] == 1
+        and lease["owner_run_id"] == abort["owner_run_id"]
+        and lease["acquired_at"] == abort["lease_acquired_at"]
+        and lease["owner_pid"] == abort["lease_owner_pid"]
+        and lease["owner_host"] == abort["lease_owner_host"]
+        and lease["wallet_fingerprint_hash"] == abort["wallet_fingerprint_hash"]
+        and lease["network"] == abort["network"]
+        and lease["expires_at"] is not None
+        and lease["expires_at"] > _stability_wall_clock()
+        and campaign_row["status"] == "stopped"
+        and _refresh_abort_unresolved_journal_ids(conn) == {operation_id}
+    )
 
 
 def finalize_offer_cancel(
@@ -24573,10 +28713,13 @@ def finalize_offer_cancel_cohort(
     manifest_json: Any,
     member_requests_json: Any,
     finalized_at: Any = None,
+    refresh_abort_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Atomically finalize every member of one shared cancellation effect."""
 
     manifest = validate_offer_cancel_cohort_manifest(manifest_json)
+    if refresh_abort_id is not None and manifest["member_count"] != 1:
+        raise ValueError("refresh abort completion requires one exact target")
     if (
         type(member_requests_json) is not list
         or len(member_requests_json) != manifest["member_count"]
@@ -24648,7 +28791,11 @@ def finalize_offer_cancel_cohort(
                 dict(prepared_row),
                 manifest,
             )
-            events.append(_finalize_offer_cancel_in_transaction(conn, values))
+            events.append(
+                _finalize_offer_cancel_in_transaction(
+                    conn, values, refresh_abort_id=refresh_abort_id
+                )
+            )
         conn.commit()
         return {"manifest": manifest, "events": events}
     except Exception:
@@ -24818,6 +28965,384 @@ def reconcile_rejected_offer_cancel_cohort(
         conn.close()
 
 
+def reconcile_follow_predispatch_cancel_cohort(
+    *,
+    run_id: str,
+    manifest_json: Any,
+    expected_latch_generation: int,
+    wallet_fingerprint_hash: str,
+    network: str,
+    wallet_evidence: Dict[str, Any],
+    reconciled_at: Any = None,
+) -> Dict[str, Any]:
+    """Release one claimed Follow cohort fenced before its wallet call.
+
+    The exact latch reason is written only after the fee recheck rejects and
+    before ``wallet.cancel_offers_batch``. The caller must additionally supply
+    fresh, complete Sage no-effect reads for every claimed coin and offer.
+    """
+
+    from cancel_outcomes import CANCEL_FAILED, cancellation_result
+
+    manifest = validate_offer_cancel_cohort_manifest(manifest_json)
+    run = _fee_digest(run_id)
+    if (
+        type(expected_latch_generation) is not int
+        or expected_latch_generation < 1
+        or type(wallet_evidence) is not dict
+        or set(wallet_evidence)
+        != {
+            "source_coins",
+            "fee_coin",
+            "offers",
+            "pending_transactions",
+            "observed_at_epoch",
+        }
+        or wallet_evidence["pending_transactions"] != []
+        or type(wallet_evidence["observed_at_epoch"]) is not int
+        or not int(time.time()) - 15
+        <= wallet_evidence["observed_at_epoch"]
+        <= int(time.time())
+        or type(wallet_evidence["source_coins"]) is not list
+        or type(wallet_evidence["offers"]) is not list
+        or type(wallet_evidence["fee_coin"]) is not dict
+    ):
+        raise ValueError("Follow pre-dispatch no-effect evidence is incomplete")
+    safe_wallet_hash = _required_stability_text(
+        wallet_fingerprint_hash, "wallet_fingerprint_hash"
+    )
+    safe_network = _required_stability_text(network, "network")
+    when = _stability_timestamp_or_now(reconciled_at, "reconciled_at")
+    no_effect = cancellation_result(
+        CANCEL_FAILED,
+        method="follow_predispatch_no_effect",
+        raw_response={"reason_code": "FOLLOW_PREDISPATCH_NO_EFFECT"},
+        error="CANCEL_REJECTED",
+    )
+    conn = _stability_connection()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        latch_row = conn.execute(
+            "SELECT * FROM runtime_safety_latch WHERE singleton_id=1"
+        ).fetchone()
+        if latch_row is None:
+            raise ValueError("Follow pre-dispatch latch is missing")
+        latch = dict(latch_row)
+        operation_ids = [member["operation_id"] for member in manifest["members"]]
+        if (
+            latch["state"] != "tripped"
+            or latch["reason_code"] != "UNRESOLVED_OPERATIONS"
+            or latch["reason"]
+            != "Follow cancellation fee hold changed after effect claim"
+            or latch["generation"] != expected_latch_generation
+            or latch["wallet_fingerprint_hash"] != safe_wallet_hash
+            or latch["network"] != safe_network
+            or json.loads(latch["blocking_operation_ids_json"]) != sorted(operation_ids)
+        ):
+            raise ValueError("Follow pre-dispatch latch does not match cohort")
+        durable = conn.execute(
+            "SELECT * FROM offer_cancel_cohort_manifests WHERE cohort_id=?",
+            (manifest["cohort_id"],),
+        ).fetchone()
+        if (
+            durable is None
+            or _validated_offer_cancel_cohort_manifest_row(dict(durable)) != manifest
+        ):
+            raise ValueError("Follow pre-dispatch manifest is not durable")
+        fee_operation_id = _follow_cancellation_fee_operation_id(run, manifest)
+        hold = conn.execute(
+            "SELECT reservation.*, outcome.state AS accounting_outcome "
+            "FROM approved_fee_reservations AS reservation "
+            "LEFT JOIN approved_fee_outcomes AS outcome USING(operation_id) "
+            "WHERE reservation.operation_id=?",
+            (fee_operation_id,),
+        ).fetchone()
+        if (
+            hold is None
+            or hold["cancellation"] != 1
+            or hold["accounting_outcome"] is not None
+        ):
+            raise ValueError("Follow pre-dispatch fee hold is missing")
+        run_row = conn.execute(
+            "SELECT approval_id FROM follow_run_authorities WHERE run_id=?",
+            (run,),
+        ).fetchone()
+        stopped = conn.execute(
+            "SELECT 1 FROM follow_run_stops WHERE run_id=?",
+            (run,),
+        ).fetchone()
+        lease = conn.execute(
+            "SELECT active,expires_at FROM runtime_mutation_lease WHERE singleton_id=1"
+        ).fetchone()
+        if stopped is None or lease is None or lease["active"] != 0:
+            raise ValueError("Follow pre-dispatch recovery requires a stopped runtime")
+        if run_row is None or (
+            hold["approval_id"] != run_row["approval_id"]
+            and conn.execute(
+                "SELECT 1 FROM follow_fee_ceiling_revisions "
+                "WHERE run_id=? AND approval_id=?",
+                (run, hold["approval_id"]),
+            ).fetchone()
+            is None
+        ):
+            raise ValueError("Follow pre-dispatch fee hold has wrong run")
+        prepared_rows = []
+        source_ids = []
+        for member in manifest["members"]:
+            prepared_row = conn.execute(
+                "SELECT * FROM offer_operation_journal WHERE event_id=?",
+                (member["prepared_event_id"],),
+            ).fetchone()
+            claim = conn.execute(
+                "SELECT * FROM offer_cancel_effect_claims "
+                "WHERE operation_id=? AND attempt=?",
+                (member["operation_id"], member["attempt"]),
+            ).fetchone()
+            later = conn.execute(
+                "SELECT 1 FROM offer_operation_journal "
+                "WHERE operation_id=? AND sequence>(SELECT sequence FROM "
+                "offer_operation_journal WHERE event_id=?)",
+                (member["operation_id"], member["prepared_event_id"]),
+            ).fetchone()
+            creation = conn.execute(
+                "SELECT purpose,sage_trade_id,lifecycle_state FROM offer_intents "
+                "WHERE intent_id=?",
+                (member["intent_id"],),
+            ).fetchone()
+            if (
+                prepared_row is None
+                or claim is None
+                or later is not None
+                or creation is None
+            ):
+                raise ValueError("Follow pre-dispatch member proof is incomplete")
+            prepared = validate_offer_operation_event(dict(prepared_row))
+            validate_offer_cancel_cohort_prepared_event(prepared, manifest)
+            evidence = json.loads(prepared["evidence_json"])
+            effect = evidence.get("wallet_effect") or {}
+            batch = effect.get("batch") or {}
+            if (
+                creation["purpose"]
+                not in {
+                    f"follow:{run}:normal_lifecycle",
+                    f"follow:{run}:book_opportunity",
+                }
+                or creation["sage_trade_id"] != member["trade_id"]
+                or creation["lifecycle_state"] not in {"created", "cancel_requested"}
+                or claim["prepared_event_id"] != prepared["event_id"]
+                or batch.get("protocol") != "sage_native_cancel_offers_zero_plus_fee_v1"
+                or batch.get("trade_ids")
+                != [item["trade_id"] for item in manifest["members"]]
+            ):
+                raise ValueError("Follow pre-dispatch member binding differs")
+            prepared_rows.append((member, prepared, evidence))
+            if not source_ids:
+                source_ids = batch.get("source_coin_ids") or []
+                fee_coin_id = batch.get("fee_coin_id")
+            elif source_ids != batch.get("source_coin_ids") or fee_coin_id != batch.get(
+                "fee_coin_id"
+            ):
+                raise ValueError("Follow pre-dispatch wallet effect differs")
+        if (
+            len(source_ids) != len(manifest["members"])
+            or type(fee_coin_id) is not str
+            or type(wallet_evidence["source_coins"]) is not list
+            or len(wallet_evidence["source_coins"]) != len(source_ids)
+            or len(wallet_evidence["offers"]) != len(source_ids)
+        ):
+            raise ValueError("Follow pre-dispatch source set differs")
+        for index, (coin_id, member) in enumerate(zip(source_ids, manifest["members"])):
+            coin = wallet_evidence["source_coins"][index]
+            offer = wallet_evidence["offers"][index]
+            if (
+                type(coin) is not dict
+                or set(coin) != {"coin_id", "offer_id", "spent_height"}
+                or norm_coin_id(coin["coin_id"]) != norm_coin_id(coin_id)
+                or str(coin["offer_id"]).lower().removeprefix("0x")
+                != member["trade_id"]
+                or coin["spent_height"] is not None
+                or type(offer) is not dict
+                or set(offer) != {"offer_id", "status"}
+                or offer["offer_id"] != member["trade_id"]
+                or offer["status"] != "active"
+            ):
+                raise ValueError("Follow pre-dispatch source is not still active")
+        fee_coin = wallet_evidence["fee_coin"]
+        if (
+            set(fee_coin) != {"coin_id", "offer_id", "spent_height"}
+            or norm_coin_id(fee_coin["coin_id"]) != norm_coin_id(fee_coin_id)
+            or fee_coin["offer_id"] not in {None, ""}
+            or fee_coin["spent_height"] is not None
+        ):
+            raise ValueError("Follow pre-dispatch fee input may have changed")
+
+        proof_digest = hashlib.sha256(
+            _canonical_json_text(
+                wallet_evidence, "wallet_evidence", expected_type=dict
+            ).encode("utf-8")
+        ).hexdigest()
+        events = []
+        terminal_members = []
+        for member, prepared, evidence in prepared_rows:
+            member_evidence = {
+                "trade_id": member["trade_id"],
+                "attempt": member["attempt"],
+                "cohort_id": manifest["cohort_id"],
+                "member_id": member["member_id"],
+                "effect_attempted": False,
+                "cancel_result": no_effect,
+                "wallet_evidence": wallet_evidence,
+                "wallet_evidence_sha256": proof_digest,
+            }
+            journal = _journal_values(
+                event_id=f"{member['operation_id']}:attempt:{member['attempt']}:reconciled",
+                operation_id=member["operation_id"],
+                intent_id=member["intent_id"],
+                operation_type="CANCEL",
+                attempt=member["attempt"],
+                phase="RECONCILED",
+                outcome=CANCEL_FAILED,
+                request_timestamp=when,
+                wallet_identity_json=json.loads(prepared["wallet_identity_json"]),
+                transaction_id=None,
+                spend_identity=None,
+                evidence_json=member_evidence,
+                evidence_sha256=None,
+                reason_code="FOLLOW_PREDISPATCH_NO_EFFECT",
+                blocks_mutation=False,
+                created_at=when,
+            )
+            event = _insert_offer_operation_event(conn, journal)
+            events.append(event)
+            terminal_members.append(
+                {
+                    "operation_id": member["operation_id"],
+                    "attempt": member["attempt"],
+                    "event_id": event["event_id"],
+                    "phase": event["phase"],
+                    "outcome": event["outcome"],
+                    "reason_code": event["reason_code"],
+                    "evidence_sha256": event["evidence_sha256"],
+                }
+            )
+            prior_state = evidence.get("prior_lifecycle_state") or "open"
+            conn.execute(
+                "UPDATE offers SET lifecycle_state=? WHERE trade_id=? AND status='open'",
+                (prior_state, member["trade_id"]),
+            )
+        outcome_evidence = {
+            "schema_version": 1,
+            "kind": "follow_cancellation_fee_outcome",
+            "state": "RELEASED_NO_EFFECT",
+            "operation_id": fee_operation_id,
+            "cohort_id": manifest["cohort_id"],
+            "manifest_sha256": manifest["manifest_sha256"],
+            "fee_mojos": int(hold["fee_mojos"]),
+            "members": terminal_members,
+            "follow_run_id": run,
+        }
+        outcome_text = _canonical_json_text(
+            outcome_evidence, "follow_no_effect_outcome", expected_type=dict
+        )
+        conn.execute(
+            "INSERT INTO approved_fee_outcomes VALUES (?, ?, ?, ?)",
+            (
+                fee_operation_id,
+                "RELEASED_NO_EFFECT",
+                hashlib.sha256(outcome_text.encode("utf-8")).hexdigest(),
+                outcome_text,
+            ),
+        )
+        _reconciliation_latch_update(
+            conn,
+            operation_id=operation_ids[0],
+            additionally_resolved=operation_ids[1:],
+            wallet_fingerprint_hash=safe_wallet_hash,
+            network=safe_network,
+            reason_code="FOLLOW_PREDISPATCH_NO_EFFECT",
+            reason="Exact Sage cohort remained active after pre-dispatch fee rejection",
+            reconciled_at=when,
+            blocking=False,
+        )
+        conn.commit()
+        return {
+            "manifest": manifest,
+            "events": events,
+            "fee_outcome": "RELEASED_NO_EFFECT",
+        }
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def get_released_follow_predispatch_cancel_fee_outcome(
+    *, run_id: str, manifest_json: Any, connection: Optional[sqlite3.Connection] = None
+) -> Dict[str, Any]:
+    """Read exact atomic fee-release evidence for a no-effect Follow cohort."""
+
+    run = _fee_digest(run_id)
+    manifest = validate_offer_cancel_cohort_manifest(manifest_json)
+    operation_id = _follow_cancellation_fee_operation_id(run, manifest)
+    conn = connection if connection is not None else get_connection()
+    row = conn.execute(
+        "SELECT outcome.state,outcome.evidence_id,outcome.evidence_json,"
+        "reservation.fee_mojos,reservation.cancellation "
+        "FROM approved_fee_outcomes AS outcome "
+        "JOIN approved_fee_reservations AS reservation USING(operation_id) "
+        "WHERE outcome.operation_id=?",
+        (operation_id,),
+    ).fetchone()
+    if row is None or row["state"] != "RELEASED_NO_EFFECT" or row["cancellation"] != 1:
+        raise ValueError("Follow no-effect fee release is missing")
+    evidence = json.loads(row["evidence_json"])
+    if type(evidence) is not dict:
+        raise ValueError("Follow no-effect fee release is malformed")
+    canonical = _canonical_json_text(
+        evidence, "follow_no_effect_outcome", expected_type=dict
+    )
+    if (
+        hashlib.sha256(canonical.encode("utf-8")).hexdigest() != row["evidence_id"]
+        or set(evidence)
+        != {
+            "schema_version",
+            "kind",
+            "state",
+            "operation_id",
+            "cohort_id",
+            "manifest_sha256",
+            "fee_mojos",
+            "members",
+            "follow_run_id",
+        }
+        or evidence["schema_version"] != 1
+        or evidence["kind"] != "follow_cancellation_fee_outcome"
+        or evidence["state"] != "RELEASED_NO_EFFECT"
+        or evidence["operation_id"] != operation_id
+        or evidence["cohort_id"] != manifest["cohort_id"]
+        or evidence["manifest_sha256"] != manifest["manifest_sha256"]
+        or evidence["fee_mojos"] != row["fee_mojos"]
+        or evidence["follow_run_id"] != run
+        or type(evidence["members"]) is not list
+        or len(evidence["members"]) != manifest["member_count"]
+    ):
+        raise ValueError("Follow no-effect fee release is not exact")
+    expected_members = []
+    for member in manifest["members"]:
+        event = conn.execute(
+            "SELECT event_id,operation_id,attempt,phase,outcome,reason_code,"
+            "evidence_sha256 FROM offer_operation_journal WHERE event_id=?",
+            (f"{member['operation_id']}:attempt:{member['attempt']}:reconciled",),
+        ).fetchone()
+        if event is None:
+            raise ValueError("Follow no-effect member journal is missing")
+        expected_members.append(dict(event))
+    if evidence["members"] != expected_members:
+        raise ValueError("Follow no-effect fee members differ")
+    return evidence
+
+
 def _canonical_coin_prep_wallet_identity(value: Any) -> tuple[str, str, str]:
     """Return canonical Task 5 identity payload, fingerprint hash, and network."""
 
@@ -24855,6 +29380,7 @@ def prepare_coin_prep_operation(
     effect_claim_token: str,
     effect_claim_generation: int,
     prepared_at: Any = None,
+    attempt_id: str | None = None,
 ) -> Dict[str, Any]:
     """Persist one deterministic PREPARED split/combine before wallet effect."""
 
@@ -24865,6 +29391,7 @@ def prepare_coin_prep_operation(
         purpose=purpose,
         source_coin_ids=source_coin_ids,
         target_contract=target_contract,
+        attempt_id=attempt_id,
     )
     source_json = _canonical_json_text(
         contract["source_coin_ids"],
@@ -25117,6 +29644,12 @@ def _coin_prep_outcome_evidence(outcome: str, value: Any) -> tuple[str, Dict[str
         "SUBMITTED_UNKNOWN": common | {"dispatch_outcome"},
         "FAILED": common | {"dispatch_outcome", "effect_attempted"},
     }[outcome]
+    rbf_reason = value.get("reason_code") in {
+        "AUTHORITATIVE_RBF_ORIGINAL_CONFIRMED",
+        "AUTHORITATIVE_RBF_REPLACEMENT_CONFIRMED",
+    }
+    if outcome == "CONFIRMED" and rbf_reason:
+        expected |= {"rbf_attempt_id", "rbf_chain_view", "winner_transaction_id"}
     if outcome == "FAILED" and value.get("reason_code") == (
         "AUTHORITATIVE_NO_EFFECT_CONFIRMED"
     ):
@@ -25143,7 +29676,7 @@ def _coin_prep_outcome_evidence(outcome: str, value: Any) -> tuple[str, Dict[str
     ):
         raise ValueError("coin prep outcome evidence values are invalid")
     if outcome == "CONFIRMED":
-        if reason != "AUTHORITATIVE_POST_VIEW_CONFIRMED":
+        if reason != "AUTHORITATIVE_POST_VIEW_CONFIRMED" and not rbf_reason:
             raise ValueError("coin prep confirmed evidence reason is invalid")
         from replacement_capacity import verify_coin_prep_post_view
 
@@ -25190,6 +29723,162 @@ def _coin_prep_outcome_evidence(outcome: str, value: Any) -> tuple[str, Dict[str
         max_bytes=65536,
     )
     return encoded, dict(value)
+
+
+def _verify_coin_prep_rbf_winner(
+    operation: Dict[str, Any],
+    attempt: Dict[str, Any],
+    evidence: Dict[str, Any],
+) -> tuple[str, str]:
+    """Require a complete height-addressed view of both output candidates."""
+    if evidence.get("rbf_attempt_id") != attempt["attempt_id"]:
+        raise ValueError("RBF attempt does not match confirmed evidence")
+    winner = (
+        "ORIGINAL"
+        if evidence["reason_code"] == "AUTHORITATIVE_RBF_ORIGINAL_CONFIRMED"
+        else "SUCCESSOR"
+    )
+    winner_tx = _reconciliation_coin_identity(
+        evidence.get("winner_transaction_id"), "RBF winner reference"
+    )[0]
+    if winner == "ORIGINAL" and winner_tx != attempt["original_transaction_id"]:
+        raise ValueError("RBF original winner transaction differs")
+    if winner == "SUCCESSOR" and winner_tx == attempt["original_transaction_id"]:
+        raise ValueError("RBF successor transaction is the original")
+    source_ids = json.loads(operation["source_coin_ids_json"])
+    if len(source_ids) != 1:
+        raise ValueError("RBF source cohort is not exact")
+    chain = evidence.get("rbf_chain_view")
+    if (
+        type(chain) is not dict
+        or set(chain)
+        != {
+            "complete",
+            "network",
+            "observed_at",
+            "source_coin_id",
+            "source_spent_height",
+            "coins",
+        }
+        or chain["complete"] is not True
+    ):
+        raise ValueError("RBF chain view is not complete")
+    identity = json.loads(operation["wallet_identity_json"])
+    observed_at = _parse_iso_timestamp(
+        chain["observed_at"], "RBF chain observed_at", require_timezone=True
+    )
+    now = _parse_iso_timestamp(
+        _stability_wall_clock(), "RBF current time", require_timezone=True
+    )
+    if chain["network"] != identity["network_id"] or not timedelta(
+        seconds=-5
+    ) <= now - observed_at <= timedelta(seconds=30):
+        raise ValueError("RBF chain view is stale or from another network")
+    source = _reconciliation_coin_identity(chain["source_coin_id"], "RBF source")[0]
+    height = _exact_integer(
+        chain["source_spent_height"], "RBF source spent height", minimum=1
+    )
+    if source != _reconciliation_coin_identity(source_ids[0], "RBF source")[0]:
+        raise ValueError("RBF chain source differs")
+    original = json.loads(attempt["original_outputs_json"])
+    successor = json.loads(attempt["successor_outputs_json"])
+    by_id = {}
+    for item in [*original, *successor]:
+        prior = by_id.get(item["coin_id"])
+        if prior is not None and prior != item["amount_mojos"]:
+            raise ValueError("RBF shared output amount differs")
+        by_id[item["coin_id"]] = item["amount_mojos"]
+    records = chain["coins"]
+    if type(records) is not list or len(records) != len(by_id):
+        raise ValueError("RBF chain output view is incomplete")
+    observed = {}
+    for item in records:
+        if type(item) is not dict or set(item) != {
+            "coin_id",
+            "amount_mojos",
+            "confirmed_height",
+        }:
+            raise ValueError("RBF chain output record is malformed")
+        coin_id = _reconciliation_coin_identity(item["coin_id"], "RBF output")[0]
+        if coin_id in observed or coin_id not in by_id:
+            raise ValueError("RBF chain output set differs")
+        if (
+            _exact_integer(item["amount_mojos"], "RBF output amount", minimum=1)
+            != by_id[coin_id]
+        ):
+            raise ValueError("RBF chain output amount differs")
+        confirmed = item["confirmed_height"]
+        if confirmed is not None:
+            _exact_integer(confirmed, "RBF output height", minimum=1)
+        observed[coin_id] = confirmed
+    if set(observed) != set(by_id):
+        raise ValueError("RBF chain output set is incomplete")
+    winning = original if winner == "ORIGINAL" else successor
+    losing = successor if winner == "ORIGINAL" else original
+    winner_ids = {item["coin_id"] for item in winning}
+    loser_only = {item["coin_id"] for item in losing} - winner_ids
+    if (
+        any(observed[coin_id] != height for coin_id in winner_ids)
+        or any(observed[coin_id] is not None for coin_id in loser_only)
+        or not loser_only
+    ):
+        raise ValueError("RBF winner is not proven by the source spend height")
+    supplied = sorted(
+        (
+            _reconciliation_coin_identity(item["coin_id"], "RBF expected output")[0],
+            item["amount_mojos"],
+            item["purpose"],
+        )
+        for item in evidence["expected_outputs"]
+    )
+    expected = sorted(
+        (item["coin_id"], item["amount_mojos"], item["purpose"]) for item in winning
+    )
+    if supplied != expected:
+        raise ValueError("RBF post-view outputs differ from winner contract")
+    if winner == "SUCCESSOR" and winner_tx != coin_prep_rbf_winner_reference(
+        attempt["attempt_id"], source, height, winning
+    ):
+        raise ValueError("RBF successor confirmation reference differs")
+    return winner, winner_tx
+
+
+def coin_prep_rbf_winner_reference(
+    attempt_id: str, source_coin_id: str, spent_height: int, outputs: list[dict]
+) -> str:
+    """Name an exact confirmed successor when Sage omits spend-bundle IDs.
+
+    The legacy resolution column is named winner_transaction_id, but Sage's
+    height-addressed confirmed response has no transaction ID. This domain-
+    separated digest identifies the proven source spend and output set; it is
+    never presented as a wallet transaction ID.
+    """
+    safe_attempt = _fee_digest(attempt_id)
+    source = _reconciliation_coin_identity(source_coin_id, "RBF source")[0]
+    height = _exact_integer(spent_height, "RBF spent height", minimum=1)
+    if type(outputs) is not list or len(outputs) != 5:
+        raise ValueError("RBF winner outputs are incomplete")
+    rows = sorted(
+        (
+            _reconciliation_coin_identity(row["coin_id"], "RBF output")[0],
+            _exact_integer(row["amount_mojos"], "RBF output amount", minimum=1),
+        )
+        for row in outputs
+    )
+    if len({coin_id for coin_id, _ in rows}) != 5:
+        raise ValueError("RBF winner output IDs repeat")
+    payload = {
+        "kind": "sage-confirmed-rbf-successor-v1",
+        "attempt_id": safe_attempt,
+        "source_coin_id": source,
+        "source_spent_height": height,
+        "outputs": rows,
+    }
+    return hashlib.sha256(
+        _canonical_json_text(
+            payload, "RBF winner reference", expected_type=dict
+        ).encode()
+    ).hexdigest()
 
 
 def _legacy_sage_even_split_confirmation_matches(
@@ -25669,6 +30358,31 @@ def record_coin_prep_operation_outcome(
             != evidence_payload["effect_claim_generation"]
         ):
             raise ValueError("coin prep outcome evidence effect claim differs")
+        rbf_attempt = conn.execute(
+            "SELECT attempt.* FROM coin_prep_rbf_attempts AS attempt "
+            "JOIN coin_prep_rbf_dispatches AS dispatch "
+            "ON dispatch.attempt_id=attempt.attempt_id "
+            "WHERE attempt.operation_id=?",
+            (safe_operation_id,),
+        ).fetchone()
+        rbf_resolution = None
+        if rbf_attempt is not None and outcome != "CONFIRMED":
+            raise ValueError(
+                "dispatched RBF attempt requires explicit joint no-effect proof"
+            )
+        if outcome == "CONFIRMED":
+            special_rbf_reason = evidence_payload.get("reason_code") in {
+                "AUTHORITATIVE_RBF_ORIGINAL_CONFIRMED",
+                "AUTHORITATIVE_RBF_REPLACEMENT_CONFIRMED",
+            }
+            if rbf_attempt is not None and not special_rbf_reason:
+                raise ValueError("dispatched RBF attempt requires winner proof")
+            if special_rbf_reason:
+                if rbf_attempt is None:
+                    raise ValueError("RBF winner has no durable dispatch")
+                rbf_resolution = _verify_coin_prep_rbf_winner(
+                    current, dict(rbf_attempt), evidence_payload
+                )
         authoritative_no_effect = (
             outcome == "FAILED"
             and evidence_payload.get("reason_code")
@@ -25799,7 +30513,9 @@ def record_coin_prep_operation_outcome(
                     (output["amount_mojos"], output["purpose"])
                     for output in evidence_payload["expected_outputs"]
                 )
-                if confirmed_outputs != target_outputs and not (
+                if rbf_resolution is not None and rbf_resolution[0] == "SUCCESSOR":
+                    pass  # The sealed successor and chain view were checked above.
+                elif confirmed_outputs != target_outputs and not (
                     _legacy_sage_even_split_confirmation_matches(
                         current,
                         stored_target,
@@ -25857,6 +30573,14 @@ def record_coin_prep_operation_outcome(
                         "last_seen=? WHERE coin_id=?",
                         (when, norm_coin_id(fee_coin_id)),
                     )
+            # All output writes share this BEGIN IMMEDIATE transaction. No
+            # other writer can change their protection authorities between
+            # this snapshot and commit. Avoid rescanning every global claim
+            # and intent for each output while starving the lease heartbeat.
+            protected_outputs = _batch_coin_terminal_mutation_protection(
+                conn,
+                [output["coin_id"] for output in evidence_payload["expected_outputs"]],
+            )
             for output in evidence_payload["expected_outputs"]:
                 output_coin_id = norm_coin_id(output["coin_id"])
                 output_wallet_type = output_wallet_types.get(
@@ -25883,7 +30607,7 @@ def record_coin_prep_operation_outcome(
                     "FROM coins WHERE coin_id=?",
                     (output_coin_id,),
                 ).fetchone()
-                if _coin_terminal_mutation_is_protected(conn, output_coin_id):
+                if output_coin_id in protected_outputs:
                     if (
                         not output_is_spent
                         or existing_output is None
@@ -25949,6 +30673,19 @@ def record_coin_prep_operation_outcome(
             """,
             (outcome, evidence, when, safe_operation_id),
         )
+        if rbf_resolution is not None:
+            conn.execute(
+                "INSERT INTO coin_prep_rbf_resolutions "
+                "(attempt_id,winner,winner_transaction_id,"
+                "outcome_evidence_sha256,resolved_at) VALUES (?,?,?,?,?)",
+                (
+                    rbf_attempt["attempt_id"],
+                    rbf_resolution[0],
+                    rbf_resolution[1],
+                    hashlib.sha256(evidence.encode()).hexdigest(),
+                    when,
+                ),
+            )
         identity = json.loads(current["wallet_identity_json"])
         import mutation_gate
 
@@ -26019,6 +30756,1031 @@ def get_coin_prep_operation_for_observation(operation_id: str) -> Dict[str, Any]
         conn.close()
 
 
+def get_coin_prep_rbf_preview_authority(operation_id: str) -> Dict[str, Any]:
+    """Read the exact pending prep and safety fence in one read-only snapshot.
+
+    This grants no dispatch authority.  In particular, a preview caller must
+    never interpret this snapshot as permission to sign or submit a spend.
+    """
+    operation_id = _fee_operation_identity(operation_id)
+    conn = _stability_read_only_connection()
+    try:
+        conn.execute("BEGIN")
+        operation = conn.execute(
+            "SELECT prep.*, claim.fee_coin_ids_json AS effect_fee_coin_ids_json, "
+            "dispatch.dispatch_token AS effect_dispatch_token, "
+            "dispatch.dispatched_at AS effect_dispatched_at, "
+            "dispatch.adapter_operation AS effect_adapter_operation "
+            "FROM coin_prep_operations AS prep "
+            "JOIN wallet_effect_claims AS claim "
+            "ON claim.claim_token=prep.effect_claim_token "
+            "AND claim.generation=prep.effect_claim_generation "
+            "AND claim.operation_id=prep.operation_id "
+            "JOIN wallet_effect_dispatches AS dispatch "
+            "ON dispatch.claim_token=claim.claim_token "
+            "AND dispatch.generation=claim.generation "
+            "WHERE prep.operation_id=?",
+            (operation_id,),
+        ).fetchone()
+        latch = conn.execute(
+            "SELECT * FROM runtime_safety_latch WHERE singleton_id=1"
+        ).fetchone()
+        conn.rollback()
+        if operation is None or latch is None:
+            raise ValueError("COIN_PREP_RBF_PREVIEW_AUTHORITY_UNAVAILABLE")
+        return {"operation": dict(operation), "latch": dict(latch)}
+    finally:
+        conn.close()
+
+
+def _coin_prep_rbf_outputs(value: Any, label: str) -> tuple[list[dict], str]:
+    """Canonical final additions; internal ephemeral coins are not outputs."""
+    if type(value) is not list or len(value) != 5:
+        raise ValueError(f"{label} must contain five exact outputs")
+    result = []
+    ids = set()
+    for output in value:
+        if type(output) is not dict or set(output) != {
+            "coin_id",
+            "amount_mojos",
+            "purpose",
+        }:
+            raise ValueError(f"{label} output shape is invalid")
+        coin_id = _reconciliation_coin_identity(output["coin_id"], label)[0]
+        if coin_id in ids:
+            raise ValueError(f"{label} output coin is duplicated")
+        ids.add(coin_id)
+        amount = _exact_integer(output["amount_mojos"], label, minimum=1)
+        purpose = output["purpose"]
+        if purpose not in {"fee_reserve", "top_up"}:
+            raise ValueError(f"{label} purpose is invalid")
+        result.append({"coin_id": coin_id, "amount_mojos": amount, "purpose": purpose})
+    result.sort(key=lambda item: item["coin_id"])
+    return result, _canonical_json_text(result, label, expected_type=list)
+
+
+def prepare_coin_prep_rbf_attempt(
+    *,
+    operation_id: str,
+    original_transaction_id: str,
+    unsigned_sha256: str,
+    review_sha256: str,
+    fee_mojos: int,
+    original_outputs: list[dict],
+    successor_outputs: list[dict],
+    latch_generation: int,
+    reviewed_at: Any,
+    review_expires_at: Any,
+) -> Dict[str, Any]:
+    """Seal one reviewed replacement candidate without dispatching it.
+
+    The caller must have obtained the original and successor output IDs from
+    authoritative pending and inspected unsigned views. This DB boundary
+    rechecks the durable original contract and latch before storing them.
+    """
+    safe_operation = _fee_operation_identity(operation_id)
+    old_tx = _reconciliation_coin_identity(
+        original_transaction_id, "original transaction id"
+    )[0]
+    unsigned_digest = _fee_digest(unsigned_sha256)
+    review_digest = _fee_digest(review_sha256)
+    fee = _exact_integer(fee_mojos, "RBF fee", minimum=10_000_000)
+    generation = _exact_integer(latch_generation, "RBF latch generation", minimum=1)
+    original, original_json = _coin_prep_rbf_outputs(
+        original_outputs, "original RBF outputs"
+    )
+    successor, successor_json = _coin_prep_rbf_outputs(
+        successor_outputs, "successor RBF outputs"
+    )
+    reviewed = _stability_timestamp(reviewed_at, "RBF reviewed_at")
+    expires = _stability_timestamp(review_expires_at, "RBF review_expires_at")
+    if _parse_iso_timestamp(expires, "RBF expiry", require_timezone=True) <= (
+        _parse_iso_timestamp(reviewed, "RBF review", require_timezone=True)
+    ):
+        raise ValueError("RBF review expiry must follow review")
+    conn = _stability_connection()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        operation = conn.execute(
+            "SELECT * FROM coin_prep_operations WHERE operation_id=?",
+            (safe_operation,),
+        ).fetchone()
+        latch = conn.execute(
+            "SELECT * FROM runtime_safety_latch WHERE singleton_id=1"
+        ).fetchone()
+        if operation is None or latch is None:
+            raise ValueError("RBF original operation or latch is absent")
+        op = dict(operation)
+        fence = dict(latch)
+        identity = json.loads(op["wallet_identity_json"])
+        import mutation_gate
+
+        if (
+            op["outcome"] != "SUBMITTED_UNKNOWN"
+            or op["operation_kind"] != "split"
+            or op["purpose"] != "fee_reserve"
+            or len(json.loads(op["source_coin_ids_json"])) != 1
+            or fence["state"] != "tripped"
+            or fence["reason_code"] != "COIN_PREP_RECOVERY_REQUIRED"
+            or fence["generation"] != generation
+            or json.loads(fence["blocking_operation_ids_json"])
+            != sorted([safe_operation, f"wallet-effect:{op['effect_claim_token']}"])
+            or fence["wallet_fingerprint_hash"]
+            != mutation_gate.wallet_fingerprint_hash(identity["fingerprint"])
+            or fence["network"] != identity["network_id"]
+        ):
+            raise ValueError("RBF attempt does not match exact recovery authority")
+        if (
+            conn.execute(
+                "SELECT 1 FROM coin_prep_rbf_dispatches WHERE operation_id=?",
+                (safe_operation,),
+            ).fetchone()
+            is not None
+        ):
+            raise ValueError("RBF original operation already has a dispatch")
+        if (
+            conn.execute(
+                "SELECT 1 FROM coin_prep_rbf_sign_intents AS sign "
+                "LEFT JOIN coin_prep_rbf_sign_no_submit AS receipt "
+                "ON receipt.attempt_id=sign.attempt_id "
+                "WHERE sign.operation_id=? AND receipt.attempt_id IS NULL LIMIT 1",
+                (safe_operation,),
+            ).fetchone()
+            is not None
+        ):
+            raise ValueError("RBF prior sign phase is unresolved")
+        target = json.loads(op["target_contract_json"])
+        if (
+            target.get("contract_version") is not None
+            or target.get("wallet_type") != "xch"
+            or len(target.get("outputs", [])) != 5
+        ):
+            raise ValueError("RBF target is not the exact XCH fee split")
+        expected_old = sorted(
+            (item["amount_mojos"], item["purpose"]) for item in target["outputs"]
+        )
+        if (
+            sorted((item["amount_mojos"], item["purpose"]) for item in original)
+            != expected_old
+        ):
+            raise ValueError("RBF original outputs differ from prep contract")
+        old_fees = sorted(
+            item["amount_mojos"]
+            for item in original
+            if item["purpose"] == "fee_reserve"
+        )
+        new_fees = sorted(
+            item["amount_mojos"]
+            for item in successor
+            if item["purpose"] == "fee_reserve"
+        )
+        old_change = [
+            item["amount_mojos"] for item in original if item["purpose"] == "top_up"
+        ]
+        new_change = [
+            item["amount_mojos"] for item in successor if item["purpose"] == "top_up"
+        ]
+        if (
+            len(old_fees) != 4
+            or old_fees != new_fees
+            or len(old_change) != 1
+            or len(new_change) != 1
+            or old_change[0] - new_change[0] != fee
+            or {item["coin_id"] for item in original}
+            == {item["coin_id"] for item in successor}
+        ):
+            raise ValueError("RBF successor is not a fee-only replacement")
+        identity_digest = hashlib.sha256(
+            op["wallet_identity_json"].encode()
+        ).hexdigest()
+        immutable = {
+            "operation_id": safe_operation,
+            "original_transaction_id": old_tx,
+            "unsigned_sha256": unsigned_digest,
+            "review_sha256": review_digest,
+            "fee_mojos": fee,
+            "original_outputs_json": original_json,
+            "successor_outputs_json": successor_json,
+            "wallet_identity_sha256": identity_digest,
+            "latch_generation": generation,
+            "reviewed_at": reviewed,
+            "review_expires_at": expires,
+        }
+        attempt_id = hashlib.sha256(
+            _canonical_json_text(immutable, "RBF attempt", expected_type=dict).encode()
+        ).hexdigest()
+        existing = conn.execute(
+            "SELECT * FROM coin_prep_rbf_attempts WHERE attempt_id=?",
+            (attempt_id,),
+        ).fetchone()
+        if existing is not None:
+            if dict(existing) != {"attempt_id": attempt_id, **immutable}:
+                raise ValueError("RBF attempt identity collision")
+            conn.commit()
+            return {"attempt": dict(existing), "idempotent": True}
+        conn.execute(
+            "INSERT INTO coin_prep_rbf_attempts (attempt_id,"
+            + ",".join(immutable)
+            + ") VALUES ("
+            + ",".join("?" for _ in range(len(immutable) + 1))
+            + ")",
+            (attempt_id, *immutable.values()),
+        )
+        row = conn.execute(
+            "SELECT * FROM coin_prep_rbf_attempts WHERE attempt_id=?", (attempt_id,)
+        ).fetchone()
+        conn.commit()
+        return {"attempt": dict(row), "idempotent": False}
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def record_coin_prep_rbf_sign_start(
+    attempt_id: str, *, owner_run_id: str, lease_version: int
+) -> Dict[str, Any]:
+    """Commit a local-sign intent, never permission to submit to peers."""
+    attempt_id = _fee_digest(attempt_id)
+    owner = _required_stability_text(owner_run_id, "RBF sign owner")
+    version = _exact_integer(lease_version, "RBF sign lease version", minimum=1)
+    candidate = get_coin_prep_rbf_attempt_for_submit(attempt_id)
+    authorize_coin_prep_rbf_rescue_target(
+        attempt_id=attempt_id,
+        operation_id=candidate["operation_id"],
+        expected_latch_generation=candidate["latch_generation"],
+        unsigned_sha256=candidate["unsigned_sha256"],
+        owner_run_id=owner,
+        lease_version=version,
+    )
+    conn = _stability_connection()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        now = _stability_wall_clock()
+        lease = conn.execute(
+            "SELECT * FROM runtime_mutation_lease WHERE singleton_id=1"
+        ).fetchone()
+        latch = conn.execute(
+            "SELECT * FROM runtime_safety_latch WHERE singleton_id=1"
+        ).fetchone()
+        operation = conn.execute(
+            "SELECT outcome,effect_claim_token,wallet_identity_json "
+            "FROM coin_prep_operations "
+            "WHERE operation_id=?",
+            (candidate["operation_id"],),
+        ).fetchone()
+        if lease is None or latch is None or operation is None:
+            raise ValueError("RBF sign authority is incomplete")
+        if (
+            lease["active"] != 1
+            or lease["owner_run_id"] != owner
+            or lease["lease_version"] != version
+            or type(lease["owner_pid"]) is not int
+            or lease["owner_pid"] <= 0
+            or not lease["owner_host"]
+            or not lease["acquired_at"]
+            or lease["wallet_fingerprint_hash"] != latch["wallet_fingerprint_hash"]
+            or lease["network"] != latch["network"]
+            or lease["expires_at"] is None
+            or _parse_iso_timestamp(
+                lease["expires_at"], "RBF sign lease expiry", require_timezone=True
+            )
+            <= _parse_iso_timestamp(now, "RBF current time", require_timezone=True)
+            or latch["state"] != "tripped"
+            or latch["reason_code"] != "COIN_PREP_RECOVERY_REQUIRED"
+            or latch["generation"] != candidate["latch_generation"]
+            or json.loads(latch["blocking_operation_ids_json"])
+            != sorted(
+                [
+                    candidate["operation_id"],
+                    f"wallet-effect:{operation['effect_claim_token']}",
+                ]
+            )
+            or operation["outcome"] != "SUBMITTED_UNKNOWN"
+            or hashlib.sha256(operation["wallet_identity_json"].encode()).hexdigest()
+            != candidate["wallet_identity_sha256"]
+            or _parse_iso_timestamp(
+                candidate["review_expires_at"],
+                "RBF sign review expiry",
+                require_timezone=True,
+            )
+            <= _parse_iso_timestamp(now, "RBF current time", require_timezone=True)
+        ):
+            raise ValueError("RBF sign lease, latch or review has changed")
+        if (
+            conn.execute(
+                "SELECT 1 FROM coin_prep_rbf_dispatches WHERE operation_id=?",
+                (candidate["operation_id"],),
+            ).fetchone()
+            is not None
+        ):
+            raise ValueError("RBF submit already started")
+        active = conn.execute(
+            "SELECT sign.attempt_id FROM coin_prep_rbf_sign_intents AS sign "
+            "LEFT JOIN coin_prep_rbf_sign_no_submit AS receipt "
+            "ON receipt.attempt_id=sign.attempt_id "
+            "WHERE sign.operation_id=? AND receipt.attempt_id IS NULL LIMIT 1",
+            (candidate["operation_id"],),
+        ).fetchone()
+        if active is not None:
+            raise ValueError("RBF prior sign intent remains unresolved")
+        if (
+            conn.execute(
+                "SELECT 1 FROM coin_prep_rbf_sign_intents WHERE attempt_id=?",
+                (attempt_id,),
+            ).fetchone()
+            is not None
+        ):
+            raise ValueError("RBF sign attempt is already spent")
+        conn.execute(
+            "INSERT INTO coin_prep_rbf_sign_intents "
+            "(attempt_id,operation_id,lease_version,owner_run_id,started_at) "
+            "VALUES (?,?,?,?,?)",
+            (attempt_id, candidate["operation_id"], version, owner, now),
+        )
+        conn.execute(
+            "INSERT INTO coin_prep_rbf_sign_owners "
+            "(attempt_id,owner_pid,owner_host,lease_acquired_at) "
+            "VALUES (?,?,?,?)",
+            (attempt_id, lease["owner_pid"], lease["owner_host"], lease["acquired_at"]),
+        )
+        conn.commit()
+        return {"attempt_id": attempt_id, "sign_started": True}
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+_RBF_SIGN_NO_SUBMIT_REASONS = frozenset(
+    {
+        "SIGN_REFUSED",
+        "SIGNED_BYTES_INVALID",
+        "PRE_SUBMIT_EXCEPTION",
+        "SIGN_ABORTED_BEFORE_SUBMIT",
+        "CRASH_BEFORE_SUBMIT_MARKER",
+    }
+)
+
+
+def get_recoverable_coin_prep_rbf_sign_intents() -> list[Dict[str, Any]]:
+    """Inventory sign intents for which CATalyst never started an RPC submit."""
+    conn = _stability_read_only_connection()
+    try:
+        rows = conn.execute(
+            "SELECT sign.*,owner.owner_pid,owner.owner_host,"
+            "owner.lease_acquired_at "
+            "FROM coin_prep_rbf_sign_intents AS sign "
+            "LEFT JOIN coin_prep_rbf_sign_owners AS owner "
+            "ON owner.attempt_id=sign.attempt_id "
+            "JOIN coin_prep_operations AS prep "
+            "ON prep.operation_id=sign.operation_id "
+            "LEFT JOIN coin_prep_rbf_sign_no_submit AS receipt "
+            "ON receipt.attempt_id=sign.attempt_id "
+            "LEFT JOIN coin_prep_rbf_dispatches AS dispatch "
+            "ON dispatch.operation_id=sign.operation_id "
+            "WHERE receipt.attempt_id IS NULL "
+            "AND dispatch.operation_id IS NULL "
+            "AND prep.outcome='SUBMITTED_UNKNOWN' "
+            "ORDER BY sign.started_at,sign.attempt_id LIMIT 128"
+        ).fetchall()
+        return [dict(row) for row in rows]
+    finally:
+        conn.close()
+
+
+def record_coin_prep_rbf_sign_no_submit(
+    attempt_id: str,
+    *,
+    receipt: dict,
+    prior_owner_liveness_proven_dead: bool = False,
+) -> Dict[str, Any]:
+    """Close a sign-only attempt only while no submit-start marker exists."""
+    attempt_id = _fee_digest(attempt_id)
+    if (
+        type(receipt) is not dict
+        or set(receipt)
+        != {"attempt_id", "reason_code", "submit_rpc_attempted", "evidence_sha256"}
+        or receipt["attempt_id"] != attempt_id
+        or receipt["reason_code"] not in _RBF_SIGN_NO_SUBMIT_REASONS
+        or receipt["submit_rpc_attempted"] is not False
+    ):
+        raise ValueError("RBF no-submit receipt is malformed")
+    _fee_digest(receipt["evidence_sha256"])
+    if type(prior_owner_liveness_proven_dead) is not bool:
+        raise ValueError("RBF owner liveness proof is malformed")
+    encoded = _canonical_json_text(receipt, "RBF no-submit receipt", expected_type=dict)
+    digest = hashlib.sha256(encoded.encode()).hexdigest()
+    conn = _stability_connection()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        sign = conn.execute(
+            "SELECT * FROM coin_prep_rbf_sign_intents WHERE attempt_id=?",
+            (attempt_id,),
+        ).fetchone()
+        if sign is None:
+            raise ValueError("RBF sign intent is absent")
+        if (
+            conn.execute(
+                "SELECT 1 FROM coin_prep_rbf_dispatches WHERE operation_id=?",
+                (sign["operation_id"],),
+            ).fetchone()
+            is not None
+        ):
+            raise ValueError("RBF submit-start marker already exists")
+        existing = conn.execute(
+            "SELECT * FROM coin_prep_rbf_sign_no_submit WHERE attempt_id=?",
+            (attempt_id,),
+        ).fetchone()
+        if existing is not None:
+            if existing["receipt_sha256"] != digest:
+                raise ValueError("RBF no-submit receipt replay differs")
+            conn.commit()
+            return {"attempt_id": attempt_id, "idempotent": True}
+        if receipt["reason_code"] == "CRASH_BEFORE_SUBMIT_MARKER":
+            lease = conn.execute(
+                "SELECT * FROM runtime_mutation_lease WHERE singleton_id=1"
+            ).fetchone()
+            now = _stability_wall_clock()
+            if (
+                not prior_owner_liveness_proven_dead
+                or lease is None
+                or (
+                    lease["active"] == 1
+                    and lease["owner_run_id"] == sign["owner_run_id"]
+                    and (
+                        lease["expires_at"] is None
+                        or _parse_iso_timestamp(
+                            lease["expires_at"],
+                            "RBF prior lease expiry",
+                            require_timezone=True,
+                        )
+                        > _parse_iso_timestamp(
+                            now, "RBF current time", require_timezone=True
+                        )
+                    )
+                )
+            ):
+                raise ValueError("RBF crashed signer is not proven stopped")
+        when = _stability_wall_clock()
+        conn.execute(
+            "INSERT INTO coin_prep_rbf_sign_no_submit "
+            "(attempt_id,receipt_json,receipt_sha256,recorded_at) "
+            "VALUES (?,?,?,?)",
+            (attempt_id, encoded, digest, when),
+        )
+        conn.commit()
+        return {"attempt_id": attempt_id, "idempotent": False}
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def record_coin_prep_rbf_submit_start(
+    attempt_id: str,
+    *,
+    owner_run_id: str,
+    lease_version: int,
+    started_at: Any = None,
+) -> Dict[str, Any]:
+    """Commit the one-shot boundary before the first Sage submit RPC.
+
+    A replay, including after an uncertain timeout or crash, is rejected. The
+    future caller must treat the committed row as possibly submitted.
+    """
+    attempt_id = _fee_digest(attempt_id)
+    owner = _required_stability_text(owner_run_id, "RBF owner_run_id")
+    version = _exact_integer(lease_version, "RBF lease version", minimum=1)
+    when = _stability_wall_clock()
+    if started_at is not None:
+        supplied = _stability_timestamp(started_at, "RBF dispatch start")
+        drift = abs(
+            (
+                _parse_iso_timestamp(
+                    supplied, "RBF supplied time", require_timezone=True
+                )
+                - _parse_iso_timestamp(when, "RBF current time", require_timezone=True)
+            ).total_seconds()
+        )
+        if drift > 5:
+            raise ValueError("RBF dispatch time is not current")
+    conn = _stability_connection()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        attempt = conn.execute(
+            "SELECT * FROM coin_prep_rbf_attempts WHERE attempt_id=?",
+            (attempt_id,),
+        ).fetchone()
+        lease = conn.execute(
+            "SELECT * FROM runtime_mutation_lease WHERE singleton_id=1"
+        ).fetchone()
+        latch = conn.execute(
+            "SELECT * FROM runtime_safety_latch WHERE singleton_id=1"
+        ).fetchone()
+        existing = conn.execute(
+            "SELECT 1 FROM coin_prep_rbf_dispatches WHERE operation_id=("
+            "SELECT operation_id FROM coin_prep_rbf_attempts WHERE attempt_id=?)",
+            (attempt_id,),
+        ).fetchone()
+        if attempt is None or lease is None or latch is None or existing is not None:
+            raise ValueError("RBF one-shot dispatch authority unavailable")
+        candidate = dict(attempt)
+        fence = dict(latch)
+        owned = dict(lease)
+        if (
+            owned["active"] != 1
+            or owned["owner_run_id"] != owner
+            or owned["lease_version"] != version
+            or owned["wallet_fingerprint_hash"] != fence["wallet_fingerprint_hash"]
+            or owned["network"] != fence["network"]
+            or owned["expires_at"] is None
+            or _parse_iso_timestamp(
+                owned["expires_at"], "RBF lease expiry", require_timezone=True
+            )
+            <= _parse_iso_timestamp(when, "RBF current time", require_timezone=True)
+            or fence["state"] != "tripped"
+            or fence["reason_code"] != "COIN_PREP_RECOVERY_REQUIRED"
+            or fence["generation"] != candidate["latch_generation"]
+            or _parse_iso_timestamp(
+                candidate["review_expires_at"],
+                "RBF review expiry",
+                require_timezone=True,
+            )
+            <= _parse_iso_timestamp(when, "RBF dispatch time", require_timezone=True)
+        ):
+            raise ValueError("RBF dispatch lease, latch or review has changed")
+        operation = conn.execute(
+            "SELECT outcome,effect_claim_token FROM coin_prep_operations "
+            "WHERE operation_id=?",
+            (candidate["operation_id"],),
+        ).fetchone()
+        if operation is None or operation["outcome"] != "SUBMITTED_UNKNOWN":
+            raise ValueError("RBF original operation is no longer pending")
+        identity_row = conn.execute(
+            "SELECT wallet_identity_json FROM coin_prep_operations WHERE operation_id=?",
+            (candidate["operation_id"],),
+        ).fetchone()
+        if (
+            hashlib.sha256(identity_row["wallet_identity_json"].encode()).hexdigest()
+            != (candidate["wallet_identity_sha256"])
+        ):
+            raise ValueError("RBF dispatch wallet identity changed")
+        if json.loads(fence["blocking_operation_ids_json"]) != sorted(
+            [
+                candidate["operation_id"],
+                f"wallet-effect:{operation['effect_claim_token']}",
+            ]
+        ):
+            raise ValueError("RBF dispatch blocker set changed")
+        sign_intent = conn.execute(
+            "SELECT * FROM coin_prep_rbf_sign_intents WHERE attempt_id=?",
+            (attempt_id,),
+        ).fetchone()
+        no_submit = conn.execute(
+            "SELECT 1 FROM coin_prep_rbf_sign_no_submit WHERE attempt_id=?",
+            (attempt_id,),
+        ).fetchone()
+        if (
+            sign_intent is None
+            or sign_intent["operation_id"] != candidate["operation_id"]
+            or sign_intent["owner_run_id"] != owner
+            or sign_intent["lease_version"] != version
+            or no_submit is not None
+        ):
+            raise ValueError("RBF sign phase has no active exact successor")
+        conn.execute(
+            "INSERT INTO coin_prep_rbf_dispatches "
+            "(attempt_id,operation_id,lease_version,owner_run_id,started_at) "
+            "VALUES (?,?,?,?,?)",
+            (attempt_id, candidate["operation_id"], version, owner, when),
+        )
+        conn.commit()
+        return {"attempt_id": attempt_id, "started": True}
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def record_coin_prep_rbf_dispatch_start(*args, **kwargs) -> Dict[str, Any]:
+    """Compatibility name: this marker is solely the submit-start boundary."""
+    return record_coin_prep_rbf_submit_start(*args, **kwargs)
+
+
+def authorize_coin_prep_rbf_rescue_target(
+    *,
+    attempt_id: str,
+    operation_id: str,
+    expected_latch_generation: int,
+    unsigned_sha256: str,
+    owner_run_id: str,
+    lease_version: int,
+    allow_dispatched: bool = False,
+) -> Dict[str, Any]:
+    """Read exact one-shot rescue authority without changing the database."""
+    attempt_id = _fee_digest(attempt_id)
+    operation_id = _fee_operation_identity(operation_id)
+    digest = _fee_digest(unsigned_sha256)
+    generation = _exact_integer(
+        expected_latch_generation, "RBF latch generation", minimum=1
+    )
+    owner = _required_stability_text(owner_run_id, "RBF owner")
+    version = _exact_integer(lease_version, "RBF lease version", minimum=1)
+    if type(allow_dispatched) is not bool:
+        raise ValueError("RBF dispatch state request is invalid")
+    conn = _stability_read_only_connection()
+    try:
+        conn.execute("BEGIN")
+        attempt = conn.execute(
+            "SELECT * FROM coin_prep_rbf_attempts WHERE attempt_id=?",
+            (attempt_id,),
+        ).fetchone()
+        operation = conn.execute(
+            "SELECT * FROM coin_prep_operations WHERE operation_id=?",
+            (operation_id,),
+        ).fetchone()
+        latch = conn.execute(
+            "SELECT * FROM runtime_safety_latch WHERE singleton_id=1"
+        ).fetchone()
+        lease = conn.execute(
+            "SELECT * FROM runtime_mutation_lease WHERE singleton_id=1"
+        ).fetchone()
+        dispatch = conn.execute(
+            "SELECT * FROM coin_prep_rbf_dispatches WHERE operation_id=?",
+            (operation_id,),
+        ).fetchone()
+        active_sign = conn.execute(
+            "SELECT sign.attempt_id FROM coin_prep_rbf_sign_intents AS sign "
+            "LEFT JOIN coin_prep_rbf_sign_no_submit AS receipt "
+            "ON receipt.attempt_id=sign.attempt_id "
+            "WHERE sign.operation_id=? AND receipt.attempt_id IS NULL LIMIT 1",
+            (operation_id,),
+        ).fetchone()
+        sign_receipt = conn.execute(
+            "SELECT 1 FROM coin_prep_rbf_sign_no_submit WHERE attempt_id=?",
+            (attempt_id,),
+        ).fetchone()
+        conn.rollback()
+        if any(row is None for row in (attempt, operation, latch, lease)):
+            raise ValueError("RBF rescue authority is incomplete")
+        candidate = dict(attempt)
+        op = dict(operation)
+        fence = dict(latch)
+        owned = dict(lease)
+        marker = dict(dispatch) if dispatch is not None else None
+        identity = json.loads(op["wallet_identity_json"])
+        import mutation_gate
+
+        now = _stability_wall_clock()
+        if (
+            candidate["operation_id"] != operation_id
+            or candidate["unsigned_sha256"] != digest
+            or candidate["latch_generation"] != generation
+            or candidate["wallet_identity_sha256"]
+            != hashlib.sha256(op["wallet_identity_json"].encode()).hexdigest()
+            or op["outcome"] != "SUBMITTED_UNKNOWN"
+            or op["operation_kind"] != "split"
+            or op["purpose"] != "fee_reserve"
+            or fence["state"] != "tripped"
+            or fence["reason_code"] != "COIN_PREP_RECOVERY_REQUIRED"
+            or fence["generation"] != generation
+            or fence["wallet_fingerprint_hash"]
+            != mutation_gate.wallet_fingerprint_hash(identity["fingerprint"])
+            or fence["network"] != identity["network_id"]
+            or json.loads(fence["blocking_operation_ids_json"])
+            != sorted([operation_id, f"wallet-effect:{op['effect_claim_token']}"])
+            or owned["active"] != 1
+            or owned["owner_run_id"] != owner
+            or owned["lease_version"] != version
+            or owned["wallet_fingerprint_hash"] != fence["wallet_fingerprint_hash"]
+            or owned["network"] != fence["network"]
+            or owned["acquired_at"] is None
+            or owned["expires_at"] is None
+            or _parse_iso_timestamp(
+                owned["expires_at"], "RBF lease expiry", require_timezone=True
+            )
+            <= _parse_iso_timestamp(now, "RBF current time", require_timezone=True)
+            or _parse_iso_timestamp(
+                candidate["review_expires_at"],
+                "RBF review expiry",
+                require_timezone=True,
+            )
+            <= _parse_iso_timestamp(now, "RBF current time", require_timezone=True)
+        ):
+            raise ValueError("RBF rescue authority changed")
+        if allow_dispatched:
+            if (
+                marker is None
+                or marker["attempt_id"] != attempt_id
+                or marker["owner_run_id"] != owner
+                or marker["lease_version"] != version
+            ):
+                raise ValueError("RBF one-shot dispatch marker is absent or changed")
+        elif marker is not None:
+            raise ValueError("RBF rescue already dispatched")
+        elif sign_receipt is not None or (
+            active_sign is not None and active_sign["attempt_id"] != attempt_id
+        ):
+            raise ValueError("RBF sign phase belongs to another active attempt")
+        return {
+            "attempt_id": attempt_id,
+            "operation_id": operation_id,
+            "unsigned_sha256": digest,
+            "wallet_fingerprint_hash": fence["wallet_fingerprint_hash"],
+            "network": fence["network"],
+            "latch_generation": generation,
+            "lease_version": version,
+            "lease_acquired_at": owned["acquired_at"],
+            "review_expires_at": candidate["review_expires_at"],
+            "dispatch_started": marker is not None,
+            "sign_started": active_sign is not None,
+        }
+    finally:
+        conn.close()
+
+
+def get_coin_prep_rbf_attempt_for_submit(attempt_id: str) -> Dict[str, Any]:
+    """Read immutable review fields; this alone grants no submit authority."""
+    attempt_id = _fee_digest(attempt_id)
+    conn = _stability_read_only_connection()
+    try:
+        row = conn.execute(
+            "SELECT * FROM coin_prep_rbf_attempts WHERE attempt_id=?",
+            (attempt_id,),
+        ).fetchone()
+        if row is None:
+            raise ValueError("RBF attempt is absent")
+        return dict(row)
+    finally:
+        conn.close()
+
+
+def get_recoverable_coin_prep_rbf_attempts() -> list[Dict[str, Any]]:
+    """Read dispatched, unresolved RBF effects for observation only."""
+    conn = _stability_read_only_connection()
+    try:
+        rows = conn.execute(
+            "SELECT attempt.*,prep.source_coin_ids_json,prep.wallet_identity_json "
+            "FROM coin_prep_rbf_attempts AS attempt "
+            "JOIN coin_prep_rbf_dispatches AS dispatch "
+            "ON dispatch.attempt_id=attempt.attempt_id "
+            "JOIN coin_prep_operations AS prep "
+            "ON prep.operation_id=attempt.operation_id "
+            "LEFT JOIN coin_prep_rbf_resolutions AS resolution "
+            "ON resolution.attempt_id=attempt.attempt_id "
+            "WHERE resolution.attempt_id IS NULL "
+            "AND prep.outcome='SUBMITTED_UNKNOWN' "
+            "ORDER BY dispatch.started_at,attempt.attempt_id LIMIT 128"
+        ).fetchall()
+        return [dict(row) for row in rows]
+    finally:
+        conn.close()
+
+
+def adopt_coin_prep_rbf_successor(
+    *,
+    operation_id: str,
+    expected_latch_generation: int,
+    expected_lease_version: int,
+    expected_prior_owner_run_id: Any,
+    expected_prior_owner_pid: Any,
+    expected_prior_owner_host: Any,
+    expected_prior_acquired_at: Any,
+    expected_prior_expires_at: Any,
+    expected_prior_released_at: Any,
+    successor_owner_run_id: str,
+    successor_owner_pid: int,
+    successor_owner_host: str,
+    lease_expires_at: Any,
+    prior_owner_liveness_proven_dead: bool,
+    observed_at: Any,
+) -> Dict[str, Any]:
+    """CAS-adopt only the exact stuck fee-prep latch for restricted recovery."""
+    operation_id = _fee_operation_identity(operation_id)
+    generation = _exact_integer(
+        expected_latch_generation, "RBF latch generation", minimum=1
+    )
+    version = _exact_integer(expected_lease_version, "RBF prior lease version")
+    owner = _required_stability_text(successor_owner_run_id, "RBF successor owner")
+    pid = _exact_integer(successor_owner_pid, "RBF successor PID", minimum=1)
+    host = _required_stability_text(successor_owner_host, "RBF successor host")
+    expiry = _stability_timestamp(lease_expires_at, "RBF successor lease expiry")
+    observed = _stability_timestamp(observed_at, "RBF adoption observation")
+    if type(prior_owner_liveness_proven_dead) is not bool:
+        raise ValueError("RBF prior owner liveness proof must be exact")
+    conn = _stability_connection()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        now = _stability_wall_clock()
+        now_dt = _parse_iso_timestamp(now, "RBF current time", require_timezone=True)
+        observed_dt = _parse_iso_timestamp(
+            observed, "RBF observation", require_timezone=True
+        )
+        expiry_dt = _parse_iso_timestamp(
+            expiry, "RBF successor expiry", require_timezone=True
+        )
+        if not timedelta(seconds=-5) <= now_dt - observed_dt <= timedelta(
+            seconds=30
+        ) or not now_dt < expiry_dt <= now_dt + timedelta(seconds=120):
+            raise ValueError("RBF adoption observation or lease expiry is stale")
+        op = conn.execute(
+            "SELECT * FROM coin_prep_operations WHERE operation_id=?",
+            (operation_id,),
+        ).fetchone()
+        latch = conn.execute(
+            "SELECT * FROM runtime_safety_latch WHERE singleton_id=1"
+        ).fetchone()
+        prior = conn.execute(
+            "SELECT * FROM runtime_mutation_lease WHERE singleton_id=1"
+        ).fetchone()
+        if op is None or latch is None or prior is None:
+            raise ValueError("RBF adoption authority is incomplete")
+        op, latch, prior = dict(op), dict(latch), dict(prior)
+        identity = json.loads(op["wallet_identity_json"])
+        import mutation_gate
+
+        wallet_hash = mutation_gate.wallet_fingerprint_hash(identity["fingerprint"])
+        blockers = sorted([operation_id, f"wallet-effect:{op['effect_claim_token']}"])
+        if (
+            op["outcome"] != "SUBMITTED_UNKNOWN"
+            or op["operation_kind"] != "split"
+            or op["purpose"] != "fee_reserve"
+            or latch["state"] != "tripped"
+            or latch["reason_code"] != "COIN_PREP_RECOVERY_REQUIRED"
+            or latch["generation"] != generation
+            or json.loads(latch["blocking_operation_ids_json"]) != blockers
+            or latch["wallet_fingerprint_hash"] != wallet_hash
+            or latch["network"] != identity["network_id"]
+            or prior["lease_version"] != version
+            or prior["owner_run_id"] != expected_prior_owner_run_id
+            or prior["owner_pid"] != expected_prior_owner_pid
+            or prior["owner_host"] != expected_prior_owner_host
+            or prior["acquired_at"] != expected_prior_acquired_at
+            or prior["expires_at"] != expected_prior_expires_at
+            or prior["released_at"] != expected_prior_released_at
+            or prior["owner_run_id"] == owner
+        ):
+            raise ValueError("RBF adoption snapshot changed")
+        if prior["active"] == 1:
+            if (
+                not prior_owner_liveness_proven_dead
+                or prior["expires_at"] is None
+                or _parse_iso_timestamp(
+                    prior["expires_at"],
+                    "RBF prior lease expiry",
+                    require_timezone=True,
+                )
+                > now_dt
+                or prior["released_at"] is not None
+                or prior["wallet_fingerprint_hash"] != wallet_hash
+                or prior["network"] != identity["network_id"]
+            ):
+                raise ValueError("RBF prior active owner is not proven dead")
+        elif prior["active"] == 0:
+            if prior["expires_at"] is not None:
+                raise ValueError("RBF prior lease is not cleanly inactive")
+        else:
+            raise ValueError("RBF prior lease state is invalid")
+        unresolved_offer = conn.execute(
+            "SELECT 1 FROM offer_operation_journal AS journal JOIN ("
+            "SELECT operation_id,MAX(sequence) AS sequence FROM offer_operation_journal "
+            "GROUP BY operation_id) AS latest ON latest.operation_id=journal.operation_id "
+            "AND latest.sequence=journal.sequence WHERE journal.blocks_mutation=1 LIMIT 1"
+        ).fetchone()
+        other_prep = conn.execute(
+            "SELECT 1 FROM coin_prep_operations WHERE operation_id<>? "
+            "AND outcome IN ('PREPARED','SUBMITTED_UNKNOWN') LIMIT 1",
+            (operation_id,),
+        ).fetchone()
+        if unresolved_offer is not None or other_prep is not None:
+            raise ValueError("unrelated recovery blocker remains")
+        changed = conn.execute(
+            "UPDATE runtime_mutation_lease SET lease_version=lease_version+1,"
+            "active=1,owner_run_id=?,owner_pid=?,owner_host=?,"
+            "wallet_fingerprint_hash=?,network=?,acquired_at=?,heartbeat_at=?,"
+            "expires_at=?,released_at=NULL,updated_at=? WHERE singleton_id=1 "
+            "AND lease_version=? AND active=?",
+            (
+                owner,
+                pid,
+                host,
+                wallet_hash,
+                identity["network_id"],
+                now,
+                now,
+                expiry,
+                now,
+                version,
+                prior["active"],
+            ),
+        )
+        if changed.rowcount != 1:
+            raise ValueError("RBF successor lease compare-and-set failed")
+        if prior["owner_run_id"]:
+            conn.execute(
+                "UPDATE runtime_worker_delegations SET state='revoked',"
+                "revoked_at=?,updated_at=? WHERE parent_run_id=? AND state='active'",
+                (now, now, prior["owner_run_id"]),
+            )
+        if expiry <= _stability_wall_clock():
+            raise ValueError("RBF successor lease expired during adoption")
+        successor = conn.execute(
+            "SELECT * FROM runtime_mutation_lease WHERE singleton_id=1"
+        ).fetchone()
+        conn.commit()
+        return {"adopted": True, "lease": dict(successor)}
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def resolve_coin_prep_rbf_attempt(
+    attempt_id: str,
+    *,
+    winner: str,
+    winner_transaction_id: str,
+    chain_view: dict,
+    authoritative_view: dict,
+) -> Dict[str, Any]:
+    """Settle a dispatched attempt from one complete confirmed winner view.
+
+    This merely consumes observations supplied by the read-only recovery
+    worker. It never calls Sage and never interprets a preview as chain proof.
+    The terminal operation, coin rows, attempt resolution and latch update
+    commit in ``record_coin_prep_operation_outcome``'s one transaction.
+    """
+    attempt_id = _fee_digest(attempt_id)
+    if winner not in {"ORIGINAL", "SUCCESSOR"}:
+        raise ValueError("RBF winner must be exact")
+    conn = _stability_read_only_connection()
+    try:
+        attempt = conn.execute(
+            "SELECT * FROM coin_prep_rbf_attempts WHERE attempt_id=?",
+            (attempt_id,),
+        ).fetchone()
+        if attempt is None:
+            raise ValueError("RBF attempt is absent")
+        attempt = dict(attempt)
+        operation = conn.execute(
+            "SELECT * FROM coin_prep_operations WHERE operation_id=?",
+            (attempt["operation_id"],),
+        ).fetchone()
+        if operation is None:
+            raise ValueError("RBF original operation is absent")
+        operation = dict(operation)
+    finally:
+        conn.close()
+    outputs = json.loads(
+        attempt[
+            "original_outputs_json"
+            if winner == "ORIGINAL"
+            else "successor_outputs_json"
+        ]
+    )
+    if (
+        type(authoritative_view) is dict
+        and type(authoritative_view.get("coins")) is list
+    ):
+        observed_by_id = {
+            _reconciliation_coin_identity(row.get("coin_id"), "RBF observed output")[
+                0
+            ]: row
+            for row in authoritative_view["coins"]
+            if type(row) is dict
+        }
+        for output in outputs:
+            observed = observed_by_id.get(output["coin_id"])
+            if observed is not None and observed.get("spent_height") is not None:
+                output["spent_height"] = observed["spent_height"]
+    return record_coin_prep_operation_outcome(
+        operation["operation_id"],
+        outcome="CONFIRMED",
+        evidence_json={
+            "reason_code": (
+                "AUTHORITATIVE_RBF_ORIGINAL_CONFIRMED"
+                if winner == "ORIGINAL"
+                else "AUTHORITATIVE_RBF_REPLACEMENT_CONFIRMED"
+            ),
+            "effect_claim_token": operation["effect_claim_token"],
+            "effect_claim_generation": operation["effect_claim_generation"],
+            "source_coin_ids": json.loads(operation["source_coin_ids_json"]),
+            "expected_outputs": outputs,
+            "authoritative_view": authoritative_view,
+            "expected_wallet_identity": json.loads(operation["wallet_identity_json"]),
+            "rbf_attempt_id": attempt_id,
+            "rbf_chain_view": chain_view,
+            "winner_transaction_id": winner_transaction_id,
+        },
+    )
+
+
 def get_recoverable_coin_prep_operations(*, limit: int = 128) -> List[Dict[str, Any]]:
     """Return restart inventory and durably fence it before observation."""
 
@@ -26074,6 +31836,67 @@ def get_recoverable_coin_prep_operations(*, limit: int = 128) -> List[Dict[str, 
     return [dict(row) for row in rows]
 
 
+def _guard_follow_intent_principal(conn, immutable, policy_digest):
+    """Reserve signed principal under the same writer lock as the intent."""
+    purpose = immutable["purpose"]
+    if not purpose.startswith("follow:"):
+        return
+    parts = purpose.split(":")
+    if (
+        len(parts) != 3
+        or re.fullmatch(r"[0-9a-f]{64}", parts[1]) is None
+        or parts[2] not in {"normal_lifecycle", "book_opportunity"}
+    ):
+        raise ValueError("FOLLOW_RUN_POLICY_PURPOSE_INVALID")
+    row = conn.execute(
+        "SELECT value FROM bot_settings WHERE key=?",
+        (_ACTIVE_FOLLOW_RUN_POLICY_SETTING,),
+    ).fetchone()
+    raw = row["value"] if row else None
+    if raw is None and policy_digest is None:
+        return  # Runs approved before signed policies retain their legacy guards.
+    policy = _decode_follow_run_policy(raw)
+    if policy is None:
+        raise ValueError("FOLLOW_RUN_POLICY_REQUIRED")
+    import mutation_gate
+
+    if (
+        policy_digest != policy.digest
+        or immutable["network"] != policy.network
+        or immutable["asset_id"] != policy.asset_id
+        or immutable["wallet_fingerprint_hash"]
+        != mutation_gate.wallet_fingerprint_hash(int(policy.wallet_fingerprint))
+    ):
+        raise ValueError("FOLLOW_RUN_POLICY_AUTHORITY_MISMATCH")
+    terminal = sorted(_TERMINAL_INTENT_RESERVATION_STATES)
+    placeholders = ",".join("?" for _ in terminal)
+    # Python integers avoid SQLite SUM's signed 64-bit overflow for atom values.
+    rows = conn.execute(
+        "SELECT offered_amount_atomic FROM offer_intents "
+        "WHERE purpose LIKE 'follow:%' AND wallet_fingerprint_hash=? "
+        "AND network=? AND asset_id=? AND side=? AND intent_id<>? "
+        f"AND lifecycle_state NOT IN ({placeholders})",
+        (
+            immutable["wallet_fingerprint_hash"],
+            immutable["network"],
+            immutable["asset_id"],
+            immutable["side"],
+            immutable["intent_id"],
+            *terminal,
+        ),
+    ).fetchall()
+    committed = sum(
+        int(_atomic_amount_text(row[0], "offered_amount_atomic")) for row in rows
+    )
+    cap = (
+        policy.maximum_trade_xch_mojos
+        if immutable["side"] == "buy"
+        else policy.maximum_trade_cat_atoms
+    )
+    if committed + int(immutable["offered_amount_atomic"]) > cap:
+        raise ValueError("FOLLOW_PRINCIPAL_CAP_EXCEEDED")
+
+
 def prepare_offer_intent(
     *,
     intent_id: str,
@@ -26102,6 +31925,7 @@ def prepare_offer_intent(
     prepared_at: Any = None,
     reserve_selected_coins: bool = False,
     require_new_intent: bool = False,
+    follow_policy_digest: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Atomically persist a creation intent and its PREPARED journal event."""
 
@@ -26270,6 +32094,7 @@ def prepare_offer_intent(
                     "selected coin has an authoritative terminal coin outcome"
                 )
         if existing is None:
+            _guard_follow_intent_principal(conn, immutable, follow_policy_digest)
             conn.execute(
                 """
                 INSERT INTO offer_intents (
@@ -26875,6 +32700,217 @@ def finalize_offer_intent(
         conn.rollback()
         _persist_confirmation_publication_conflict(exc.publication_id, final_time)
         raise ValueError("confirmed publication identity conflicts") from exc
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def settle_no_effect_offer_creation(*, proof: Any) -> Dict[str, Any]:
+    """Atomically close one reviewed unknown creation proven absent in Sage.
+
+    The caller must re-collect the complete wallet proof immediately before
+    this transaction. This boundary rechecks every durable intent, coin,
+    journal, latch and lease field and never sends a wallet operation.
+    """
+
+    required = {
+        "intent_id",
+        "operation_id",
+        "row_version",
+        "latch_generation",
+        "wallet_fingerprint_hash",
+        "network",
+        "selected_coin_id",
+        "requested_amount_atomic",
+        "sage_stable",
+        "lease_owner_run_id",
+        "lease_owner_pid",
+        "lease_owner_host",
+        "lease_version",
+        "proof_digest",
+    }
+    if type(proof) is not dict or set(proof) != required:
+        raise ValueError("no-effect creation proof fields are invalid")
+    digest = _required_stability_text(proof["proof_digest"], "proof_digest")
+    if len(digest) != 64 or any(char not in "0123456789abcdef" for char in digest):
+        raise ValueError("no-effect creation digest is invalid")
+    material = {key: value for key, value in proof.items() if key != "proof_digest"}
+    canonical = _canonical_json_text(
+        material, "no-effect creation proof", expected_type=dict
+    )
+    if hashlib.sha256(canonical.encode("utf-8")).hexdigest() != digest:
+        raise ValueError("no-effect creation proof digest changed")
+    intent_id = _required_stability_text(proof["intent_id"], "intent_id")
+    operation_id = _required_stability_text(proof["operation_id"], "operation_id")
+    if operation_id != f"create:{intent_id}":
+        raise ValueError("no-effect creation operation identity differs")
+    expected_version = _exact_integer(proof["row_version"], "row_version")
+    generation = _exact_integer(proof["latch_generation"], "latch_generation")
+    expected_lease_version = _exact_integer(
+        proof["lease_version"], "lease_version", minimum=1
+    )
+    expected_pid = _exact_integer(
+        proof["lease_owner_pid"], "lease_owner_pid", minimum=1
+    )
+    selected_coin = norm_coin_id(
+        _required_stability_text(proof["selected_coin_id"], "selected_coin_id")
+    )
+    requested = _exact_integer(
+        proof["requested_amount_atomic"], "requested_amount_atomic", minimum=1
+    )
+    wallet_hash = _required_stability_text(
+        proof["wallet_fingerprint_hash"], "wallet_fingerprint_hash"
+    )
+    network = _required_stability_text(proof["network"], "network")
+    when = _stability_timestamp_or_now(None, "no-effect creation recovery")
+    event_id = f"{operation_id}:recovered:no-effect"
+    conn = _stability_connection()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        intent_row = conn.execute(
+            "SELECT * FROM offer_intents WHERE intent_id=?", (intent_id,)
+        ).fetchone()
+        latch_row = conn.execute(
+            "SELECT * FROM runtime_safety_latch WHERE singleton_id=1"
+        ).fetchone()
+        lease_row = conn.execute(
+            "SELECT * FROM runtime_mutation_lease WHERE singleton_id=1"
+        ).fetchone()
+        latest_row = conn.execute(
+            "SELECT * FROM offer_operation_journal WHERE operation_id=? "
+            "ORDER BY sequence DESC LIMIT 1",
+            (operation_id,),
+        ).fetchone()
+        if any(row is None for row in (intent_row, latch_row, lease_row, latest_row)):
+            raise ValueError("no-effect creation durable authority is missing")
+        intent, latch, lease, latest = map(
+            dict, (intent_row, latch_row, lease_row, latest_row)
+        )
+        existing = conn.execute(
+            "SELECT * FROM offer_operation_journal WHERE event_id=?", (event_id,)
+        ).fetchone()
+        if existing is not None:
+            evidence = json.loads(existing["evidence_json"])
+            if (
+                intent["lifecycle_state"] == "creation_failed"
+                and latch["state"] == "resolved"
+                and evidence == proof
+                and existing["blocks_mutation"] == 0
+            ):
+                conn.commit()
+                return {
+                    "applied": False,
+                    "intent_id": intent_id,
+                    "operation_id": operation_id,
+                    "wallet_effect_started": False,
+                }
+            raise ValueError("no-effect creation replay differs")
+        if (
+            intent["lifecycle_state"] != "creation_unknown"
+            or intent["row_version"] != expected_version
+            or intent["sage_trade_id"] is not None
+            or intent["wallet_fingerprint_hash"] != wallet_hash
+            or intent["network"] != network
+            or int(intent["requested_amount_atomic"]) != requested
+            or json.loads(intent["selected_coin_ids_json"])
+            != [proof["selected_coin_id"]]
+            or latch["state"] != "tripped"
+            or latch["generation"] != generation
+            or latch["reason_code"] != "UNRESOLVED_OPERATIONS"
+            or latch["wallet_fingerprint_hash"] != wallet_hash
+            or latch["network"] != network
+            or json.loads(latch["blocking_operation_ids_json"]) != [operation_id]
+            or latest["intent_id"] != intent_id
+            or latest["operation_type"] != "CREATE"
+            or latest["outcome"] != "UNKNOWN"
+            or latest["blocks_mutation"] != 1
+        ):
+            raise ValueError("no-effect creation durable scope changed")
+        if (
+            lease["active"] != 1
+            or lease["owner_run_id"] != proof["lease_owner_run_id"]
+            or lease["owner_pid"] != expected_pid
+            or lease["owner_host"] != proof["lease_owner_host"]
+            or lease["wallet_fingerprint_hash"] != wallet_hash
+            or lease["network"] != network
+            or lease["lease_version"] < expected_lease_version
+            or lease["expires_at"] <= when
+        ):
+            raise ValueError("no-effect creation runtime lease changed")
+        other_blocker = conn.execute(
+            "SELECT 1 FROM offer_operation_journal AS journal JOIN "
+            "(SELECT operation_id,MAX(sequence) AS latest_sequence "
+            "FROM offer_operation_journal GROUP BY operation_id) AS current "
+            "ON current.operation_id=journal.operation_id "
+            "AND current.latest_sequence=journal.sequence "
+            "WHERE journal.blocks_mutation=1 AND journal.operation_id<>? LIMIT 1",
+            (operation_id,),
+        ).fetchone()
+        if other_blocker is not None:
+            raise ValueError("another unresolved operation remains")
+        coin = conn.execute(
+            "SELECT status,trade_id FROM coins WHERE coin_id=?", (selected_coin,)
+        ).fetchone()
+        if (
+            coin is None
+            or coin["status"] != "locked"
+            or coin["trade_id"] != f"intent:{intent_id}"
+        ):
+            raise ValueError("selected coin reservation changed")
+        cursor = conn.execute(
+            "UPDATE offer_intents SET lifecycle_state='creation_failed', "
+            "row_version=row_version+1, terminal_at=?, updated_at=? "
+            "WHERE intent_id=? AND row_version=? AND lifecycle_state='creation_unknown'",
+            (when, when, intent_id, expected_version),
+        )
+        if cursor.rowcount != 1:
+            raise ValueError("creation intent compare-and-set failed")
+        cursor = conn.execute(
+            "UPDATE coins SET status='free',trade_id=NULL,last_seen=? "
+            "WHERE coin_id=? AND status='locked' AND trade_id=?",
+            (when, selected_coin, f"intent:{intent_id}"),
+        )
+        if cursor.rowcount != 1:
+            raise ValueError("selected coin release compare-and-set failed")
+        event = _journal_values(
+            event_id=event_id,
+            operation_id=operation_id,
+            intent_id=intent_id,
+            operation_type="CREATE",
+            attempt=int(latest["attempt"]) + 1,
+            phase="RECOVERED",
+            outcome="FAILED",
+            request_timestamp=when,
+            wallet_identity_json={
+                "wallet_fingerprint_hash": wallet_hash,
+                "network": network,
+            },
+            transaction_id=None,
+            spend_identity=None,
+            evidence_json=proof,
+            evidence_sha256=None,
+            reason_code="AUTHORITATIVE_NO_EFFECT_CONFIRMED",
+            blocks_mutation=False,
+            created_at=when,
+        )
+        _insert_offer_operation_event(conn, event)
+        cursor = conn.execute(
+            "UPDATE runtime_safety_latch SET state='resolved',reason_code=NULL,"
+            "reason=NULL,blocking_operation_ids_json='[]',resolved_at=?,"
+            "updated_at=? WHERE singleton_id=1 AND generation=? AND state='tripped'",
+            (when, when, generation),
+        )
+        if cursor.rowcount != 1:
+            raise ValueError("runtime latch compare-and-set failed")
+        conn.commit()
+        return {
+            "applied": True,
+            "intent_id": intent_id,
+            "operation_id": operation_id,
+            "wallet_effect_started": False,
+        }
     except Exception:
         conn.rollback()
         raise
@@ -28110,6 +34146,72 @@ def commit_legacy_expired_offer_intent(
         conn.close()
 
 
+def _validate_external_cancel_commit_evidence(
+    conn: sqlite3.Connection,
+    *,
+    intent: Dict[str, Any],
+    canonical_evidence: str,
+    reconciled_at: str,
+    transaction_id: Optional[str],
+    spend_identity: Optional[str],
+    block_height: Optional[int],
+    fee_mojos: int,
+    rebindings: List[Dict[str, Any]],
+) -> None:
+    """Recompute a Sage-only cancel proof without borrowing Task 8 authority."""
+
+    from offer_reconciliation import classify_external_cancel_evidence
+
+    envelope = json.loads(canonical_evidence)
+    if type(envelope) is not dict or set(envelope) != {"classification", "evidence"}:
+        raise ValueError("external cancellation evidence envelope is invalid")
+    derived = classify_external_cancel_evidence(
+        intent, envelope["evidence"], now=reconciled_at
+    )
+    if (
+        derived.get("classification") != "CANCELLED_PROVEN"
+        or derived.get("reason_code") != "EXACT_EXTERNAL_CANCEL_RETURN_PROOF"
+        or derived.get("origin") != "external"
+        or envelope["classification"] != derived
+        or derived.get("transaction_id") != transaction_id
+        or derived.get("spend_identity") != spend_identity
+        or derived.get("block_height") != block_height
+        or derived.get("fee_mojos") != fee_mojos
+    ):
+        raise ValueError("external cancellation proof differs from Sage evidence")
+    expected_rebindings = [
+        {
+            "input_coin_id": row["input_bare"],
+            "return_coin_id": row["return_bare"],
+            "asset_id": row["asset_id"],
+            "amount": row["amount"],
+        }
+        for row in rebindings
+    ]
+    if derived.get("coin_rebindings") != expected_rebindings:
+        raise ValueError("external cancellation returned coin proof differs")
+    latest = conn.execute(
+        "SELECT * FROM offer_operation_journal WHERE operation_id=? "
+        "ORDER BY sequence DESC LIMIT 1",
+        (f"cancel:{intent['sage_trade_id']}",),
+    ).fetchone()
+    if latest is None:
+        return
+    event = validate_offer_operation_event(dict(latest))
+    try:
+        effect_evidence = json.loads(event["evidence_json"])
+    except (TypeError, ValueError) as exc:
+        raise ValueError("prior cancellation journal is invalid") from exc
+    if (
+        event["phase"] != "FINALIZED"
+        or event["outcome"] != "CANCEL_FAILED"
+        or event["blocks_mutation"] != 0
+        or type(effect_evidence) is not dict
+        or effect_evidence.get("effect_attempted") is not False
+    ):
+        raise ValueError("external recovery conflicts with CATalyst cancellation")
+
+
 def commit_offer_reconciliation(
     *,
     intent_id: str,
@@ -28128,7 +34230,10 @@ def commit_offer_reconciliation(
     fee_mojos: int = 0,
     coin_rebindings: Any = None,
     cancel_context_json: Any = None,
+    refresh_abort_id: Optional[str] = None,
     reconciled_at: Any = None,
+    recovery_fence: Optional[Dict[str, Any]] = None,
+    external_cancel: bool = False,
 ) -> Dict[str, Any]:
     """Commit one policy-authorized reconciliation in one short transaction.
 
@@ -28151,6 +34256,17 @@ def commit_offer_reconciliation(
         | _RECONCILE_OBSERVATION_OUTCOMES
     ):
         raise ValueError("reconciliation classification is not committable")
+    if type(external_cancel) is not bool:
+        raise ValueError("external_cancel must be an exact bool")
+    if external_cancel and safe_classification != "CANCELLED_PROVEN":
+        raise ValueError("external recovery requires proven cancellation")
+    safe_refresh_abort_id = (
+        _required_stability_text(refresh_abort_id, "refresh_abort_id")
+        if refresh_abort_id is not None
+        else None
+    )
+    if safe_refresh_abort_id and safe_classification != "CANCELLED_PROVEN":
+        raise ValueError("refresh abort requires proven cancellation")
     blocking = safe_classification in _RECONCILE_BLOCKING_OUTCOMES
     phase = {
         "UNKNOWN": "UNKNOWN",
@@ -28158,6 +34274,8 @@ def commit_offer_reconciliation(
         "ACTIVE_PROVEN": "OBSERVED",
     }.get(safe_classification, "FINALIZED")
     safe_reason = _required_stability_text(reason_code, "reason_code").upper()
+    if external_cancel and safe_reason != "EXACT_EXTERNAL_CANCEL_RETURN_PROOF":
+        raise ValueError("external recovery requires exact external proof")
     when = _stability_timestamp_or_now(reconciled_at, "reconciled_at")
     wallet_json = _canonical_json_text(
         wallet_identity_json,
@@ -28270,8 +34388,14 @@ def commit_offer_reconciliation(
             max_bytes=262144,
         )
         safe_cancel_context = json.loads(cancel_context_text)
-    if safe_classification == "CANCELLED_PROVEN" and safe_cancel_context is None:
+    if (
+        safe_classification == "CANCELLED_PROVEN"
+        and safe_cancel_context is None
+        and not external_cancel
+    ):
         raise ValueError("proven cancellation requires exact Task 8 context")
+    if external_cancel and safe_cancel_context is not None:
+        raise ValueError("external recovery cannot borrow Task 8 context")
     if safe_classification != "CANCELLED_PROVEN" and safe_cancel_context is not None:
         raise ValueError("only proven cancellation may carry Task 8 context")
 
@@ -28305,6 +34429,15 @@ def commit_offer_reconciliation(
     conn = _stability_connection()
     try:
         conn.execute("BEGIN IMMEDIATE")
+        if recovery_fence is not None:
+            if safe_classification not in {"FILLED_PROVEN", "EXPIRED_PROVEN"}:
+                raise ValueError("mixed terminal recovery permits only fill or expiry")
+            if (
+                type(recovery_fence) is not dict
+                or recovery_fence.get("target_intent_id") != safe_intent_id
+            ):
+                raise ValueError("mixed terminal recovery target differs")
+            fence_mixed_terminal_commit(**recovery_fence, _conn=conn)
         intent_row = conn.execute(
             "SELECT * FROM offer_intents WHERE intent_id=?", (safe_intent_id,)
         ).fetchone()
@@ -28316,6 +34449,32 @@ def commit_offer_reconciliation(
             or intent["network"] != network
         ):
             raise ValueError("reconciliation wallet binding mismatch")
+        child_id = intent.get("child_intent_id")
+        child_row = (
+            conn.execute(
+                "SELECT * FROM offer_intents WHERE intent_id=?", (child_id,)
+            ).fetchone()
+            if child_id
+            else None
+        )
+        if (
+            safe_classification in {"CANCELLED_PROVEN", "EXPIRED_PROVEN"}
+            and child_row is not None
+            and child_row["lifecycle_state"] == "created"
+            and safe_refresh_abort_id is None
+        ):
+            raise ValueError("unpublished replacement requires a fenced refresh abort")
+        refresh_abort = None
+        if safe_refresh_abort_id is not None:
+            refresh_abort = _validate_refresh_abort_commit_authority(
+                conn,
+                abort_id=safe_refresh_abort_id,
+                parent=intent,
+                child=dict(child_row) if child_row is not None else None,
+                wallet_hash=wallet_hash,
+                network=network,
+                at=when,
+            )
         immutable_economics = (
             _current_intent_economic_authority(conn, safe_intent_id)
             if safe_classification == "FILLED_PROVEN"
@@ -28327,71 +34486,84 @@ def commit_offer_reconciliation(
         if safe_classification == "CANCELLED_PROVEN":
             if not trade_hint:
                 raise ValueError("Task 8 cancellation target trade is missing")
-            task8 = _validate_reconciliation_cancel_context(
-                conn,
-                safe_cancel_context,
-                intent_id=safe_intent_id,
-                trade_id=trade_hint,
-                fee_mojos=safe_fee,
-            )
-            for task8_operation_id, observed_sequence in task8[
-                "latest_sequences"
-            ].items():
-                current_latest = conn.execute(
-                    """
-                    SELECT sequence FROM offer_operation_journal
-                    WHERE operation_id=? ORDER BY sequence DESC LIMIT 1
-                    """,
-                    (task8_operation_id,),
-                ).fetchone()
-                if current_latest is None or int(current_latest["sequence"]) != int(
-                    observed_sequence
+            if external_cancel:
+                _validate_external_cancel_commit_evidence(
+                    conn,
+                    intent=intent,
+                    canonical_evidence=canonical_evidence,
+                    reconciled_at=when,
+                    transaction_id=safe_transaction_id,
+                    spend_identity=safe_spend_identity,
+                    block_height=safe_height,
+                    fee_mojos=safe_fee,
+                    rebindings=safe_rebindings,
+                )
+            else:
+                task8 = _validate_reconciliation_cancel_context(
+                    conn,
+                    safe_cancel_context,
+                    intent_id=safe_intent_id,
+                    trade_id=trade_hint,
+                    fee_mojos=safe_fee,
+                )
+                for task8_operation_id, observed_sequence in task8[
+                    "latest_sequences"
+                ].items():
+                    current_latest = conn.execute(
+                        """
+                        SELECT sequence FROM offer_operation_journal
+                        WHERE operation_id=? ORDER BY sequence DESC LIMIT 1
+                        """,
+                        (task8_operation_id,),
+                    ).fetchone()
+                    if current_latest is None or int(current_latest["sequence"]) != int(
+                        observed_sequence
+                    ):
+                        raise ValueError(
+                            "Task 8 cancellation cohort changed during reconciliation"
+                        )
+                latest_event = task8["latest"]
+                cancel_operation_id = f"cancel:{trade_hint}"
+                if latest_event["blocks_mutation"] == 1 or (
+                    task8["external_recovery"] is True
+                    and latest_event["phase"] == "FINALIZED"
+                    and latest_event["outcome"] == "CANCEL_FAILED"
+                    and latest_event["blocks_mutation"] == 0
+                ):
+                    cancel_resolution = {
+                        "observed_sequence": latest_event["sequence"],
+                        "operation_id": cancel_operation_id,
+                        "journal": _journal_values(
+                            event_id=(
+                                f"{cancel_operation_id}:attempt:"
+                                f"{latest_event['attempt']}:reconciled"
+                            ),
+                            operation_id=cancel_operation_id,
+                            intent_id=safe_intent_id,
+                            operation_type="CANCEL",
+                            attempt=latest_event["attempt"],
+                            phase="RECONCILED",
+                            outcome="CANCEL_CONFIRMED",
+                            request_timestamp=when,
+                            wallet_identity_json=wallet_json,
+                            transaction_id=safe_transaction_id,
+                            spend_identity=safe_spend_identity,
+                            evidence_json=canonical_evidence,
+                            evidence_sha256=expected_digest,
+                            reason_code="AUTHORITATIVE_TERMINAL_PROOF",
+                            blocks_mutation=False,
+                            created_at=when,
+                        ),
+                    }
+                elif (
+                    latest_event["outcome"] != "CANCEL_CONFIRMED"
+                    or latest_event["transaction_id"] != safe_transaction_id
+                    or latest_event["spend_identity"] != safe_spend_identity
+                    or latest_event["evidence_sha256"] != expected_digest
                 ):
                     raise ValueError(
-                        "Task 8 cancellation cohort changed during reconciliation"
+                        "Task 8 nonblocking cancellation result contradicts proof"
                     )
-            latest_event = task8["latest"]
-            cancel_operation_id = f"cancel:{trade_hint}"
-            if latest_event["blocks_mutation"] == 1 or (
-                task8["external_recovery"] is True
-                and latest_event["phase"] == "FINALIZED"
-                and latest_event["outcome"] == "CANCEL_FAILED"
-                and latest_event["blocks_mutation"] == 0
-            ):
-                cancel_resolution = {
-                    "observed_sequence": latest_event["sequence"],
-                    "operation_id": cancel_operation_id,
-                    "journal": _journal_values(
-                        event_id=(
-                            f"{cancel_operation_id}:attempt:"
-                            f"{latest_event['attempt']}:reconciled"
-                        ),
-                        operation_id=cancel_operation_id,
-                        intent_id=safe_intent_id,
-                        operation_type="CANCEL",
-                        attempt=latest_event["attempt"],
-                        phase="RECONCILED",
-                        outcome="CANCEL_CONFIRMED",
-                        request_timestamp=when,
-                        wallet_identity_json=wallet_json,
-                        transaction_id=safe_transaction_id,
-                        spend_identity=safe_spend_identity,
-                        evidence_json=canonical_evidence,
-                        evidence_sha256=expected_digest,
-                        reason_code="AUTHORITATIVE_TERMINAL_PROOF",
-                        blocks_mutation=False,
-                        created_at=when,
-                    ),
-                }
-            elif (
-                latest_event["outcome"] != "CANCEL_CONFIRMED"
-                or latest_event["transaction_id"] != safe_transaction_id
-                or latest_event["spend_identity"] != safe_spend_identity
-                or latest_event["evidence_sha256"] != expected_digest
-            ):
-                raise ValueError(
-                    "Task 8 nonblocking cancellation result contradicts proof"
-                )
         if safe_filled_at is not None:
             offer_created_at = _parse_iso_timestamp(
                 intent.get("confirmed_at") or intent.get("prepared_at"),
@@ -28418,6 +34590,11 @@ def commit_offer_reconciliation(
             (safe_operation_id,),
         ).fetchone()
         if existing_terminal is not None:
+            if (
+                refresh_abort is not None
+                and refresh_abort["state"] != "parent_terminal"
+            ):
+                raise ValueError("refresh abort terminal replay stage differs")
             existing = validate_offer_operation_event(dict(existing_terminal))
             if (
                 existing["outcome"] != safe_classification
@@ -28428,6 +34605,17 @@ def commit_offer_reconciliation(
                 raise ValueError(
                     "terminal offer was reconciled with different authoritative proof"
                 )
+            if external_cancel:
+                audit_row = conn.execute(
+                    "SELECT * FROM offer_external_cancel_fee_audits WHERE intent_id=?",
+                    (safe_intent_id,),
+                ).fetchone()
+                if audit_row is None or (
+                    audit_row["terminal_event_id"] != existing["event_id"]
+                    or audit_row["fee_mojos"] != safe_fee
+                    or audit_row["evidence_sha256"] != expected_digest
+                ):
+                    raise ValueError("external cancellation fee audit replay differs")
             fill_id = None
             if safe_classification == "FILLED_PROVEN":
                 fill_row = conn.execute(
@@ -28490,6 +34678,8 @@ def commit_offer_reconciliation(
             journal = reconciliation_journal(max(phase_attempts, default=0) + 1)
         if intent["lifecycle_state"] == "terminal":
             raise ValueError("terminal offer lacks its authoritative journal event")
+        if refresh_abort is not None and refresh_abort["state"] != "fenced":
+            raise ValueError("refresh abort parent has already reached terminal stage")
         try:
             selected_bare = json.loads(intent["selected_coin_ids_json"])
         except (TypeError, ValueError) as exc:
@@ -28828,6 +35018,30 @@ def commit_offer_reconciliation(
                 """,
                 (when, *selected_registry, trade_id),
             )
+            if external_cancel:
+                conn.execute(
+                    """
+                    INSERT INTO offer_external_cancel_fee_audits (
+                        intent_id, terminal_event_id, trade_id,
+                        wallet_fingerprint_hash, network, transaction_id,
+                        spend_identity, confirmed_height, fee_mojos,
+                        evidence_sha256, recorded_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        safe_intent_id,
+                        event["event_id"],
+                        trade_id,
+                        wallet_hash,
+                        network,
+                        safe_transaction_id,
+                        safe_spend_identity,
+                        safe_height,
+                        safe_fee,
+                        expected_digest,
+                        when,
+                    ),
+                )
         elif safe_classification == "EXPIRED_PROVEN" and safe_height is not None:
             conn.execute(
                 f"""
@@ -28875,6 +35089,14 @@ def commit_offer_reconciliation(
             blocking=False,
             additionally_resolved=resolved_operations,
         )
+        if refresh_abort is not None:
+            changed = conn.execute(
+                "UPDATE offer_refresh_aborts SET state='parent_terminal', updated_at=? "
+                "WHERE abort_id=? AND state='fenced'",
+                (when, refresh_abort["abort_id"]),
+            )
+            if changed.rowcount != 1:
+                raise ValueError("refresh abort stage changed during reconciliation")
         conn.commit()
         return {
             "event": event,
@@ -28884,6 +35106,21 @@ def commit_offer_reconciliation(
     except Exception:
         conn.rollback()
         raise
+    finally:
+        conn.close()
+
+
+def get_external_cancel_fee_audit(intent_id: str) -> Optional[Dict[str, Any]]:
+    """Read the immutable fee of a proven cancellation performed in Sage."""
+
+    safe_intent_id = _required_stability_text(intent_id, "intent_id")
+    conn = _stability_connection()
+    try:
+        row = conn.execute(
+            "SELECT * FROM offer_external_cancel_fee_audits WHERE intent_id=?",
+            (safe_intent_id,),
+        ).fetchone()
+        return dict(row) if row is not None else None
     finally:
         conn.close()
 
@@ -28958,6 +35195,7 @@ def get_offer_intent(intent_id: str) -> Optional[Dict[str, Any]]:
 
 
 _OFFER_DISCOVERY_PROVIDERS = ("dexie", "splash")
+_OFFER_PREPUBLICATION_TIMEOUT_SECONDS = 600
 
 
 def _offer_discovery_identity(value: Any, label: str) -> str:
@@ -28974,7 +35212,7 @@ def _offer_discovery_identity(value: Any, label: str) -> str:
 def ensure_offer_publication_discoveries(
     intent_id: str, *, deadline_seconds: int = 90
 ) -> List[Dict[str, Any]]:
-    """Create and return the durable per-provider discovery obligations."""
+    """Arm discovery after publication, with a bounded prepublication wait."""
 
     safe_intent_id = _required_stability_text(intent_id, "intent_id")
     if type(deadline_seconds) is not int or deadline_seconds <= 0:
@@ -28999,8 +35237,54 @@ def ensure_offer_publication_discoveries(
         confirmed_dt = _parse_iso_timestamp(
             confirmed_at, "confirmed_at", require_timezone=True
         )
+        prepublication_deadline = confirmed_dt + timedelta(
+            seconds=max(deadline_seconds, _OFFER_PREPUBLICATION_TIMEOUT_SECONDS)
+        )
+        first_success = None
+        for publication in conn.execute(
+            "SELECT publisher,network,offer_fingerprint,attempt_count,"
+            "claim_generation,row_version,dispatch_started_at,request_sha256,"
+            "acknowledgement_json,acknowledgement_sha256,succeeded_at,terminal_at "
+            "FROM publication_outbox WHERE intent_id=? AND state='succeeded'",
+            (safe_intent_id,),
+        ):
+            row = dict(publication)
+            acknowledgement = row["acknowledgement_json"]
+            if (
+                row["publisher"] not in _OFFER_DISCOVERY_PROVIDERS
+                or row["network"] != intent["network"]
+                or row["offer_fingerprint"] != identity
+                or type(row["attempt_count"]) is not int
+                or row["attempt_count"] < 1
+                or type(row["claim_generation"]) is not int
+                or row["claim_generation"] < 1
+                or type(row["row_version"]) is not int
+                or row["row_version"] < 1
+                or row["dispatch_started_at"] is None
+                or type(row["request_sha256"]) is not str
+                or re.fullmatch(r"[0-9a-f]{64}", row["request_sha256"]) is None
+                or type(acknowledgement) is not str
+                or type(row["acknowledgement_sha256"]) is not str
+                or hashlib.sha256(acknowledgement.encode("utf-8")).hexdigest()
+                != row["acknowledgement_sha256"]
+                or row["succeeded_at"] != row["terminal_at"]
+            ):
+                continue
+            try:
+                succeeded = _parse_iso_timestamp(
+                    row["succeeded_at"], "succeeded_at", require_timezone=True
+                )
+            except (TypeError, ValueError):
+                continue
+            if succeeded < confirmed_dt or succeeded > prepublication_deadline:
+                continue
+            if first_success is None or succeeded < first_success:
+                first_success = succeeded
         deadline_at = _stability_timestamp(
-            confirmed_dt + timedelta(seconds=deadline_seconds), "discovery deadline"
+            (first_success + timedelta(seconds=deadline_seconds))
+            if first_success is not None
+            else prepublication_deadline,
+            "discovery deadline",
         )
         updated_at = _stability_wall_clock()
         for provider in _OFFER_DISCOVERY_PROVIDERS:
@@ -29020,6 +35304,23 @@ def ensure_offer_publication_discoveries(
         ).fetchall()
         if len(rows) != len(_OFFER_DISCOVERY_PROVIDERS):
             raise RuntimeError("offer discovery obligations are incomplete")
+        # Acknowledgement can arrive after obligations are first inserted.
+        # Reanchor only pending/exact obligations. An already expired row is
+        # terminal and must never be revived by a late provider response.
+        if not any(row["state"] == "deadline_expired" for row in rows):
+            if any(row["deadline_at"] != deadline_at for row in rows):
+                conn.execute(
+                    "UPDATE offer_publication_discoveries "
+                    "SET deadline_at=?, updated_at=? WHERE intent_id=?",
+                    (deadline_at, updated_at, safe_intent_id),
+                )
+                rows = conn.execute(
+                    "SELECT * FROM offer_publication_discoveries "
+                    "WHERE intent_id=? ORDER BY provider",
+                    (safe_intent_id,),
+                ).fetchall()
+        else:
+            deadline_at = rows[0]["deadline_at"]
         for row in rows:
             current = dict(row)
             if (
@@ -29195,6 +35496,2321 @@ def _refresh_lineage_rows(
     return parent, child
 
 
+def _refresh_abort_child_is_fenced_or_cancelled(
+    conn: sqlite3.Connection, abort: Dict[str, Any], child: Dict[str, Any]
+) -> bool:
+    """Allow later exact targets only after the child has terminal proof."""
+
+    if (
+        child["intent_id"] != abort["child_intent_id"]
+        or child["parent_intent_id"] != abort["parent_intent_id"]
+        or child["first_visible_at"] is not None
+    ):
+        return False
+    if child["lifecycle_state"] == "created":
+        return True
+    if child["lifecycle_state"] != "terminal":
+        return False
+    terminal_row = conn.execute(
+        "SELECT * FROM offer_operation_journal WHERE operation_id=? "
+        "AND phase='FINALIZED' ORDER BY sequence DESC LIMIT 1",
+        (f"reconcile:{child['intent_id']}",),
+    ).fetchone()
+    cancel_row = conn.execute(
+        "SELECT * FROM offer_operation_journal WHERE operation_id=? "
+        "ORDER BY sequence DESC LIMIT 1",
+        (f"cancel:{child['sage_trade_id']}",),
+    ).fetchone()
+    if terminal_row is None:
+        return False
+    terminal = validate_offer_operation_event(dict(terminal_row))
+    if (
+        terminal["operation_type"] == "RECONCILE"
+        and terminal["intent_id"] == child["intent_id"]
+        and terminal["outcome"] == "EXPIRED_PROVEN"
+        and terminal["transaction_id"] is None
+        and terminal["spend_identity"] is None
+        and cancel_row is None
+    ):
+        return True
+    if cancel_row is None:
+        return False
+    cancel = validate_offer_operation_event(dict(cancel_row))
+    return bool(
+        terminal["operation_type"] == "RECONCILE"
+        and terminal["intent_id"] == child["intent_id"]
+        and terminal["outcome"] == "CANCELLED_PROVEN"
+        and cancel["operation_type"] == "CANCEL"
+        and cancel["intent_id"] == child["intent_id"]
+        and cancel["phase"] == "RECONCILED"
+        and cancel["outcome"] == "CANCEL_CONFIRMED"
+        and cancel["blocks_mutation"] == 0
+    )
+
+
+def _assert_refresh_abort_publication_scope(
+    conn: sqlite3.Connection,
+    child: Dict[str, Any],
+    *,
+    abort_id: Optional[str] = None,
+    published_cleanup: bool = False,
+) -> str:
+    """Bind possible public exposure to a distinct, append-only cleanup proof.
+
+    A successful provider acknowledgement does not prove external discovery.
+    The child is still an exact cancellation target, and the completed row must
+    survive terminal cleanup as evidence of its possible public exposure.
+    """
+
+    if type(published_cleanup) is not bool:
+        raise TypeError("published_cleanup must be an exact bool")
+    marker = None
+    if abort_id is not None:
+        marker = conn.execute(
+            "SELECT * FROM offer_refresh_published_cleanups WHERE abort_id=?",
+            (abort_id,),
+        ).fetchone()
+        published_cleanup = marker is not None
+    rows = conn.execute(
+        "SELECT publication_id,network,offer_fingerprint,publisher,state,"
+        "dispatch_started_at,succeeded_at,acknowledgement_json,"
+        "acknowledgement_sha256 FROM publication_outbox WHERE intent_id=? "
+        "ORDER BY publisher,publication_id",
+        (child["intent_id"],),
+    ).fetchall()
+    receipts = []
+    for row in rows:
+        if (
+            row["network"] != child["network"]
+            or row["offer_fingerprint"] != child["offer_text_sha256"]
+        ):
+            raise ValueError("replacement publication identity differs")
+        if row["state"] == "succeeded":
+            acknowledgement = row["acknowledgement_json"]
+            digest = row["acknowledgement_sha256"]
+            if (
+                not row["dispatch_started_at"]
+                or not row["succeeded_at"]
+                or type(acknowledgement) is not str
+                or type(digest) is not str
+                or hashlib.sha256(acknowledgement.encode("utf-8")).hexdigest() != digest
+            ):
+                raise ValueError("replacement publication success proof is incomplete")
+            receipts.append(
+                {
+                    "publication_id": row["publication_id"],
+                    "publisher": row["publisher"],
+                    "offer_fingerprint": row["offer_fingerprint"],
+                    "dispatch_started_at": row["dispatch_started_at"],
+                    "succeeded_at": row["succeeded_at"],
+                    "acknowledgement_sha256": digest,
+                }
+            )
+        elif (
+            row["state"] not in {"queued", "suppressed"}
+            or row["dispatch_started_at"] is not None
+        ):
+            raise ValueError("replacement publication dispatch is ambiguous")
+    if bool(receipts) != published_cleanup:
+        raise ValueError("replacement publication cleanup mode differs")
+    receipts_json = _canonical_json_text(
+        receipts, "published cleanup receipts", expected_type=list
+    )
+    if marker is not None:
+        if (
+            marker["child_intent_id"] != child["intent_id"]
+            or marker["offer_fingerprint"] != child["offer_text_sha256"]
+            or marker["receipts_json"] != receipts_json
+            or marker["receipts_sha256"]
+            != hashlib.sha256(receipts_json.encode("utf-8")).hexdigest()
+        ):
+            raise ValueError("published cleanup receipt authority differs")
+    return receipts_json
+
+
+def _refresh_abort_unresolved_journal_ids(conn: sqlite3.Connection) -> set[str]:
+    """Read the latest durable operation blockers in the same DB snapshot."""
+
+    rows = conn.execute(
+        "SELECT journal.operation_id FROM offer_operation_journal AS journal "
+        "JOIN (SELECT operation_id,MAX(sequence) AS sequence "
+        "FROM offer_operation_journal GROUP BY operation_id) AS latest "
+        "ON latest.operation_id=journal.operation_id "
+        "AND latest.sequence=journal.sequence "
+        "WHERE journal.blocks_mutation=1 ORDER BY journal.operation_id LIMIT 257"
+    ).fetchall()
+    if len(rows) > 256:
+        raise ValueError("refresh abort unresolved journal set is too large")
+    return {str(row["operation_id"]) for row in rows}
+
+
+def _assert_refresh_abort_journal_scope(
+    conn: sqlite3.Connection, expected: set[str]
+) -> None:
+    if _refresh_abort_unresolved_journal_ids(conn) != expected:
+        raise ValueError("refresh abort has an unrelated durable operation")
+
+
+def _assert_refresh_abort_effect_scope(
+    conn: sqlite3.Connection,
+    permitted_operations: set[str],
+    permitted_fee_hold: Optional[str] = None,
+) -> None:
+    """Reject any other retained wallet effect before granting cleanup authority."""
+
+    for query in (
+        "SELECT claim.operation_id FROM wallet_effect_claims AS claim "
+        "LEFT JOIN wallet_effect_claim_resolutions AS resolution "
+        "ON resolution.claim_token=claim.claim_token "
+        "LEFT JOIN wallet_effect_dispatches AS dispatch "
+        "ON dispatch.claim_token=claim.claim_token "
+        "LEFT JOIN coin_prep_operations AS prep "
+        "ON prep.effect_claim_token=claim.claim_token "
+        "WHERE (resolution.claim_token IS NULL "
+        "OR resolution.outcome<>'RELEASED_NO_EFFECT' "
+        "OR NOT ((dispatch.dispatch_token IS NOT NULL "
+        "AND dispatch.dispatch_token=json_extract(resolution.evidence_json, '$.dispatch_token')) "
+        "OR (dispatch.dispatch_token IS NULL "
+        "AND json_extract(resolution.evidence_json, '$.reason_code') IN "
+        "('PRE_DISPATCH_RETRY_CONTRACT_COLLISION','PRE_DISPATCH_PREP_NO_EFFECT_CONFIRMED') "
+        "AND json_extract(resolution.evidence_json, '$.effect_attempted')=0))) "
+        "AND COALESCE(NOT (prep.outcome='CONFIRMED' "
+        "OR (prep.outcome='FAILED' "
+        "AND json_extract(prep.outcome_evidence_json, '$.reason_code')="
+        "'AUTHORITATIVE_NO_EFFECT_CONFIRMED' "
+        "AND json_extract(prep.outcome_evidence_json, '$.effect_attempted')=0)),1) "
+        "LIMIT 257",
+        "SELECT operation_id FROM coin_prep_operations "
+        "WHERE outcome IN ('PREPARED','SUBMITTED_UNKNOWN') LIMIT 257",
+    ):
+        rows = conn.execute(query).fetchall()
+        if len(rows) > 256 or any(
+            str(row["operation_id"]) not in permitted_operations for row in rows
+        ):
+            raise ValueError("refresh abort has an unrelated wallet effect")
+    fee_rows = conn.execute(
+        "SELECT reservation.operation_id FROM approved_fee_reservations AS reservation "
+        "LEFT JOIN approved_fee_outcomes AS outcome USING(operation_id) "
+        "WHERE outcome.operation_id IS NULL LIMIT 257"
+    ).fetchall()
+    if len(fee_rows) > 256 or any(
+        str(row["operation_id"]) != permitted_fee_hold for row in fee_rows
+    ):
+        raise ValueError("refresh abort has an unrelated wallet effect")
+    if (
+        conn.execute(
+            "SELECT 1 FROM publication_outbox WHERE state IN ('claimed','unresolved') "
+            "OR (dispatch_started_at IS NOT NULL "
+            "AND state NOT IN ('succeeded','suppressed')) LIMIT 1"
+        ).fetchone()
+        is not None
+    ):
+        raise ValueError("refresh abort has an unresolved publication effect")
+    if (
+        conn.execute(
+            "SELECT 1 FROM runtime_worker_delegations WHERE state='active' LIMIT 1"
+        ).fetchone()
+        is not None
+    ):
+        raise ValueError("refresh abort has an active worker delegation")
+
+
+def _refresh_abort_prepared_fee_hold(
+    conn: sqlite3.Connection,
+    *,
+    prepared_operation_id: str,
+    trade_id: str,
+    intent_id: str,
+    campaign_id: str,
+    allow_submitted_parent: bool = False,
+) -> Optional[str]:
+    """Admit only the reservation sealed to this one durable cancel cohort."""
+
+    prepared = conn.execute(
+        "SELECT * FROM offer_operation_journal WHERE operation_id=? "
+        "ORDER BY sequence DESC LIMIT 1",
+        (prepared_operation_id,),
+    ).fetchone()
+    if prepared is None:
+        raise ValueError("exact cleanup PREPARED journal is missing")
+    latest = validate_offer_operation_event(dict(prepared))
+    if allow_submitted_parent:
+        if (
+            latest["phase"] != "FINALIZED"
+            or latest["outcome"] != "CANCEL_SUBMITTED_UNCONFIRMED"
+        ):
+            raise ValueError("submitted parent cancellation journal differs")
+        prepared = conn.execute(
+            "SELECT * FROM offer_operation_journal WHERE operation_id=? "
+            "AND attempt=1 AND phase='PREPARED'",
+            (prepared_operation_id,),
+        ).fetchone()
+        if prepared is None:
+            raise ValueError("submitted parent PREPARED journal is missing")
+    event = validate_offer_operation_event(dict(prepared))
+    evidence = json.loads(event["evidence_json"])
+    if allow_submitted_parent and evidence.get("reason") != "coin_prep_cancel_all":
+        if event["phase"] != "PREPARED" or event["intent_id"] != intent_id:
+            raise ValueError("submitted parent PREPARED journal differs")
+        return None
+    if (
+        event["phase"] != "PREPARED"
+        or event["intent_id"] != intent_id
+        or evidence.get("effect_claim_protocol") != "durable_cohort_claim_v1"
+    ):
+        raise ValueError("exact cleanup fee journal differs")
+    if evidence.get("reason") != "coin_prep_cancel_all":
+        raise ValueError("exact cleanup fee journal differs")
+    cohort_id = _required_stability_text(evidence.get("cohort_id"), "cohort_id")
+    row = conn.execute(
+        "SELECT manifest_sequence,cohort_id,manifest_sha256,member_count,"
+        "manifest_json,created_at FROM offer_cancel_cohort_manifests "
+        "WHERE cohort_id=?",
+        (cohort_id,),
+    ).fetchone()
+    if row is None:
+        raise ValueError("exact cleanup fee manifest is missing")
+    manifest = _validated_offer_cancel_cohort_manifest_row(dict(row))
+    if manifest["member_count"] != 1 or any(
+        member[key] != value
+        for member in manifest["members"]
+        for key, value in (
+            ("trade_id", trade_id),
+            ("intent_id", intent_id),
+            ("operation_id", prepared_operation_id),
+            ("prepared_event_id", event["event_id"]),
+            ("attempt", 1),
+        )
+    ):
+        raise ValueError("exact cleanup fee manifest targets another effect")
+    fee_operation_id = _coin_prep_cancellation_fee_operation_id(manifest)
+    hold = conn.execute(
+        "SELECT reservation.cancellation,reservation.fee_mojos,"
+        "json_extract(preview.scope_json, '$.campaign_id') AS campaign_id "
+        "FROM approved_fee_reservations AS reservation "
+        "JOIN coin_prep_fee_consents AS consent USING(approval_id) "
+        "JOIN coin_prep_fee_previews AS preview USING(preview_id) "
+        "WHERE reservation.operation_id=?",
+        (fee_operation_id,),
+    ).fetchone()
+    if hold is None:
+        return None
+    if (
+        hold["cancellation"] != 1
+        or hold["campaign_id"] != campaign_id
+        or evidence.get("wallet_effect", {}).get("fee_mojos") != hold["fee_mojos"]
+    ):
+        raise ValueError("exact cleanup fee hold differs")
+    return fee_operation_id
+
+
+def get_refresh_abort(abort_id: str) -> Optional[Dict[str, Any]]:
+    """Read one exact abort fence without implying cleanup progress."""
+
+    safe_id = _required_stability_text(abort_id, "abort_id")
+    row = (
+        get_connection()
+        .execute("SELECT * FROM offer_refresh_aborts WHERE abort_id=?", (safe_id,))
+        .fetchone()
+    )
+    return dict(row) if row is not None else None
+
+
+def list_fenced_refresh_abort_candidates(
+    *, asset_id: str, wallet_fingerprint_hash: str, network: str
+) -> List[Dict[str, Any]]:
+    """List exact unconfirmed-visibility lineages with submitted parent cancel.
+
+    This is diagnostic discovery only. A candidate has no abort or wallet
+    authority until ``begin_refresh_abort`` validates fresh Sage and lease
+    state inside its write transaction.
+    """
+
+    safe_asset = _reconciliation_coin_identity(asset_id, "asset_id")[0]
+    safe_wallet = _reconciliation_coin_identity(
+        wallet_fingerprint_hash, "wallet_fingerprint_hash"
+    )[0]
+    safe_network = _required_stability_text(network, "network").lower()
+    if safe_network not in {"mainnet", "testnet"}:
+        raise ValueError("refresh abort network is invalid")
+    conn = get_connection()
+    rows = conn.execute(
+        "SELECT parent.intent_id AS parent_intent_id, "
+        "child.intent_id AS child_intent_id, "
+        "parent.sage_trade_id AS parent_trade_id, "
+        "child.sage_trade_id AS child_trade_id, "
+        "parent.asset_id AS asset_id, parent.side AS side "
+        "FROM offer_intents AS parent "
+        "JOIN offer_intents AS child ON child.intent_id=parent.child_intent_id "
+        "JOIN offers AS projection ON projection.trade_id=parent.sage_trade_id "
+        "WHERE parent.wallet_fingerprint_hash=? AND parent.network=? "
+        "AND parent.asset_id=? AND parent.lifecycle_state='visible' "
+        "AND parent.first_visible_at IS NOT NULL "
+        "AND child.parent_intent_id=parent.intent_id "
+        "AND child.wallet_fingerprint_hash=parent.wallet_fingerprint_hash "
+        "AND child.network=parent.network AND child.asset_id=parent.asset_id "
+        "AND child.lifecycle_state='created' AND child.first_visible_at IS NULL "
+        "AND parent.sage_trade_id IS NOT NULL "
+        "AND child.sage_trade_id IS NOT NULL "
+        "AND projection.status='open' "
+        "AND projection.lifecycle_state='cancel_requested' "
+        "ORDER BY parent.prepared_at,parent.intent_id LIMIT 65",
+        (safe_wallet, safe_network, safe_asset),
+    ).fetchall()
+    if len(rows) > 64:
+        raise ValueError("refresh abort candidates exceed bounded review")
+    result: List[Dict[str, Any]] = []
+    for row in rows:
+        candidate = dict(row)
+        operation_id = f"cancel:{candidate['parent_trade_id']}"
+        latest_row = conn.execute(
+            "SELECT * FROM offer_operation_journal WHERE operation_id=? "
+            "ORDER BY sequence DESC LIMIT 1",
+            (operation_id,),
+        ).fetchone()
+        if latest_row is None:
+            continue
+        latest = validate_offer_operation_event(dict(latest_row))
+        if (
+            latest["operation_type"] != "CANCEL"
+            or latest["intent_id"] != candidate["parent_intent_id"]
+            or latest["phase"] != "FINALIZED"
+            or latest["outcome"] != "CANCEL_SUBMITTED_UNCONFIRMED"
+            or latest["blocks_mutation"] != 1
+            or not (latest["transaction_id"] or latest["spend_identity"])
+        ):
+            continue
+        published_row = conn.execute(
+            "SELECT 1 FROM publication_outbox WHERE intent_id=? "
+            "AND state='succeeded' LIMIT 1",
+            (candidate["child_intent_id"],),
+        ).fetchone()
+        candidate["published_cleanup"] = published_row is not None
+        result.append({**candidate, "cancel_operation_id": operation_id})
+    return result
+
+
+def list_incomplete_refresh_aborts(
+    *, asset_id: str, wallet_fingerprint_hash: str, network: str
+) -> List[Dict[str, Any]]:
+    """Read durable abort stages for native recovery after page reload."""
+
+    safe_asset = _reconciliation_coin_identity(asset_id, "asset_id")[0]
+    safe_wallet = _reconciliation_coin_identity(
+        wallet_fingerprint_hash, "wallet_fingerprint_hash"
+    )[0]
+    safe_network = _required_stability_text(network, "network").lower()
+    if safe_network not in {"mainnet", "testnet"}:
+        raise ValueError("refresh abort network is invalid")
+    rows = (
+        get_connection()
+        .execute(
+            "SELECT * FROM offer_refresh_aborts WHERE asset_id=? "
+            "AND wallet_fingerprint_hash=? AND network=? "
+            "AND state IN ('fenced','parent_terminal') "
+            "ORDER BY recorded_at,abort_id LIMIT 65",
+            (safe_asset, safe_wallet, safe_network),
+        )
+        .fetchall()
+    )
+    if len(rows) > 64:
+        raise ValueError("refresh abort stages exceed bounded review")
+    return [dict(row) for row in rows]
+
+
+def list_refresh_abort_successions(abort_id: str) -> List[Dict[str, Any]]:
+    """Read bounded immutable owner handoff receipts for one exact abort."""
+
+    safe_abort = _reconciliation_coin_identity(abort_id, "abort_id")[0]
+    rows = (
+        get_connection()
+        .execute(
+            "SELECT * FROM offer_refresh_abort_successions WHERE abort_id=? "
+            "ORDER BY successor_lease_version LIMIT 65",
+            (safe_abort,),
+        )
+        .fetchall()
+    )
+    if len(rows) > 64:
+        raise ValueError("refresh abort succession history exceeds bounded review")
+    result = []
+    for row in rows:
+        saved = dict(row)
+        proof_json = saved["proof_json"]
+        proof = json.loads(proof_json)
+        if (
+            type(proof) is not dict
+            or type(proof.get("predecessor_lease")) is not dict
+            or type(proof.get("successor_lease")) is not dict
+            or hashlib.sha256(proof_json.encode("utf-8")).hexdigest()
+            != saved["proof_sha256"]
+            or hashlib.sha256(
+                b"catalyst-refresh-abort-succession-v1\x00" + proof_json.encode("utf-8")
+            ).hexdigest()
+            != saved["succession_id"]
+            or proof.get("abort_id") != saved["abort_id"]
+            or proof.get("predecessor_lease", {}).get("owner_run_id")
+            != saved["prior_owner_run_id"]
+            or proof.get("predecessor_lease", {}).get("lease_version")
+            != saved["prior_lease_version"]
+            or proof.get("successor_lease", {}).get("owner_run_id")
+            != saved["successor_owner_run_id"]
+            or proof.get("successor_lease", {}).get("lease_version")
+            != saved["successor_lease_version"]
+            or proof.get("adopted_at") != saved["adopted_at"]
+        ):
+            raise ValueError("refresh abort succession proof digest or binding differs")
+        result.append(saved)
+    return result
+
+
+def fence_mixed_terminal_commit(
+    *,
+    campaign_id: str,
+    revision: int,
+    asset_id: str,
+    wallet_fingerprint_hash: str,
+    network: str,
+    owner_run_id: str,
+    owner_pid: int,
+    owner_host: str,
+    acquired_at: Any,
+    latch_generation: int,
+    blocking_operation_ids: Any,
+    proof_observed_at: Any,
+    target_intent_id: str,
+    target_row_version: int,
+    target_lifecycle_state: str,
+    _conn: Optional[sqlite3.Connection] = None,
+) -> Dict[str, Any]:
+    """Atomically fence an exact terminal target against the current lease."""
+
+    safe_campaign = _reconciliation_coin_identity(campaign_id, "campaign_id")[0]
+    safe_revision = _exact_integer(revision, "revision")
+    safe_asset = _reconciliation_coin_identity(asset_id, "asset_id")[0]
+    safe_wallet = _reconciliation_coin_identity(
+        wallet_fingerprint_hash, "wallet_fingerprint_hash"
+    )[0]
+    safe_network = _required_stability_text(network, "network")
+    if safe_network not in {"mainnet", "testnet"}:
+        raise ValueError("mixed terminal network is invalid")
+    safe_owner = _required_stability_text(owner_run_id, "owner_run_id")
+    safe_pid = _exact_integer(owner_pid, "owner_pid", minimum=1)
+    safe_host = _required_stability_text(owner_host, "owner_host")
+    safe_acquired = _stability_timestamp(acquired_at, "acquired_at")
+    safe_generation = _exact_integer(latch_generation, "latch_generation")
+    safe_proof_at = _stability_timestamp(proof_observed_at, "proof_observed_at")
+    safe_target = _required_stability_text(target_intent_id, "target_intent_id")
+    safe_version = _exact_integer(target_row_version, "target_row_version")
+    if target_lifecycle_state not in {"created", "visible", "unknown"}:
+        raise ValueError("mixed terminal target state is invalid")
+    if type(blocking_operation_ids) is not list or len(blocking_operation_ids) > 256:
+        raise ValueError("mixed terminal blocker list is missing")
+    expected_blockers = [
+        _required_stability_text(value, "blocking operation id")
+        for value in blocking_operation_ids
+    ]
+    if len(expected_blockers) != len(set(expected_blockers)):
+        raise ValueError("mixed terminal blocker list is duplicated")
+    conn = _conn if _conn is not None else _stability_connection()
+    owns_transaction = _conn is None
+    try:
+        if owns_transaction:
+            conn.execute("BEGIN IMMEDIATE")
+        locked_at = _stability_wall_clock()
+        proof_age = datetime.fromisoformat(
+            locked_at.replace("Z", "+00:00")
+        ) - datetime.fromisoformat(safe_proof_at.replace("Z", "+00:00"))
+        if not timedelta(seconds=-5) <= proof_age <= timedelta(seconds=30):
+            raise ValueError("mixed terminal proof is stale")
+        campaign_row = conn.execute(
+            "SELECT * FROM bootstrap_campaigns WHERE campaign_id=?", (safe_campaign,)
+        ).fetchone()
+        lease_row = conn.execute(
+            "SELECT * FROM runtime_mutation_lease WHERE singleton_id=1"
+        ).fetchone()
+        latch_row = conn.execute(
+            "SELECT * FROM runtime_safety_latch WHERE singleton_id=1"
+        ).fetchone()
+        target_row = conn.execute(
+            "SELECT * FROM offer_intents WHERE intent_id=?", (safe_target,)
+        ).fetchone()
+        if any(row is None for row in (campaign_row, lease_row, latch_row, target_row)):
+            raise ValueError("mixed terminal commit authority is missing")
+        campaign, lease, latch, target = (
+            dict(campaign_row),
+            dict(lease_row),
+            dict(latch_row),
+            dict(target_row),
+        )
+        from mutation_gate import wallet_fingerprint_hash as hash_fingerprint
+
+        purpose = f"bootstrap:{safe_campaign}:revision:{safe_revision}"
+        roots = [
+            dict(row)
+            for row in conn.execute(
+                "SELECT * FROM offer_intents WHERE purpose=?",
+                (purpose,),
+            ).fetchall()
+        ]
+        other_root = conn.execute(
+            "SELECT 1 FROM offer_intents WHERE wallet_fingerprint_hash=? AND network=? "
+            "AND asset_id=? AND purpose<>? "
+            "AND lifecycle_state NOT IN ('terminal','creation_failed') LIMIT 1",
+            (safe_wallet, safe_network, safe_asset, purpose),
+        ).fetchone()
+        other_campaign = conn.execute(
+            "SELECT 1 FROM bootstrap_campaigns WHERE status='active' AND asset_id=? "
+            "AND campaign_id<>? LIMIT 1",
+            (safe_asset, safe_campaign),
+        ).fetchone()
+        open_ids = {
+            f"reconcile:{row['intent_id']}"
+            for row in roots
+            if row["lifecycle_state"] != "terminal"
+        }
+        unknown_ids = {
+            f"reconcile:{row['intent_id']}"
+            for row in roots
+            if row["lifecycle_state"] == "unknown"
+        }
+        journal_rows = [
+            dict(row)
+            for row in conn.execute(
+                "SELECT j.* FROM offer_operation_journal j JOIN ("
+                "SELECT operation_id,MAX(sequence) sequence FROM offer_operation_journal "
+                "GROUP BY operation_id) latest ON latest.operation_id=j.operation_id "
+                "AND latest.sequence=j.sequence WHERE j.blocks_mutation=1"
+            ).fetchall()
+        ]
+        journal = {row["operation_id"]: row for row in journal_rows}
+        latch_ids = json.loads(latch["blocking_operation_ids_json"])
+        if (
+            type(latch_ids) is not list
+            or len(latch_ids) > 256
+            or any(type(value) is not str for value in latch_ids)
+            or len(latch_ids) != len(set(latch_ids))
+        ):
+            raise ValueError("mixed terminal latch blockers are invalid")
+        if lease["heartbeat_at"] is None:
+            raise ValueError("mixed terminal lease heartbeat is missing")
+        heartbeat_at = _stability_timestamp(lease["heartbeat_at"], "heartbeat_at")
+        earliest_heartbeat = (
+            datetime.fromisoformat(locked_at.replace("Z", "+00:00"))
+            - timedelta(seconds=30)
+        ).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+        # Restricted recovery consumes exact blockers. A normally stopped
+        # campaign begins with a resolved latch and no blockers.
+        restricted = bool(expected_blockers)
+        latch_binding_matches = (
+            latch["wallet_fingerprint_hash"] == safe_wallet
+            and latch["network"] == safe_network
+            if restricted or safe_generation > 0
+            else latch["wallet_fingerprint_hash"] is None and latch["network"] is None
+        )
+        latch_matches = (
+            safe_generation > 0
+            and latch["state"] == "tripped"
+            and latch["reason_code"] == "REGISTRY_BLOCKED"
+            and set(latch_ids) == open_ids
+            and open_ids.issubset(set(expected_blockers))
+            if restricted
+            else latch["state"] == "resolved"
+            and latch["reason_code"] is None
+            and not latch_ids
+            and not unknown_ids
+            and not journal
+        )
+        if (
+            campaign["status"] != "active"
+            or campaign["revision"] != safe_revision
+            or campaign["asset_id"] != safe_asset
+            or campaign["network"] != safe_network
+            or campaign["wallet_type"] != "sage"
+            or hash_fingerprint(campaign["wallet_fingerprint"]) != safe_wallet
+            or _stability_timestamp(campaign["expires_at"], "expires_at") > locked_at
+            or lease["active"] != 1
+            or lease["owner_run_id"] != safe_owner
+            or lease["owner_pid"] != safe_pid
+            or lease["owner_host"] != safe_host
+            or lease["acquired_at"] != safe_acquired
+            or lease["wallet_fingerprint_hash"] != safe_wallet
+            or lease["network"] != safe_network
+            or lease["expires_at"] <= locked_at
+            or heartbeat_at < earliest_heartbeat
+            or not latch_matches
+            or latch["generation"] != safe_generation
+            or not latch_binding_matches
+            or f"reconcile:{safe_target}" not in open_ids
+            or not 1 <= len(roots) <= 256
+            or other_root is not None
+            or other_campaign is not None
+            or any(
+                row["wallet_fingerprint_hash"] != safe_wallet
+                or row["network"] != safe_network
+                or row["asset_id"] != safe_asset
+                or row["lifecycle_state"]
+                not in {"created", "visible", "unknown", "terminal"}
+                or row["parent_intent_id"] is not None
+                or row["child_intent_id"] is not None
+                or not row["sage_trade_id"]
+                for row in roots
+            )
+            or len({row["sage_trade_id"] for row in roots}) != len(roots)
+            or target["purpose"] != purpose
+            or target["row_version"] != safe_version
+            or target["lifecycle_state"] != target_lifecycle_state
+            or target["wallet_fingerprint_hash"] != safe_wallet
+            or target["network"] != safe_network
+            or target["asset_id"] != safe_asset
+            or len(journal) != len(journal_rows)
+            or set(journal) != unknown_ids
+            or any(
+                journal[f"reconcile:{row['intent_id']}"]["intent_id"]
+                != row["intent_id"]
+                or journal[f"reconcile:{row['intent_id']}"]["operation_type"]
+                != "RECONCILE"
+                or journal[f"reconcile:{row['intent_id']}"]["outcome"] != "UNKNOWN"
+                for row in roots
+                if row["lifecycle_state"] == "unknown"
+            )
+        ):
+            raise ValueError("mixed terminal commit authority changed")
+        changed = conn.execute(
+            "UPDATE runtime_mutation_lease SET lease_version=lease_version "
+            "WHERE singleton_id=1 AND lease_version=? AND owner_run_id=? "
+            "AND acquired_at=? AND active=1 AND expires_at>?",
+            (lease["lease_version"], safe_owner, safe_acquired, locked_at),
+        )
+        if changed.rowcount != 1:
+            raise ValueError("mixed terminal commit lease compare-and-set failed")
+        if owns_transaction:
+            conn.commit()
+        return {
+            "lease_version": lease["lease_version"],
+            "heartbeat_at": lease["heartbeat_at"],
+        }
+    except Exception:
+        if owns_transaction:
+            conn.rollback()
+        raise
+    finally:
+        if owns_transaction:
+            conn.close()
+
+
+def adopt_registry_terminal_successor(
+    *,
+    campaign_id: str,
+    revision: int,
+    asset_id: str,
+    latch_generation: int,
+    blocking_operation_ids: Any,
+    successor_owner_run_id: str,
+    successor_owner_pid: int,
+    successor_owner_host: str,
+    wallet_fingerprint_hash: str,
+    network: str,
+    expected_lease_version: int,
+    expected_prior_owner_run_id: str,
+    expected_prior_owner_pid: int,
+    expected_prior_owner_host: str,
+    expected_prior_acquired_at: Any,
+    expected_prior_expires_at: Any,
+    expected_prior_released_at: Any,
+    lease_expires_at: Any,
+    prior_owner_liveness_proven_dead: bool,
+    observed_trade_ids: Any,
+    observed_pending_transaction_ids: Any,
+    observed_at: Any,
+) -> Dict[str, Any]:
+    """Adopt only an expired registry-blocked campaign for proof-only recovery.
+
+    The lease moves in one transaction after all durable authority is checked.
+    The campaign, latch, offers and fee ledger are never changed here.
+    """
+
+    safe_campaign = _reconciliation_coin_identity(campaign_id, "campaign_id")[0]
+    safe_revision = _exact_integer(revision, "revision")
+    safe_asset = _reconciliation_coin_identity(asset_id, "asset_id")[0]
+    generation = _exact_integer(latch_generation, "latch_generation", minimum=1)
+    owner = _required_stability_text(successor_owner_run_id, "successor owner")
+    pid = _exact_integer(successor_owner_pid, "successor_owner_pid", minimum=1)
+    host = _required_stability_text(successor_owner_host, "successor owner host")
+    wallet_hash = _reconciliation_coin_identity(
+        wallet_fingerprint_hash, "wallet_fingerprint_hash"
+    )[0]
+    safe_network = _required_stability_text(network, "network").lower()
+    if safe_network not in {"mainnet", "testnet"}:
+        raise ValueError("registry terminal network is invalid")
+    version = _exact_integer(
+        expected_lease_version, "expected_lease_version", minimum=1
+    )
+    prior_owner = _required_stability_text(
+        expected_prior_owner_run_id, "expected prior owner"
+    )
+    prior_pid = _exact_integer(
+        expected_prior_owner_pid, "expected_prior_owner_pid", minimum=1
+    )
+    prior_host = _required_stability_text(
+        expected_prior_owner_host, "expected prior owner host"
+    )
+    prior_acquired = _stability_timestamp(
+        expected_prior_acquired_at, "expected_prior_acquired_at"
+    )
+    prior_expires = (
+        _stability_timestamp(expected_prior_expires_at, "expected_prior_expires_at")
+        if expected_prior_expires_at is not None
+        else None
+    )
+    prior_released = (
+        _stability_timestamp(expected_prior_released_at, "expected_prior_released_at")
+        if expected_prior_released_at is not None
+        else None
+    )
+    if type(prior_owner_liveness_proven_dead) is not bool:
+        raise TypeError("prior owner liveness proof must be an exact bool")
+    if (
+        type(blocking_operation_ids) is not list
+        or not 1 <= len(blocking_operation_ids) <= 256
+    ):
+        raise ValueError("complete registry blocker set is required")
+    blockers = sorted(
+        _required_stability_text(value, "blocking operation id")
+        for value in blocking_operation_ids
+    )
+    if len(blockers) != len(set(blockers)):
+        raise ValueError("duplicate registry blockers")
+    if type(observed_trade_ids) is not list or observed_trade_ids:
+        raise ValueError("registry terminal recovery requires an empty Sage offer book")
+    if (
+        type(observed_pending_transaction_ids) is not list
+        or observed_pending_transaction_ids
+    ):
+        raise ValueError(
+            "registry terminal recovery requires zero pending transactions"
+        )
+    at = _stability_timestamp(observed_at, "observed_at")
+    expiry = _stability_timestamp(lease_expires_at, "lease_expires_at")
+    conn = _stability_connection()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        locked_at = _stability_wall_clock()
+        age = datetime.fromisoformat(
+            locked_at.replace("Z", "+00:00")
+        ) - datetime.fromisoformat(at.replace("Z", "+00:00"))
+        if not timedelta(seconds=-5) <= age <= timedelta(seconds=30):
+            raise ValueError("fresh Sage offer book is required")
+        if expiry <= max(at, locked_at):
+            raise ValueError("successor lease expiry is stale")
+        campaign_row = conn.execute(
+            "SELECT * FROM bootstrap_campaigns WHERE campaign_id=?", (safe_campaign,)
+        ).fetchone()
+        lease_row = conn.execute(
+            "SELECT * FROM runtime_mutation_lease WHERE singleton_id=1"
+        ).fetchone()
+        latch_row = conn.execute(
+            "SELECT * FROM runtime_safety_latch WHERE singleton_id=1"
+        ).fetchone()
+        if campaign_row is None or lease_row is None or latch_row is None:
+            raise ValueError("registry terminal authority is missing")
+        campaign, lease, latch = dict(campaign_row), dict(lease_row), dict(latch_row)
+        from mutation_gate import wallet_fingerprint_hash as hash_fingerprint
+
+        if (
+            campaign["status"] != "active"
+            or campaign["revision"] != safe_revision
+            or _stability_timestamp(campaign["expires_at"], "campaign expires_at")
+            > locked_at
+            or campaign["asset_id"] != safe_asset
+            or campaign["network"] != safe_network
+            or campaign["wallet_type"] != "sage"
+            or hash_fingerprint(campaign["wallet_fingerprint"]) != wallet_hash
+            or latch["state"] != "tripped"
+            or latch["reason_code"] != "REGISTRY_BLOCKED"
+            or latch["generation"] != generation
+            or latch["wallet_fingerprint_hash"] != wallet_hash
+            or latch["network"] != safe_network
+            or lease["lease_version"] != version
+            or lease["owner_run_id"] != prior_owner
+            or lease["owner_pid"] != prior_pid
+            or lease["owner_host"] != prior_host
+            or lease["acquired_at"] != prior_acquired
+            or lease["expires_at"] != prior_expires
+            or lease["released_at"] != prior_released
+            or lease["wallet_fingerprint_hash"] != wallet_hash
+            or lease["network"] != safe_network
+            or lease["owner_run_id"] == owner
+        ):
+            raise ValueError("registry terminal authority changed")
+        if lease["active"] == 1:
+            if (
+                lease["expires_at"] is None
+                or lease["expires_at"] > max(at, locked_at)
+                or lease["released_at"] is not None
+                or not prior_owner_liveness_proven_dead
+            ):
+                raise ValueError("prior registry owner is not proven stopped")
+        elif lease["active"] == 0:
+            if lease["expires_at"] is not None or lease["released_at"] is None:
+                raise ValueError("prior registry release proof is invalid")
+        else:
+            raise ValueError("prior registry lease state is invalid")
+        purpose = f"bootstrap:{safe_campaign}:revision:{safe_revision}"
+        roots = [
+            dict(row)
+            for row in conn.execute(
+                "SELECT * FROM offer_intents WHERE purpose=? ORDER BY intent_id",
+                (purpose,),
+            ).fetchall()
+        ]
+        if not 1 <= len(roots) <= 256:
+            raise ValueError("registry terminal cohort is incomplete")
+        expected = {
+            f"reconcile:{row['intent_id']}"
+            for row in roots
+            if row["lifecycle_state"] != "terminal"
+        }
+        expected_journal = {
+            f"reconcile:{row['intent_id']}"
+            for row in roots
+            if row["lifecycle_state"] == "unknown"
+        }
+        if (
+            not expected
+            or len(expected)
+            != len([row for row in roots if row["lifecycle_state"] != "terminal"])
+            or any(
+                row["wallet_fingerprint_hash"] != wallet_hash
+                or row["network"] != safe_network
+                or row["asset_id"] != safe_asset
+                or row["lifecycle_state"]
+                not in {"created", "visible", "unknown", "terminal"}
+                or row["parent_intent_id"] is not None
+                or row["child_intent_id"] is not None
+                or not row["sage_trade_id"]
+                for row in roots
+            )
+            or len({row["sage_trade_id"] for row in roots}) != len(roots)
+            or set(blockers) != expected
+            or len(json.loads(latch["blocking_operation_ids_json"])) != len(expected)
+            or set(json.loads(latch["blocking_operation_ids_json"])) != expected
+        ):
+            raise ValueError("registry terminal cohort or blockers changed")
+        other = conn.execute(
+            "SELECT 1 FROM offer_intents WHERE wallet_fingerprint_hash=? AND network=? "
+            "AND asset_id=? AND purpose<>? "
+            "AND lifecycle_state NOT IN ('terminal','creation_failed') LIMIT 1",
+            (wallet_hash, safe_network, safe_asset, purpose),
+        ).fetchone()
+        other_campaign = conn.execute(
+            "SELECT 1 FROM bootstrap_campaigns WHERE status='active' AND asset_id=? "
+            "AND campaign_id<>? LIMIT 1",
+            (safe_asset, safe_campaign),
+        ).fetchone()
+        journal_rows = [
+            dict(row)
+            for row in conn.execute(
+                "SELECT j.* FROM offer_operation_journal j JOIN ("
+                "SELECT operation_id,MAX(sequence) sequence FROM offer_operation_journal "
+                "GROUP BY operation_id) latest ON latest.operation_id=j.operation_id "
+                "AND latest.sequence=j.sequence WHERE j.blocks_mutation=1"
+            ).fetchall()
+        ]
+        journal = {row["operation_id"]: row for row in journal_rows}
+        unknown_by_operation = {
+            f"reconcile:{row['intent_id']}": row
+            for row in roots
+            if row["lifecycle_state"] == "unknown"
+        }
+        if (
+            other is not None
+            or other_campaign is not None
+            or len(journal) != len(journal_rows)
+            or set(journal) != expected_journal
+            or any(
+                journal[operation_id]["intent_id"] != root["intent_id"]
+                or journal[operation_id]["operation_type"] != "RECONCILE"
+                or journal[operation_id]["outcome"] != "UNKNOWN"
+                for operation_id, root in unknown_by_operation.items()
+            )
+        ):
+            raise ValueError("unrelated registry authority remains unresolved")
+        changed = conn.execute(
+            "UPDATE runtime_mutation_lease SET lease_version=lease_version+1,active=1,"
+            "owner_run_id=?,owner_pid=?,owner_host=?,acquired_at=?,heartbeat_at=?,"
+            "expires_at=?,released_at=NULL,updated_at=? WHERE singleton_id=1 "
+            "AND lease_version=? AND owner_run_id=?",
+            (
+                owner,
+                pid,
+                host,
+                locked_at,
+                locked_at,
+                expiry,
+                locked_at,
+                version,
+                lease["owner_run_id"],
+            ),
+        )
+        if changed.rowcount != 1:
+            raise ValueError("registry lease compare-and-set failed")
+        if lease["owner_run_id"]:
+            conn.execute(
+                "UPDATE runtime_worker_delegations SET state='revoked', "
+                "revoked_at=?,updated_at=? WHERE parent_run_id=? AND state='active'",
+                (locked_at, locked_at, lease["owner_run_id"]),
+            )
+        if expiry <= _stability_wall_clock():
+            raise ValueError("registry successor lease expired during adoption")
+        successor = dict(
+            conn.execute(
+                "SELECT * FROM runtime_mutation_lease WHERE singleton_id=1"
+            ).fetchone()
+        )
+        conn.commit()
+        return {"adopted": True, "lease": successor}
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def adopt_refresh_abort_successor(
+    *,
+    abort_id: str,
+    successor_owner_run_id: str,
+    successor_owner_pid: int,
+    successor_owner_host: str,
+    wallet_fingerprint_hash: str,
+    network: str,
+    asset_id: str,
+    expected_lease_version: int,
+    lease_expires_at: Any,
+    prior_owner_liveness_proven_dead: bool,
+    observed_trade_ids: Any,
+    observed_pending_transaction_ids: Any,
+    observed_at: Any,
+) -> Dict[str, Any]:
+    """Move one fenced abort to a successor without granting normal mutation.
+
+    An inactive lease is its own release proof. An active predecessor must be
+    expired and independently proven dead by the process layer. The lease and
+    abort owner change in the same transaction; the latch never changes.
+    """
+
+    safe_abort = _reconciliation_coin_identity(abort_id, "abort_id")[0]
+    owner = _required_stability_text(successor_owner_run_id, "successor_owner_run_id")
+    pid = _exact_integer(successor_owner_pid, "successor_owner_pid", minimum=1)
+    host = _required_stability_text(successor_owner_host, "successor_owner_host")
+    wallet_hash = _reconciliation_coin_identity(
+        wallet_fingerprint_hash, "wallet_fingerprint_hash"
+    )[0]
+    safe_network = _required_stability_text(network, "network").lower()
+    if safe_network not in {"mainnet", "testnet"}:
+        raise ValueError("refresh abort network is invalid")
+    safe_asset = _reconciliation_coin_identity(asset_id, "asset_id")[0]
+    version = _exact_integer(
+        expected_lease_version, "expected_lease_version", minimum=1
+    )
+    if type(prior_owner_liveness_proven_dead) is not bool:
+        raise TypeError("prior_owner_liveness_proven_dead must be an exact bool")
+    at = _stability_timestamp(observed_at, "observed_at")
+    expiry = _stability_timestamp(lease_expires_at, "lease_expires_at")
+    if type(observed_trade_ids) is not list or len(observed_trade_ids) > 256:
+        raise ValueError("complete Sage offer book is required")
+    observed = sorted(
+        _reconciliation_coin_identity(value, "observed trade_id")[0]
+        for value in observed_trade_ids
+    )
+    if len(observed) != len(set(observed)):
+        raise ValueError("observed Sage trade identities are duplicated")
+    if (
+        type(observed_pending_transaction_ids) is not list
+        or len(observed_pending_transaction_ids) > 256
+    ):
+        raise ValueError("complete Sage pending transaction read is required")
+    pending = [
+        _reconciliation_coin_identity(value, "pending transaction_id")[0]
+        for value in observed_pending_transaction_ids
+    ]
+    if pending:
+        raise ValueError("refresh abort successor has a pending wallet effect")
+    conn = _stability_connection()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        locked_at = _stability_wall_clock()
+        observed_time = datetime.fromisoformat(at.replace("Z", "+00:00"))
+        authority_time = datetime.fromisoformat(locked_at.replace("Z", "+00:00"))
+        if (
+            not timedelta(seconds=-5)
+            <= authority_time - observed_time
+            <= timedelta(seconds=30)
+        ):
+            raise ValueError("fresh Sage offer book is required")
+        if expiry <= max(at, locked_at):
+            raise ValueError("successor lease expiry is stale")
+        abort_row = conn.execute(
+            "SELECT * FROM offer_refresh_aborts WHERE abort_id=?", (safe_abort,)
+        ).fetchone()
+        lease_row = conn.execute(
+            "SELECT * FROM runtime_mutation_lease WHERE singleton_id=1"
+        ).fetchone()
+        latch_row = conn.execute(
+            "SELECT * FROM runtime_safety_latch WHERE singleton_id=1"
+        ).fetchone()
+        if abort_row is None or lease_row is None or latch_row is None:
+            raise ValueError("refresh abort successor authority is missing")
+        abort, lease, latch = dict(abort_row), dict(lease_row), dict(latch_row)
+        if abort["state"] not in {"fenced", "parent_terminal"}:
+            raise ValueError("refresh abort stage cannot be succeeded")
+        expected_blockers = {abort["blocking_operation_id"]}
+        if abort["state"] == "fenced":
+            expected_blockers.add(abort["cancel_operation_id"])
+        if (
+            abort["wallet_fingerprint_hash"] != wallet_hash
+            or abort["network"] != safe_network
+            or abort["asset_id"] != safe_asset
+            or latch["state"] != "tripped"
+            or latch["generation"] != abort["latch_generation"]
+            or latch["wallet_fingerprint_hash"] != wallet_hash
+            or latch["network"] != safe_network
+            or set(json.loads(latch["blocking_operation_ids_json"]))
+            != expected_blockers
+            or lease["lease_version"] != version
+            or lease["owner_run_id"] != abort["owner_run_id"]
+            or lease["owner_pid"] != abort["lease_owner_pid"]
+            or lease["owner_host"] != abort["lease_owner_host"]
+            or lease["acquired_at"] != abort["lease_acquired_at"]
+            or lease["lease_version"] < abort["lease_version"]
+            or lease["wallet_fingerprint_hash"] != wallet_hash
+            or lease["network"] != safe_network
+            or owner == abort["owner_run_id"]
+        ):
+            raise ValueError("refresh abort successor authority changed")
+        if lease["active"] == 1:
+            if (
+                lease["expires_at"] is None
+                or lease["expires_at"] > max(at, locked_at)
+                or lease["released_at"] is not None
+                or not prior_owner_liveness_proven_dead
+            ):
+                raise ValueError("prior refresh abort owner is not proven stopped")
+        elif lease["active"] == 0:
+            if lease["expires_at"] is not None or lease["released_at"] is None:
+                raise ValueError("prior refresh abort release proof is invalid")
+        else:
+            raise ValueError("prior refresh abort lease state is invalid")
+        campaign_row = conn.execute(
+            "SELECT status,network,asset_id,wallet_fingerprint FROM "
+            "bootstrap_campaigns WHERE campaign_id=?",
+            (abort["campaign_id"],),
+        ).fetchone()
+        if (
+            campaign_row is None
+            or campaign_row["status"] != "stopped"
+            or campaign_row["network"] != safe_network
+            or campaign_row["asset_id"] != safe_asset
+        ):
+            raise ValueError("refresh abort campaign is not stopped and exact")
+        from mutation_gate import wallet_fingerprint_hash as hash_fingerprint
+
+        if hash_fingerprint(campaign_row["wallet_fingerprint"]) != wallet_hash:
+            raise ValueError("refresh abort campaign wallet differs")
+        if (
+            conn.execute(
+                "SELECT COUNT(*) FROM offer_refresh_aborts WHERE "
+                "state IN ('fenced','parent_terminal')"
+            ).fetchone()[0]
+            != 1
+        ):
+            raise ValueError("refresh abort successor is not unique")
+        parent, child = _refresh_lineage_rows(
+            conn, abort["parent_intent_id"], abort["child_intent_id"]
+        )
+        if (
+            parent["child_intent_id"] != child["intent_id"]
+            or child["parent_intent_id"] != parent["intent_id"]
+            or not _refresh_abort_child_is_fenced_or_cancelled(conn, abort, child)
+            or child["sage_trade_id"] not in json.loads(abort["target_trade_ids_json"])
+            or (abort["state"] == "fenced" and parent["lifecycle_state"] != "visible")
+            or (
+                abort["state"] == "parent_terminal"
+                and parent["lifecycle_state"] != "terminal"
+            )
+        ):
+            raise ValueError("refresh abort lineage differs")
+        _assert_refresh_abort_publication_scope(conn, child, abort_id=safe_abort)
+        active = conn.execute(
+            "SELECT sage_trade_id,asset_id FROM offer_intents WHERE "
+            "wallet_fingerprint_hash=? AND network=? "
+            "AND lifecycle_state IN ('created','visible','cancel_requested') "
+            "AND intent_id<>?",
+            (wallet_hash, safe_network, parent["intent_id"]),
+        ).fetchall()
+        durable_trades = sorted(row["sage_trade_id"] for row in active)
+        abort_targets = set(json.loads(abort["target_trade_ids_json"]))
+        if (
+            any(
+                not row["sage_trade_id"] or row["asset_id"] != safe_asset
+                for row in active
+            )
+            or len(durable_trades) != len(set(durable_trades))
+            or not set(durable_trades).issubset(abort_targets)
+            or not set(observed).issubset(set(durable_trades))
+            or (abort["state"] == "fenced" and durable_trades != observed)
+        ):
+            raise ValueError("complete Sage book differs from refresh abort targets")
+        changed = conn.execute(
+            "UPDATE runtime_mutation_lease SET lease_version=lease_version+1, "
+            "active=1,owner_run_id=?,owner_pid=?,owner_host=?,acquired_at=?,"
+            "heartbeat_at=?,expires_at=?,released_at=NULL,updated_at=? "
+            "WHERE singleton_id=1 AND lease_version=? AND owner_run_id=?",
+            (
+                owner,
+                pid,
+                host,
+                locked_at,
+                locked_at,
+                expiry,
+                locked_at,
+                version,
+                abort["owner_run_id"],
+            ),
+        )
+        if changed.rowcount != 1:
+            raise ValueError("refresh abort lease compare-and-set failed")
+        successor = dict(
+            conn.execute(
+                "SELECT * FROM runtime_mutation_lease WHERE singleton_id=1"
+            ).fetchone()
+        )
+        changed = conn.execute(
+            "UPDATE offer_refresh_aborts SET owner_run_id=?,lease_version=?,"
+            "lease_acquired_at=?,lease_owner_pid=?,lease_owner_host=?,updated_at=? "
+            "WHERE abort_id=? AND owner_run_id=? AND lease_version<=?",
+            (
+                owner,
+                successor["lease_version"],
+                locked_at,
+                pid,
+                host,
+                locked_at,
+                safe_abort,
+                abort["owner_run_id"],
+                version,
+            ),
+        )
+        if changed.rowcount != 1:
+            raise ValueError("refresh abort owner compare-and-set failed")
+        _validate_refresh_abort_commit_authority(
+            conn,
+            abort_id=safe_abort,
+            parent=parent,
+            child=child,
+            wallet_hash=wallet_hash,
+            network=safe_network,
+            at=locked_at,
+        )
+        if lease["owner_run_id"]:
+            conn.execute(
+                "UPDATE runtime_worker_delegations SET state='revoked', "
+                "revoked_at=?,updated_at=? WHERE parent_run_id=? AND state='active'",
+                (locked_at, locked_at, lease["owner_run_id"]),
+            )
+        if expiry <= _stability_wall_clock():
+            raise ValueError("refresh abort successor lease expired during adoption")
+        saved = dict(
+            conn.execute(
+                "SELECT * FROM offer_refresh_aborts WHERE abort_id=?", (safe_abort,)
+            ).fetchone()
+        )
+        proof_json = _canonical_json_text(
+            {
+                "abort_id": safe_abort,
+                "latch_generation": abort["latch_generation"],
+                "blocking_operation_ids": sorted(expected_blockers),
+                "campaign_id": abort["campaign_id"],
+                "wallet_fingerprint_hash": wallet_hash,
+                "network": safe_network,
+                "asset_id": safe_asset,
+                "observed_trade_ids": observed,
+                "observed_pending_transaction_ids": [],
+                "prior_owner_liveness_proven_dead": prior_owner_liveness_proven_dead,
+                "predecessor_lease": {
+                    key: lease[key]
+                    for key in (
+                        "owner_run_id",
+                        "owner_pid",
+                        "owner_host",
+                        "lease_version",
+                        "active",
+                        "acquired_at",
+                        "heartbeat_at",
+                        "expires_at",
+                        "released_at",
+                    )
+                },
+                "successor_lease": {
+                    key: successor[key]
+                    for key in (
+                        "owner_run_id",
+                        "owner_pid",
+                        "owner_host",
+                        "lease_version",
+                        "acquired_at",
+                        "expires_at",
+                    )
+                },
+                "adopted_at": locked_at,
+            },
+            "refresh abort succession proof",
+            expected_type=dict,
+            max_bytes=32768,
+        )
+        proof_sha256 = hashlib.sha256(proof_json.encode("utf-8")).hexdigest()
+        succession_id = hashlib.sha256(
+            b"catalyst-refresh-abort-succession-v1\x00" + proof_json.encode("utf-8")
+        ).hexdigest()
+        conn.execute(
+            "INSERT INTO offer_refresh_abort_successions ("
+            "succession_id,abort_id,prior_owner_run_id,prior_lease_version,"
+            "successor_owner_run_id,successor_lease_version,proof_json,"
+            "proof_sha256,adopted_at) VALUES (?,?,?,?,?,?,?,?,?)",
+            (
+                succession_id,
+                safe_abort,
+                lease["owner_run_id"],
+                version,
+                owner,
+                successor["lease_version"],
+                proof_json,
+                proof_sha256,
+                locked_at,
+            ),
+        )
+        conn.commit()
+        return {
+            "adopted": True,
+            "abort": saved,
+            "lease": successor,
+            "succession_id": succession_id,
+        }
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def authorize_refresh_abort_expiry_target(
+    *,
+    abort_id: str,
+    trade_id: str,
+    expected_latch_generation: int,
+    owner_run_id: str,
+    observed_trade_ids: Any,
+    observed_pending_transaction_ids: Any,
+    observed_at: Any,
+) -> Dict[str, Any]:
+    """Authorize proof-only expiry of one missing, exact abort target.
+
+    This grants no cancellation permit and leaves the abort blocker intact.
+    Authoritative terminal evidence must still pass Task 9 reconciliation.
+    """
+
+    safe_abort = _reconciliation_coin_identity(abort_id, "abort_id")[0]
+    safe_trade = _reconciliation_coin_identity(trade_id, "trade_id")[0]
+    generation = _exact_integer(
+        expected_latch_generation, "expected_latch_generation", minimum=1
+    )
+    owner = _required_stability_text(owner_run_id, "owner_run_id")
+    at = _stability_timestamp(observed_at, "observed_at")
+    age = datetime.fromisoformat(_stability_wall_clock().replace("Z", "+00:00")) - (
+        datetime.fromisoformat(at.replace("Z", "+00:00"))
+    )
+    if not timedelta(seconds=-5) <= age <= timedelta(seconds=30):
+        raise ValueError("fresh Sage offer book is required")
+    if type(observed_trade_ids) is not list or len(observed_trade_ids) > 256:
+        raise ValueError("complete Sage offer book is required")
+    observed = [
+        _reconciliation_coin_identity(value, "observed trade_id")[0]
+        for value in observed_trade_ids
+    ]
+    if len(observed) != len(set(observed)) or safe_trade in observed:
+        raise ValueError("expiry target is still live or Sage book is duplicated")
+    if observed_pending_transaction_ids != []:
+        raise ValueError("expiry proof requires zero pending wallet effects")
+    conn = _stability_connection()
+    try:
+        conn.execute("BEGIN")
+        row = conn.execute(
+            "SELECT * FROM offer_refresh_aborts WHERE abort_id=?", (safe_abort,)
+        ).fetchone()
+        if row is None:
+            raise ValueError("exact refresh abort is missing")
+        abort = dict(row)
+        if (
+            abort["state"] != "parent_terminal"
+            or generation != abort["latch_generation"]
+        ):
+            raise ValueError("refresh abort stage or generation changed")
+        targets = json.loads(abort["target_trade_ids_json"])
+        if safe_trade not in targets or not set(observed).issubset(set(targets)):
+            raise ValueError("Sage book differs from exact abort targets")
+        parent, child = _refresh_lineage_rows(
+            conn, abort["parent_intent_id"], abort["child_intent_id"]
+        )
+        _validate_refresh_abort_commit_authority(
+            conn,
+            abort_id=safe_abort,
+            parent=parent,
+            child=child,
+            wallet_hash=abort["wallet_fingerprint_hash"],
+            network=abort["network"],
+            at=at,
+        )
+        if owner != abort["owner_run_id"]:
+            raise ValueError("refresh abort owner changed")
+        target_row = conn.execute(
+            "SELECT * FROM offer_intents WHERE sage_trade_id=? "
+            "AND wallet_fingerprint_hash=? AND network=?",
+            (safe_trade, abort["wallet_fingerprint_hash"], abort["network"]),
+        ).fetchone()
+        if target_row is None:
+            raise ValueError("exact abort target is missing")
+        target = dict(target_row)
+        if target["asset_id"] != abort["asset_id"] or target["lifecycle_state"] not in {
+            "created",
+            "visible",
+        }:
+            raise ValueError("abort target is not open for expiry proof")
+        active_rows = conn.execute(
+            "SELECT sage_trade_id,asset_id FROM offer_intents WHERE "
+            "wallet_fingerprint_hash=? AND network=? AND lifecycle_state IN "
+            "('prepared','created','visible','cancel_requested')",
+            (abort["wallet_fingerprint_hash"], abort["network"]),
+        ).fetchall()
+        if any(
+            row["sage_trade_id"] not in targets or row["asset_id"] != abort["asset_id"]
+            for row in active_rows
+        ):
+            raise ValueError("durable wallet book differs from abort targets")
+        if (
+            conn.execute(
+                "SELECT 1 FROM offer_operation_journal WHERE operation_id=? LIMIT 1",
+                (f"cancel:{safe_trade}",),
+            ).fetchone()
+            is not None
+        ):
+            raise ValueError("expiry target has a cancellation journal")
+        conn.commit()
+        return {"intent_id": target["intent_id"], "trade_id": safe_trade}
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def authorize_refresh_abort_cleanup_target(
+    *,
+    abort_id: str,
+    trade_id: str,
+    expected_latch_generation: int,
+    owner_run_id: str,
+    observed_trade_ids: Any,
+    observed_pending_transaction_ids: Any,
+    observed_at: Any,
+    prepared_operation_id: Optional[str] = None,
+    require_reserved_fee_hold: bool = False,
+    _connection: Optional[sqlite3.Connection] = None,
+) -> Dict[str, Any]:
+    """Validate one exact cleanup target against the retained abort fence.
+
+    The caller supplies a fresh complete Sage wallet book. This read-only
+    boundary grants no wallet permit; the runtime must recheck it immediately
+    before entering and dispatching the one target's cancellation.
+    """
+
+    safe_abort = _reconciliation_coin_identity(abort_id, "abort_id")[0]
+    safe_trade = _reconciliation_coin_identity(trade_id, "trade_id")[0]
+    safe_prepared = (
+        _required_stability_text(prepared_operation_id, "prepared_operation_id")
+        if prepared_operation_id is not None
+        else None
+    )
+    if safe_prepared is not None and safe_prepared != f"cancel:{safe_trade}":
+        raise ValueError("prepared cleanup operation targets another trade")
+    generation = _exact_integer(
+        expected_latch_generation, "expected_latch_generation", minimum=1
+    )
+    owner = _required_stability_text(owner_run_id, "owner_run_id")
+    at = _stability_timestamp(observed_at, "observed_at")
+    observed_time = datetime.fromisoformat(at.replace("Z", "+00:00"))
+    authority_time = datetime.fromisoformat(
+        _stability_wall_clock().replace("Z", "+00:00")
+    )
+    if (
+        not timedelta(seconds=-5)
+        <= authority_time - observed_time
+        <= timedelta(seconds=30)
+    ):
+        raise ValueError("fresh Sage offer book is required")
+    if type(observed_trade_ids) is not list or len(observed_trade_ids) > 256:
+        raise ValueError("complete Sage offer book is required")
+    observed = sorted(
+        _reconciliation_coin_identity(value, "observed trade_id")[0]
+        for value in observed_trade_ids
+    )
+    if len(observed) != len(set(observed)):
+        raise ValueError("observed Sage trade identities are duplicated")
+    if (
+        type(observed_pending_transaction_ids) is not list
+        or len(observed_pending_transaction_ids) > 256
+    ):
+        raise ValueError("complete Sage pending transaction read is required")
+    pending = [
+        _reconciliation_coin_identity(value, "pending transaction_id")[0]
+        for value in observed_pending_transaction_ids
+    ]
+    if pending:
+        raise ValueError("refresh abort cleanup has a pending wallet effect")
+
+    own_connection = _connection is None
+    conn = _stability_connection() if own_connection else _connection
+    try:
+        if own_connection:
+            conn.execute("BEGIN")
+        row = conn.execute(
+            "SELECT * FROM offer_refresh_aborts WHERE abort_id=?", (safe_abort,)
+        ).fetchone()
+        if row is None:
+            raise ValueError("exact refresh abort is missing")
+        abort = dict(row)
+        targets = json.loads(abort["target_trade_ids_json"])
+        if abort["state"] != "parent_terminal" or safe_trade not in targets:
+            raise ValueError("trade is not an active cleanup target")
+        parent, child = _refresh_lineage_rows(
+            conn, abort["parent_intent_id"], abort["child_intent_id"]
+        )
+        if (
+            parent["lifecycle_state"] != "terminal"
+            or not _refresh_abort_child_is_fenced_or_cancelled(conn, abort, child)
+            or parent["child_intent_id"] != child["intent_id"]
+            or abort["cancel_operation_id"] != f"cancel:{parent['sage_trade_id']}"
+        ):
+            raise ValueError("refresh abort lineage is not fenced and terminal")
+        latch_row = conn.execute(
+            "SELECT * FROM runtime_safety_latch WHERE singleton_id=1"
+        ).fetchone()
+        lease_row = conn.execute(
+            "SELECT * FROM runtime_mutation_lease WHERE singleton_id=1"
+        ).fetchone()
+        campaign_row = conn.execute(
+            "SELECT status FROM bootstrap_campaigns WHERE campaign_id=?",
+            (abort["campaign_id"],),
+        ).fetchone()
+        if latch_row is None or lease_row is None or campaign_row is None:
+            raise ValueError("refresh abort safety authority is missing")
+        latch, lease = dict(latch_row), dict(lease_row)
+        if (
+            latch["state"] != "tripped"
+            or latch["generation"] != generation
+            or generation != abort["latch_generation"]
+            or latch["wallet_fingerprint_hash"] != abort["wallet_fingerprint_hash"]
+            or latch["network"] != abort["network"]
+            or set(json.loads(latch["blocking_operation_ids_json"]))
+            != (
+                {abort["blocking_operation_id"]}
+                | ({safe_prepared} if safe_prepared else set())
+            )
+            or lease["active"] != 1
+            or lease["owner_run_id"] != owner
+            or owner != abort["owner_run_id"]
+            or lease["lease_version"] < abort["lease_version"]
+            or lease["acquired_at"] != abort["lease_acquired_at"]
+            or lease["owner_pid"] != abort["lease_owner_pid"]
+            or lease["owner_host"] != abort["lease_owner_host"]
+            or lease["wallet_fingerprint_hash"] != abort["wallet_fingerprint_hash"]
+            or lease["network"] != abort["network"]
+            or lease["expires_at"] is None
+            or lease["expires_at"] <= max(at, _stability_wall_clock())
+            or campaign_row["status"] != "stopped"
+        ):
+            raise ValueError("refresh abort cleanup authority changed")
+        _assert_refresh_abort_journal_scope(
+            conn, {safe_prepared} if safe_prepared is not None else set()
+        )
+        active_rows = conn.execute(
+            "SELECT intent_id,sage_trade_id,asset_id FROM offer_intents WHERE "
+            "wallet_fingerprint_hash=? AND network=? "
+            "AND lifecycle_state IN ('created','visible','cancel_requested')",
+            (abort["wallet_fingerprint_hash"], abort["network"]),
+        ).fetchall()
+        active = [dict(value) for value in active_rows]
+        db_trades = sorted(value["sage_trade_id"] for value in active)
+        if (
+            any(not value["sage_trade_id"] for value in active)
+            or any(value["asset_id"] != abort["asset_id"] for value in active)
+            or db_trades != observed
+            or not set(observed).issubset(set(targets))
+            or safe_trade not in observed
+        ):
+            raise ValueError("complete Sage book differs from cleanup targets")
+        target = next(value for value in active if value["sage_trade_id"] == safe_trade)
+        prior_cancel = conn.execute(
+            "SELECT * FROM offer_operation_journal WHERE operation_id=? "
+            "ORDER BY sequence DESC LIMIT 1",
+            (f"cancel:{safe_trade}",),
+        ).fetchone()
+        if safe_prepared is None and prior_cancel is not None:
+            raise ValueError("cleanup target already has a cancellation journal")
+        if safe_prepared is not None:
+            if prior_cancel is None:
+                raise ValueError("prepared cleanup cancellation journal is missing")
+            latest = validate_offer_operation_event(dict(prior_cancel))
+            if (
+                latest["operation_id"] != safe_prepared
+                or latest["intent_id"] != target["intent_id"]
+                or latest["phase"] != "PREPARED"
+                or latest["blocks_mutation"] != 1
+            ):
+                raise ValueError("prepared cleanup cancellation journal differs")
+        fee_hold = (
+            _refresh_abort_prepared_fee_hold(
+                conn,
+                prepared_operation_id=safe_prepared,
+                trade_id=safe_trade,
+                intent_id=target["intent_id"],
+                campaign_id=abort["campaign_id"],
+            )
+            if safe_prepared is not None
+            else None
+        )
+        if require_reserved_fee_hold and fee_hold is None:
+            raise ValueError("exact cleanup fee reservation is missing")
+        _assert_refresh_abort_effect_scope(
+            conn,
+            {safe_prepared} if safe_prepared is not None else set(),
+            fee_hold,
+        )
+        _assert_refresh_abort_publication_scope(conn, child, abort_id=safe_abort)
+        if own_connection:
+            conn.commit()
+        return {
+            "abort_id": safe_abort,
+            "trade_id": safe_trade,
+            "intent_id": target["intent_id"],
+            "blocking_operation_id": abort["blocking_operation_id"],
+            "wallet_fingerprint_hash": abort["wallet_fingerprint_hash"],
+            "network": abort["network"],
+            "latch_generation": generation,
+            "lease_version": lease["lease_version"],
+            "lease_acquired_at": abort["lease_acquired_at"],
+            "observed_at": at,
+            "prepared_operation_id": safe_prepared,
+        }
+    except Exception:
+        if own_connection:
+            conn.rollback()
+        raise
+    finally:
+        if own_connection:
+            conn.close()
+
+
+def claim_refresh_abort_cleanup_cancel_effect(
+    *,
+    abort_id: str,
+    trade_id: str,
+    expected_latch_generation: int,
+    owner_run_id: str,
+    observed_trade_ids: Any,
+    observed_pending_transaction_ids: Any,
+    observed_at: Any,
+) -> bool:
+    """Claim one fenced Task 8 effect in the same transaction as abort proof."""
+
+    safe_trade = _reconciliation_coin_identity(trade_id, "trade_id")[0]
+    operation_id = f"cancel:{safe_trade}"
+    prepared_event_id = f"{operation_id}:attempt:1:prepared"
+    conn = _stability_connection()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        proof = authorize_refresh_abort_cleanup_target(
+            abort_id=abort_id,
+            trade_id=safe_trade,
+            expected_latch_generation=expected_latch_generation,
+            owner_run_id=owner_run_id,
+            observed_trade_ids=observed_trade_ids,
+            observed_pending_transaction_ids=observed_pending_transaction_ids,
+            observed_at=observed_at,
+            prepared_operation_id=operation_id,
+            require_reserved_fee_hold=True,
+            _connection=conn,
+        )
+        prepared_row = conn.execute(
+            "SELECT * FROM offer_operation_journal WHERE event_id=?",
+            (prepared_event_id,),
+        ).fetchone()
+        if prepared_row is None:
+            raise ValueError("exact cleanup PREPARED event is missing")
+        prepared = validate_offer_operation_event(dict(prepared_row))
+        evidence = json.loads(prepared["evidence_json"])
+        if (
+            prepared["operation_id"] != operation_id
+            or prepared["intent_id"] != proof["intent_id"]
+            or prepared["attempt"] != 1
+            or prepared["phase"] != "PREPARED"
+            or prepared["outcome"] != "PREPARED"
+            or prepared["transaction_id"] is not None
+            or prepared["spend_identity"] is not None
+            or prepared["blocks_mutation"] != 1
+            or type(evidence) is not dict
+            or evidence.get("trade_id") != safe_trade
+            or evidence.get("effect_claim_protocol") != "durable_cohort_claim_v1"
+        ):
+            raise ValueError("cleanup cancellation PREPARED evidence differs")
+        finalized = conn.execute(
+            "SELECT 1 FROM offer_operation_journal WHERE operation_id=? "
+            "AND attempt=1 AND phase='FINALIZED' LIMIT 1",
+            (operation_id,),
+        ).fetchone()
+        if finalized is not None:
+            raise ValueError("finalized cleanup cancellation cannot claim an effect")
+        existing = conn.execute(
+            "SELECT operation_id,attempt,prepared_event_id,claimed_at,"
+            "recovery_generation FROM offer_cancel_effect_claims "
+            "WHERE operation_id=? AND attempt=1",
+            (operation_id,),
+        ).fetchone()
+        if existing is not None:
+            _validated_offer_cancel_effect_claim(dict(existing))
+            if (
+                existing["prepared_event_id"] != prepared_event_id
+                or existing["recovery_generation"] != expected_latch_generation
+            ):
+                raise ValueError("cleanup effect claim replay differs")
+            conn.commit()
+            return False
+        conn.execute(
+            "INSERT INTO offer_cancel_effect_claims "
+            "(operation_id,attempt,prepared_event_id,claimed_at,recovery_generation) "
+            "VALUES (?,1,?,?,?)",
+            (
+                operation_id,
+                prepared_event_id,
+                _stability_timestamp(observed_at, "observed_at"),
+                expected_latch_generation,
+            ),
+        )
+        conn.commit()
+        return True
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def complete_refresh_abort(
+    *,
+    abort_id: str,
+    expected_latch_generation: int,
+    owner_run_id: str,
+    observed_trade_ids: Any,
+    observed_pending_transaction_ids: Any,
+    observed_at: Any,
+) -> Dict[str, Any]:
+    """Close only a proven empty wallet book after exact terminal proofs."""
+
+    safe_abort = _reconciliation_coin_identity(abort_id, "abort_id")[0]
+    generation = _exact_integer(
+        expected_latch_generation, "expected_latch_generation", minimum=1
+    )
+    owner = _required_stability_text(owner_run_id, "owner_run_id")
+    at = _stability_timestamp(observed_at, "observed_at")
+    observed_time = datetime.fromisoformat(at.replace("Z", "+00:00"))
+    authority_time = datetime.fromisoformat(
+        _stability_wall_clock().replace("Z", "+00:00")
+    )
+    if (
+        not timedelta(seconds=-5)
+        <= authority_time - observed_time
+        <= timedelta(seconds=30)
+    ):
+        raise ValueError("fresh complete Sage offer book is required")
+    if observed_trade_ids != [] or observed_pending_transaction_ids != []:
+        raise ValueError("refresh abort needs zero live offers and pending effects")
+    conn = _stability_connection()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        abort_row = conn.execute(
+            "SELECT * FROM offer_refresh_aborts WHERE abort_id=?", (safe_abort,)
+        ).fetchone()
+        if abort_row is None:
+            raise ValueError("exact refresh abort is missing")
+        abort = dict(abort_row)
+        if abort["latch_generation"] != generation:
+            raise ValueError("refresh abort generation changed")
+        if abort["state"] == "aborted":
+            conn.commit()
+            return {**abort, "idempotent": True}
+        if abort["state"] != "parent_terminal":
+            raise ValueError("refresh abort awaits parent terminal proof")
+        latch_row = conn.execute(
+            "SELECT * FROM runtime_safety_latch WHERE singleton_id=1"
+        ).fetchone()
+        lease_row = conn.execute(
+            "SELECT * FROM runtime_mutation_lease WHERE singleton_id=1"
+        ).fetchone()
+        campaign_row = conn.execute(
+            "SELECT status FROM bootstrap_campaigns WHERE campaign_id=?",
+            (abort["campaign_id"],),
+        ).fetchone()
+        if latch_row is None or lease_row is None or campaign_row is None:
+            raise ValueError("refresh abort safety authority is missing")
+        latch, lease = dict(latch_row), dict(lease_row)
+        if (
+            latch["state"] != "tripped"
+            or latch["generation"] != generation
+            or latch["wallet_fingerprint_hash"] != abort["wallet_fingerprint_hash"]
+            or latch["network"] != abort["network"]
+            or json.loads(latch["blocking_operation_ids_json"])
+            != [abort["blocking_operation_id"]]
+            or lease["active"] != 1
+            or lease["owner_run_id"] != owner
+            or owner != abort["owner_run_id"]
+            or lease["lease_version"] < abort["lease_version"]
+            or lease["acquired_at"] != abort["lease_acquired_at"]
+            or lease["owner_pid"] != abort["lease_owner_pid"]
+            or lease["owner_host"] != abort["lease_owner_host"]
+            or lease["wallet_fingerprint_hash"] != abort["wallet_fingerprint_hash"]
+            or lease["network"] != abort["network"]
+            or lease["expires_at"] is None
+            or lease["expires_at"] <= max(at, _stability_wall_clock())
+            or campaign_row["status"] != "stopped"
+        ):
+            raise ValueError("refresh abort completion authority changed")
+        _assert_refresh_abort_journal_scope(conn, set())
+        _assert_refresh_abort_effect_scope(conn, set())
+        parent, child = _refresh_lineage_rows(
+            conn, abort["parent_intent_id"], abort["child_intent_id"]
+        )
+        if (
+            parent["lifecycle_state"] != "terminal"
+            or child["lifecycle_state"] != "terminal"
+            or child["first_visible_at"] is not None
+        ):
+            raise ValueError("refresh abort lineage lacks terminal proof")
+        active = conn.execute(
+            "SELECT 1 FROM offer_intents WHERE wallet_fingerprint_hash=? "
+            "AND network=? AND lifecycle_state IN "
+            "('prepared','created','visible','cancel_requested') LIMIT 1",
+            (abort["wallet_fingerprint_hash"], abort["network"]),
+        ).fetchone()
+        if active is not None:
+            raise ValueError("durable wallet book is not empty")
+        targets = json.loads(abort["target_trade_ids_json"])
+        if type(targets) is not list or not targets:
+            raise ValueError("refresh abort targets are invalid")
+        for trade_id in targets:
+            intent_row = conn.execute(
+                "SELECT intent_id,asset_id,lifecycle_state FROM offer_intents "
+                "WHERE sage_trade_id=? AND wallet_fingerprint_hash=? AND network=?",
+                (trade_id, abort["wallet_fingerprint_hash"], abort["network"]),
+            ).fetchone()
+            terminal_row = conn.execute(
+                "SELECT * FROM offer_operation_journal WHERE operation_id=("
+                "SELECT 'reconcile:'||intent_id FROM offer_intents WHERE sage_trade_id=?"
+                ") AND phase='FINALIZED' ORDER BY sequence DESC LIMIT 1",
+                (trade_id,),
+            ).fetchone()
+            cancel_row = conn.execute(
+                "SELECT * FROM offer_operation_journal WHERE operation_id=? "
+                "ORDER BY sequence DESC LIMIT 1",
+                (f"cancel:{trade_id}",),
+            ).fetchone()
+            if intent_row is None or terminal_row is None:
+                raise ValueError("cleanup target lacks exact terminal journal")
+            terminal = validate_offer_operation_event(dict(terminal_row))
+            if (
+                intent_row["asset_id"] != abort["asset_id"]
+                or intent_row["lifecycle_state"] != "terminal"
+                or terminal["intent_id"] != intent_row["intent_id"]
+                or terminal["operation_type"] != "RECONCILE"
+            ):
+                raise ValueError("cleanup target lacks exact terminal proof")
+            if terminal["outcome"] == "CANCELLED_PROVEN":
+                if cancel_row is None:
+                    raise ValueError("cleanup target lacks exact cancellation journal")
+                cancel = validate_offer_operation_event(dict(cancel_row))
+                if (
+                    cancel["intent_id"] != intent_row["intent_id"]
+                    or cancel["phase"] != "RECONCILED"
+                    or cancel["outcome"] != "CANCEL_CONFIRMED"
+                    or cancel["blocks_mutation"] != 0
+                ):
+                    raise ValueError("cleanup target is not cancellation proven")
+            elif terminal["outcome"] == "EXPIRED_PROVEN":
+                # Natural expiry is proof-only. A submitted cancellation must
+                # still use its exact Task 8 result, never this narrower path.
+                if (
+                    cancel_row is not None
+                    or terminal["transaction_id"] is not None
+                    or terminal["spend_identity"] is not None
+                ):
+                    raise ValueError("cleanup expiry has a cancellation effect")
+            else:
+                raise ValueError("cleanup target lacks proven terminal outcome")
+        _assert_refresh_abort_publication_scope(conn, child, abort_id=safe_abort)
+        _suppress_publication_outbox_rows(
+            conn,
+            intent_id=abort["child_intent_id"],
+            proof_json={
+                "code": "REFRESH_ABORT_TERMINAL_CLEANUP",
+                "abort_id": safe_abort,
+            },
+            suppressed_at=at,
+        )
+        cursor = conn.execute(
+            "UPDATE offer_refresh_aborts SET state='aborted',updated_at=?,completed_at=? "
+            "WHERE abort_id=? AND state='parent_terminal'",
+            (at, at, safe_abort),
+        )
+        if cursor.rowcount != 1:
+            raise ValueError("refresh abort completion compare-and-set failed")
+        _reconciliation_latch_update(
+            conn,
+            operation_id=abort["blocking_operation_id"],
+            wallet_fingerprint_hash=abort["wallet_fingerprint_hash"],
+            network=abort["network"],
+            reason_code="REFRESH_ABORT_CLEANUP_COMPLETE",
+            reason="Exact wallet offer book is empty and terminal outcomes proven",
+            reconciled_at=at,
+            blocking=False,
+        )
+        saved = dict(
+            conn.execute(
+                "SELECT * FROM offer_refresh_aborts WHERE abort_id=?", (safe_abort,)
+            ).fetchone()
+        )
+        conn.commit()
+        return {**saved, "idempotent": False}
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def _validate_refresh_abort_commit_authority(
+    conn: sqlite3.Connection,
+    *,
+    abort_id: str,
+    parent: Dict[str, Any],
+    child: Optional[Dict[str, Any]],
+    wallet_hash: str,
+    network: str,
+    at: str,
+) -> Dict[str, Any]:
+    """Recheck a typed exception inside Task 9's own terminal transaction."""
+
+    row = conn.execute(
+        "SELECT * FROM offer_refresh_aborts WHERE abort_id=?", (abort_id,)
+    ).fetchone()
+    if row is None or child is None:
+        raise ValueError("fenced refresh abort or exact child is missing")
+    abort = dict(row)
+    latch_row = conn.execute(
+        "SELECT * FROM runtime_safety_latch WHERE singleton_id=1"
+    ).fetchone()
+    lease_row = conn.execute(
+        "SELECT * FROM runtime_mutation_lease WHERE singleton_id=1"
+    ).fetchone()
+    campaign_row = conn.execute(
+        "SELECT * FROM bootstrap_campaigns WHERE campaign_id=?",
+        (abort["campaign_id"],),
+    ).fetchone()
+    if latch_row is None or lease_row is None or campaign_row is None:
+        raise ValueError("refresh abort safety authority is missing")
+    latch, lease, campaign = dict(latch_row), dict(lease_row), dict(campaign_row)
+    expected_blockers = {abort["blocking_operation_id"]}
+    if abort["state"] == "fenced":
+        expected_blockers.add(abort["cancel_operation_id"])
+    elif abort["state"] != "parent_terminal":
+        raise ValueError("refresh abort stage is not a parent proof stage")
+    _assert_refresh_abort_journal_scope(
+        conn,
+        {abort["cancel_operation_id"]} if abort["state"] == "fenced" else set(),
+    )
+    parent_fee_hold = (
+        _refresh_abort_prepared_fee_hold(
+            conn,
+            prepared_operation_id=abort["cancel_operation_id"],
+            trade_id=parent["sage_trade_id"],
+            intent_id=parent["intent_id"],
+            campaign_id=abort["campaign_id"],
+            allow_submitted_parent=True,
+        )
+        if abort["state"] == "fenced"
+        else None
+    )
+    _assert_refresh_abort_effect_scope(
+        conn,
+        {abort["cancel_operation_id"]} if abort["state"] == "fenced" else set(),
+        parent_fee_hold,
+    )
+    _assert_refresh_abort_publication_scope(conn, child, abort_id=abort_id)
+    if (
+        abort["parent_intent_id"] != parent["intent_id"]
+        or abort["child_intent_id"] != child["intent_id"]
+        or parent["child_intent_id"] != child["intent_id"]
+        or child["parent_intent_id"] != parent["intent_id"]
+        or not _refresh_abort_child_is_fenced_or_cancelled(conn, abort, child)
+        or abort["wallet_fingerprint_hash"] != wallet_hash
+        or abort["network"] != network
+        or abort["asset_id"] != parent["asset_id"]
+        or abort["asset_id"] != child["asset_id"]
+        or abort["cancel_operation_id"] != f"cancel:{parent['sage_trade_id']}"
+        or child["sage_trade_id"] not in json.loads(abort["target_trade_ids_json"])
+        or latch["state"] != "tripped"
+        or latch["generation"] != abort["latch_generation"]
+        or set(json.loads(latch["blocking_operation_ids_json"])) != expected_blockers
+        or lease["active"] != 1
+        or lease["owner_run_id"] != abort["owner_run_id"]
+        or lease["lease_version"] < abort["lease_version"]
+        or lease["acquired_at"] != abort["lease_acquired_at"]
+        or lease["owner_pid"] != abort["lease_owner_pid"]
+        or lease["owner_host"] != abort["lease_owner_host"]
+        or lease["wallet_fingerprint_hash"] != wallet_hash
+        or lease["network"] != network
+        or lease["expires_at"] is None
+        or lease["expires_at"] <= max(at, _stability_wall_clock())
+        or campaign["status"] != "stopped"
+    ):
+        raise ValueError("refresh abort authority changed before terminal proof")
+    return abort
+
+
+def begin_refresh_abort(
+    *,
+    parent_intent_id: str,
+    child_intent_id: str,
+    campaign_id: str,
+    expected_latch_generation: int,
+    owner_run_id: str,
+    expected_lease_version: int,
+    observed_trade_ids: Any,
+    observed_at: Any,
+    published_cleanup: bool = False,
+) -> Dict[str, Any]:
+    """Retain an exact stop fence before settling an already-submitted cancel.
+
+    This is a durable authority check, not a wallet or publication action.
+    The caller must obtain the complete Sage book independently. Later stages
+    re-read that book before each effect; this snapshot cannot grant one.
+    """
+
+    from mutation_gate import wallet_fingerprint_hash
+
+    if type(published_cleanup) is not bool:
+        raise TypeError("published_cleanup must be an exact bool")
+
+    parent_id = _required_stability_text(parent_intent_id, "parent_intent_id")
+    child_id = _required_stability_text(child_intent_id, "child_intent_id")
+    campaign = _bootstrap_identity(campaign_id, "campaign_id")
+    generation = _exact_integer(
+        expected_latch_generation, "expected_latch_generation", minimum=1
+    )
+    owner = _required_stability_text(owner_run_id, "owner_run_id")
+    lease_version = _exact_integer(
+        expected_lease_version, "expected_lease_version", minimum=1
+    )
+    at = _stability_timestamp(observed_at, "observed_at")
+    if type(observed_trade_ids) is not list or len(observed_trade_ids) > 256:
+        raise ValueError("observed_trade_ids must be a bounded exact list")
+    trades = sorted(
+        _reconciliation_coin_identity(value, "observed trade_id")[0]
+        for value in observed_trade_ids
+    )
+    if not trades or len(trades) != len(set(trades)):
+        raise ValueError("observed Sage trade identities are empty or duplicated")
+    target_json = _canonical_json_text(
+        trades, "target_trade_ids_json", expected_type=list
+    )
+    conn = _stability_connection()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        parent, child = _refresh_lineage_rows(conn, parent_id, child_id)
+        parent_trade = parent.get("sage_trade_id")
+        cancel_op = f"cancel:{parent_trade}"
+        prior_row = conn.execute(
+            "SELECT * FROM offer_refresh_aborts WHERE parent_intent_id=?",
+            (parent_id,),
+        ).fetchone()
+        if prior_row is not None and prior_row["state"] == "parent_terminal":
+            _assert_refresh_abort_journal_scope(conn, set())
+            _assert_refresh_abort_effect_scope(conn, set())
+            prior = dict(prior_row)
+            terminal_offer = conn.execute(
+                "SELECT status FROM offers WHERE trade_id=?", (parent_trade,)
+            ).fetchone()
+            terminal_proof = conn.execute(
+                "SELECT 1 FROM offer_operation_journal WHERE operation_id=? "
+                "AND operation_type='RECONCILE' AND phase='FINALIZED' "
+                "AND outcome='CANCELLED_PROVEN' LIMIT 1",
+                (f"reconcile:{parent_id}",),
+            ).fetchone()
+            current_lease = conn.execute(
+                "SELECT lease_version FROM runtime_mutation_lease WHERE singleton_id=1"
+            ).fetchone()
+            if (
+                prior["campaign_id"] != campaign
+                or prior["cancel_operation_id"] != cancel_op
+                or prior["latch_generation"] != generation
+                or prior["owner_run_id"] != owner
+                or prior["target_trade_ids_json"] != target_json
+                or prior["lease_version"] > lease_version
+                or current_lease is None
+                or current_lease["lease_version"] != lease_version
+                or parent["lifecycle_state"] != "terminal"
+                or terminal_offer is None
+                or terminal_offer["status"] != "cancelled"
+                or terminal_proof is None
+            ):
+                raise ValueError("refresh abort terminal replay differs")
+            _validate_refresh_abort_commit_authority(
+                conn,
+                abort_id=prior["abort_id"],
+                parent=parent,
+                child=child,
+                wallet_hash=parent["wallet_fingerprint_hash"],
+                network=parent["network"],
+                at=at,
+            )
+            _assert_refresh_abort_publication_scope(
+                conn, child, abort_id=prior["abort_id"]
+            )
+            if (
+                bool(
+                    conn.execute(
+                        "SELECT 1 FROM offer_refresh_published_cleanups WHERE abort_id=?",
+                        (prior["abort_id"],),
+                    ).fetchone()
+                )
+                != published_cleanup
+            ):
+                raise ValueError("refresh abort replay cleanup mode differs")
+            conn.commit()
+            return {**prior, "idempotent": True}
+        parent_offer = conn.execute(
+            "SELECT status,lifecycle_state FROM offers WHERE trade_id=?",
+            (parent_trade,),
+        ).fetchone()
+        if (
+            parent["child_intent_id"] != child_id
+            or parent["lifecycle_state"] != "visible"
+            or parent["first_visible_at"] is None
+            or parent_offer is None
+            or parent_offer["status"] != "open"
+            or parent_offer["lifecycle_state"] != "cancel_requested"
+            or _authority_sql_selected_coin_digest(parent["selected_coin_ids_json"])
+            != parent["selected_coin_ids_sha256"]
+            or _authority_sql_selected_coin_digest(child["selected_coin_ids_json"])
+            != child["selected_coin_ids_sha256"]
+            or child["lifecycle_state"] != "created"
+            or child["first_visible_at"] is not None
+            or not parent_trade
+            or not child.get("sage_trade_id")
+            or child["sage_trade_id"] not in trades
+        ):
+            raise ValueError("abort lineage is not an exact created replacement")
+        latch_row = conn.execute(
+            "SELECT * FROM runtime_safety_latch WHERE singleton_id=1"
+        ).fetchone()
+        lease_row = conn.execute(
+            "SELECT * FROM runtime_mutation_lease WHERE singleton_id=1"
+        ).fetchone()
+        campaign_row = conn.execute(
+            "SELECT * FROM bootstrap_campaigns WHERE campaign_id=?", (campaign,)
+        ).fetchone()
+        if latch_row is None or lease_row is None or campaign_row is None:
+            raise ValueError("abort authority is incomplete")
+        latch, lease, saved_campaign = (
+            dict(latch_row),
+            dict(lease_row),
+            dict(campaign_row),
+        )
+        wallet_hash, network = parent["wallet_fingerprint_hash"], parent["network"]
+        if (
+            latch["generation"] != generation
+            or latch["state"] != "tripped"
+            or latch["wallet_fingerprint_hash"] != wallet_hash
+            or latch["network"] != network
+            or lease["active"] != 1
+            or lease["owner_run_id"] != owner
+            or lease["lease_version"] != lease_version
+            or lease["wallet_fingerprint_hash"] != wallet_hash
+            or lease["network"] != network
+            or lease["expires_at"] is None
+            or lease["expires_at"] <= at
+            or saved_campaign["status"] != "stopped"
+            or saved_campaign["network"] != network
+            or saved_campaign["asset_id"] != parent["asset_id"]
+            or wallet_fingerprint_hash(saved_campaign["wallet_fingerprint"])
+            != wallet_hash
+        ):
+            raise ValueError("abort safety, lease or stopped campaign differs")
+        latest_row = conn.execute(
+            "SELECT * FROM offer_operation_journal WHERE operation_id=? "
+            "ORDER BY sequence DESC LIMIT 1",
+            (cancel_op,),
+        ).fetchone()
+        if latest_row is None:
+            raise ValueError("submitted cancellation journal is missing")
+        latest = validate_offer_operation_event(dict(latest_row))
+        if (
+            latest["intent_id"] != parent_id
+            or latest["phase"] != "FINALIZED"
+            or latest["outcome"] != "CANCEL_SUBMITTED_UNCONFIRMED"
+            or latest["blocks_mutation"] != 1
+            or not (latest["transaction_id"] or latest["spend_identity"])
+        ):
+            raise ValueError("submitted cancellation is not an exact blocker")
+        _assert_refresh_abort_journal_scope(conn, {cancel_op})
+        parent_fee_hold = _refresh_abort_prepared_fee_hold(
+            conn,
+            prepared_operation_id=cancel_op,
+            trade_id=parent_trade,
+            intent_id=parent_id,
+            campaign_id=campaign,
+            allow_submitted_parent=True,
+        )
+        _assert_refresh_abort_effect_scope(conn, {cancel_op}, parent_fee_hold)
+        db_trades = sorted(
+            str(row["sage_trade_id"])
+            for row in conn.execute(
+                "SELECT sage_trade_id FROM offer_intents WHERE "
+                "wallet_fingerprint_hash=? AND network=? AND asset_id=? "
+                "AND lifecycle_state IN ('created','visible','cancel_requested') "
+                "AND sage_trade_id IS NOT NULL AND intent_id<>?",
+                (wallet_hash, network, parent["asset_id"], parent_id),
+            ).fetchall()
+        )
+        if db_trades != trades:
+            raise ValueError("complete Sage book differs from durable offer intents")
+        receipts_json = _assert_refresh_abort_publication_scope(
+            conn, child, published_cleanup=published_cleanup
+        )
+        material = _canonical_json_text(
+            {
+                "parent_intent_id": parent_id,
+                "child_intent_id": child_id,
+                "cancel_operation_id": cancel_op,
+                "latch_generation": generation,
+            },
+            "refresh abort identity",
+            expected_type=dict,
+        )
+        abort_id = hashlib.sha256(
+            b"catalyst-refresh-abort-v1\x00" + material.encode("utf-8")
+        ).hexdigest()
+        blocker = f"refresh-abort:{abort_id}"
+        immutable = {
+            "abort_id": abort_id,
+            "parent_intent_id": parent_id,
+            "child_intent_id": child_id,
+            "campaign_id": campaign,
+            "cancel_operation_id": cancel_op,
+            "blocking_operation_id": blocker,
+            "latch_generation": generation,
+            "owner_run_id": owner,
+            "lease_version": lease_version,
+            "lease_acquired_at": lease["acquired_at"],
+            "lease_owner_pid": lease["owner_pid"],
+            "lease_owner_host": lease["owner_host"],
+            "wallet_fingerprint_hash": wallet_hash,
+            "network": network,
+            "asset_id": parent["asset_id"],
+            "target_trade_ids_json": target_json,
+        }
+        existing = conn.execute(
+            "SELECT * FROM offer_refresh_aborts WHERE parent_intent_id=?",
+            (parent_id,),
+        ).fetchone()
+        if existing is not None:
+            current = dict(existing)
+            # Heartbeats advance the owned lease version without changing its
+            # acquisition epoch. Keep the version recorded at entry as a
+            # minimum, while requiring this replay to name the fresh version
+            # already compared with the durable lease above.
+            if (
+                any(
+                    current[key] != value
+                    for key, value in immutable.items()
+                    if key != "lease_version"
+                )
+                or current["lease_version"] > lease_version
+            ):
+                raise ValueError("refresh abort replay differs")
+            if set(json.loads(latch["blocking_operation_ids_json"])) != {
+                cancel_op,
+                blocker,
+            }:
+                raise ValueError("refresh abort has an additional safety blocker")
+            conn.commit()
+            return {**current, "idempotent": True}
+        if json.loads(latch["blocking_operation_ids_json"]) != [cancel_op]:
+            raise ValueError("refresh abort has an additional safety blocker")
+        conn.execute(
+            "INSERT INTO offer_refresh_aborts ("
+            + ",".join(immutable)
+            + ",state,recorded_at,updated_at) VALUES ("
+            + ",".join("?" for _ in immutable)
+            + ",?,?,?)",
+            (*immutable.values(), "fenced", at, at),
+        )
+        if published_cleanup:
+            conn.execute(
+                "INSERT INTO offer_refresh_published_cleanups ("
+                "abort_id,child_intent_id,offer_fingerprint,receipts_json,"
+                "receipts_sha256,recorded_at) VALUES (?,?,?,?,?,?)",
+                (
+                    abort_id,
+                    child_id,
+                    child["offer_text_sha256"],
+                    receipts_json,
+                    hashlib.sha256(receipts_json.encode("utf-8")).hexdigest(),
+                    at,
+                ),
+            )
+        _reconciliation_latch_update(
+            conn,
+            operation_id=blocker,
+            wallet_fingerprint_hash=wallet_hash,
+            network=network,
+            reason_code="REFRESH_ABORT_CLEANUP",
+            reason="Confirmed cancellation needs fenced offer cleanup",
+            reconciled_at=at,
+            blocking=True,
+        )
+        saved = dict(
+            conn.execute(
+                "SELECT * FROM offer_refresh_aborts WHERE abort_id=?", (abort_id,)
+            ).fetchone()
+        )
+        conn.commit()
+        return {**saved, "idempotent": False}
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
 def bind_refresh_lineage(parent_intent_id: str, child_intent_id: str) -> Dict[str, Any]:
     """CAS-bind one confirmed child to exactly one parent.
 
@@ -29367,7 +37983,30 @@ def refresh_lineage_completion(
         parent_intent_id, require_visible=require_visible
     )
     if not eligibility["eligible"]:
-        return {"complete": False, "reason": eligibility["reason"]}
+        if eligibility["reason"] != "child_not_confirmed" or not require_visible:
+            return {"complete": False, "reason": eligibility["reason"]}
+        # A previously visible replacement may itself have reached Task 9's
+        # terminal boundary before a restarted run commits the parent edge.
+        # This is completion proof only; cancellation eligibility remains
+        # restricted to a currently visible child.
+        conn = _stability_connection()
+        try:
+            parent_row = conn.execute(
+                "SELECT child_intent_id FROM offer_intents WHERE intent_id=?",
+                (parent_intent_id,),
+            ).fetchone()
+            if parent_row is None or not parent_row["child_intent_id"]:
+                return {"complete": False, "reason": eligibility["reason"]}
+            try:
+                _parent, child = _refresh_lineage_rows(
+                    conn, parent_intent_id, parent_row["child_intent_id"]
+                )
+            except ValueError:
+                return {"complete": False, "reason": "invalid_lineage"}
+            if not _refresh_terminal_child_was_visible(conn, child):
+                return {"complete": False, "reason": eligibility["reason"]}
+        finally:
+            conn.close()
     parent = get_offer_intent(parent_intent_id)
     assert parent is not None  # checked by eligibility in the same durable DB
     trade_id = parent.get("sage_trade_id")
@@ -29388,6 +38027,36 @@ def refresh_lineage_completion(
     ):
         return {"complete": False, "reason": "cancel_resolution_missing"}
     return {"complete": True, "reason": "complete", "terminal": terminal}
+
+
+def _refresh_terminal_child_was_visible(
+    conn: sqlite3.Connection, child: Dict[str, Any]
+) -> bool:
+    """Verify historical visibility and exact terminal proof for one child."""
+
+    if (
+        child["lifecycle_state"] != "terminal"
+        or not child["publication_identity"]
+        or not child["first_visible_at"]
+        or not child["sage_trade_id"]
+        or not child["offer_text_sha256"]
+    ):
+        return False
+    row = conn.execute(
+        "SELECT * FROM offer_operation_journal WHERE operation_id=? "
+        "AND operation_type='RECONCILE' AND phase='FINALIZED' "
+        "ORDER BY sequence DESC LIMIT 1",
+        (f"reconcile:{child['intent_id']}",),
+    ).fetchone()
+    if row is None:
+        return False
+    event = validate_offer_operation_event(dict(row))
+    return bool(
+        event["intent_id"] == child["intent_id"]
+        and event["outcome"] in _RECONCILE_TERMINAL_OUTCOMES
+        and child["terminal_at"]
+        and child["first_visible_at"] < child["terminal_at"]
+    )
 
 
 def commit_refresh_lineage_completion(parent_intent_id: str) -> Dict[str, Any]:
@@ -29424,10 +38093,13 @@ def commit_refresh_lineage_completion(parent_intent_id: str) -> Dict[str, Any]:
         except ValueError:
             conn.commit()
             return {"committed": False, "reason": "invalid_lineage"}
-        if (
-            child["lifecycle_state"] != "visible"
-            or not child["publication_identity"]
-            or not child["first_visible_at"]
+        if not (
+            (
+                child["lifecycle_state"] == "visible"
+                and child["publication_identity"]
+                and child["first_visible_at"]
+            )
+            or _refresh_terminal_child_was_visible(conn, child)
         ):
             conn.commit()
             return {"committed": False, "reason": "child_not_visible"}
@@ -29526,9 +38198,14 @@ def get_pending_refresh_lineage_parent_ids(
         FROM offer_intents AS parent
         LEFT JOIN offer_refresh_lineage_commits AS committed
           ON committed.parent_intent_id=parent.intent_id
+        LEFT JOIN offer_refresh_aborts AS aborted
+          ON aborted.parent_intent_id=parent.intent_id
+         AND aborted.child_intent_id=parent.child_intent_id
+         AND aborted.state='aborted'
         WHERE parent.asset_id=? AND parent.side=?
           AND parent.child_intent_id IS NOT NULL
           AND committed.parent_intent_id IS NULL
+          AND aborted.abort_id IS NULL
         ORDER BY parent.updated_at, parent.intent_id
         LIMIT ?
         """,
@@ -30121,6 +38798,9 @@ def get_offer_ui_authority_by_trade_ids(
         snapshot = {
             str(row["sage_trade_id"]): {
                 "intent": dict(row),
+                "economics": _current_intent_economic_authority(
+                    conn, str(row["intent_id"])
+                ),
                 "discoveries": [],
                 "publications": [],
             }
@@ -35595,24 +44275,46 @@ def claim_offer_book_improvement(
 def compact_market_provider_evidence(
     *, before: datetime, summarized_at: datetime
 ) -> Dict[str, int]:
-    """Replace detailed old evidence with non-sensitive daily counts."""
+    """Replace a bounded batch of old evidence with non-sensitive daily counts.
+
+    Housekeeping repeats this call to drain a backlog. A no-op check avoids
+    taking the SQLite writer lock when no observations have expired.
+    """
 
     cutoff = _market_evidence_timestamp(before, "before")
     summarized = _market_evidence_timestamp(summarized_at, "summarized_at")
     conn = get_connection()
+    if (
+        conn.execute(
+            "SELECT 1 FROM market_provider_observations WHERE observed_at < ? LIMIT 1",
+            (cutoff,),
+        ).fetchone()
+        is None
+    ):
+        return {"deleted": 0, "summaries_written": 0}
     try:
         conn.execute("BEGIN IMMEDIATE")
-        groups = conn.execute(
+        rows = conn.execute(
             """
-            SELECT asset_id, substr(observed_at, 1, 10) AS summary_day,
-                   provider_id, capability, quality, COUNT(*) AS observation_count
+            SELECT observation_id, asset_id, substr(observed_at, 1, 10) AS summary_day,
+                   provider_id, capability, quality
             FROM market_provider_observations
             WHERE observed_at < ?
-            GROUP BY asset_id, summary_day, provider_id, capability, quality
+            LIMIT 500
             """,
             (cutoff,),
         ).fetchall()
-        for row in groups:
+        groups: Dict[tuple, int] = {}
+        for row in rows:
+            key = (
+                row["asset_id"],
+                row["summary_day"],
+                row["provider_id"],
+                row["capability"],
+                row["quality"],
+            )
+            groups[key] = groups.get(key, 0) + 1
+        for key, observation_count in groups.items():
             conn.execute(
                 """
                 INSERT INTO market_evidence_summaries (
@@ -35624,19 +44326,18 @@ def compact_market_provider_evidence(
                     observation_count=observation_count + excluded.observation_count,
                     summarized_at=excluded.summarized_at
                 """,
-                (
-                    row["asset_id"],
-                    row["summary_day"],
-                    row["provider_id"],
-                    row["capability"],
-                    row["quality"],
-                    row["observation_count"],
-                    summarized,
-                ),
+                (*key, observation_count, summarized),
             )
-        deleted = conn.execute(
-            "DELETE FROM market_provider_observations WHERE observed_at < ?", (cutoff,)
-        ).rowcount
+        deleted = 0
+        if rows:
+            ids = [row["observation_id"] for row in rows]
+            placeholders = ",".join("?" for _ in ids)
+            deleted = conn.execute(
+                f"DELETE FROM market_provider_observations WHERE observation_id IN ({placeholders})",
+                ids,
+            ).rowcount
+            if deleted != len(rows):
+                raise RuntimeError("market evidence batch changed during compaction")
         conn.commit()
         return {"deleted": int(deleted), "summaries_written": len(groups)}
     except Exception:
@@ -36008,6 +44709,18 @@ def get_bootstrap_campaign(campaign_id: str) -> Optional[Dict[str, Any]]:
     )
 
 
+def bootstrap_campaign_immutable_authority_valid(campaign: Dict[str, Any]) -> bool:
+    """Verify that the fixed campaign terms still hash to its durable ID."""
+    if type(campaign) is not dict:
+        return False
+    try:
+        authority = {key: campaign[key] for key in _BOOTSTRAP_CAMPAIGN_FIELDS}
+        _, derived_id = _bootstrap_campaign_material(authority)
+        return derived_id == campaign.get("campaign_id")
+    except (KeyError, TypeError, ValueError):
+        return False
+
+
 def get_bootstrap_campaign_authoritative_fee_spent_mojos(campaign_id: str) -> int:
     """Return exact confirmed fees attributable to one Bootstrap campaign.
 
@@ -36032,6 +44745,7 @@ def _bootstrap_campaign_authoritative_fee_spent_mojos(
     campaign_id: str,
     *,
     held_scope: Optional[str] = None,
+    held_scopes: Optional[List[str]] = None,
 ) -> int:
     """Aggregate terminal evidence in the caller's single accounting snapshot."""
     safe_id = _bootstrap_identity(campaign_id, "campaign_id")
@@ -36064,6 +44778,15 @@ def _bootstrap_campaign_authoritative_fee_spent_mojos(
     for row in rows:
         evidence = json.loads(row[0])
         exact_subset = evidence.get("exact_subset") if type(evidence) is dict else None
+        if (
+            type(exact_subset) is not dict
+            and type(evidence) is dict
+            and type(evidence.get("evidence")) is dict
+        ):
+            # Normal Task 9 reconciliation persists its exact classification
+            # and cohort context at the top level. Older journal writers
+            # wrapped the same proof in exact_subset.
+            exact_subset = evidence
         cancel_context = (
             exact_subset.get("cancel_context") if type(exact_subset) is dict else None
         )
@@ -36083,7 +44806,7 @@ def _bootstrap_campaign_authoritative_fee_spent_mojos(
         prior = cancellation_batches.setdefault(cohort_id, fee)
         if prior != fee:
             raise ValueError("Bootstrap cancellation fee evidence conflicts")
-    if held_scope is not None:
+    if held_scope is not None or held_scopes:
         # Scope accounting already counts unsettled reservations as held. A
         # crash between journal confirmation and ledger settlement must not
         # import that same batch as additional spend. The public campaign view
@@ -36093,13 +44816,16 @@ def _bootstrap_campaign_authoritative_fee_spent_mojos(
                 f"coin-prep-cancel:{cohort_id}".encode()
             ).hexdigest()
             pending = conn.execute(
-                "SELECT reservation.fee_mojos FROM approved_fee_reservations AS reservation "
+                "SELECT reservation.fee_mojos, reservation.scope_sha256 "
+                "FROM approved_fee_reservations AS reservation "
                 "LEFT JOIN approved_fee_outcomes AS outcome USING(operation_id) "
-                "WHERE reservation.operation_id=? AND reservation.scope_sha256=? "
+                "WHERE reservation.operation_id=? "
                 "AND reservation.cancellation=1 AND outcome.operation_id IS NULL",
-                (operation_id, held_scope),
+                (operation_id,),
             ).fetchone()
-            if pending is not None:
+            if pending is not None and pending["scope_sha256"] in (
+                held_scopes or [held_scope]
+            ):
                 if _fee_amount(pending[0]) != fee:
                     raise ValueError("FEE_CANCELLATION_EVIDENCE_CONFLICT")
                 del cancellation_batches[cohort_id]
@@ -36327,19 +45053,27 @@ def update_bootstrap_campaign_state(
     campaign_id: str,
     *,
     expected_revision: int,
+    expected_state_revision: Optional[int] = None,
     record: Dict[str, Any],
 ) -> int:
-    """Replace materialized policy state only at the expected revision."""
+    """CAS evidence independently of the offer-authority revision."""
 
     safe_id = _bootstrap_identity(campaign_id, "campaign_id")
     revision = _exact_integer(expected_revision, "expected_revision", minimum=0)
+    state_revision = _exact_integer(
+        revision if expected_state_revision is None else expected_state_revision,
+        "expected_state_revision",
+        minimum=0,
+    )
     state = _bootstrap_state_material(record)
     conn = get_connection()
     try:
         conn.execute("BEGIN IMMEDIATE")
         campaign = conn.execute(
             """
-            SELECT minimum_price, maximum_price FROM bootstrap_campaigns
+            SELECT minimum_price, maximum_price, stage, deployment_fraction,
+                   current_anchor_price, adverse_fill_times_json
+            FROM bootstrap_campaigns
             WHERE campaign_id=? AND status='active'
             """,
             (safe_id,),
@@ -36353,6 +45087,12 @@ def update_bootstrap_campaign_state(
             <= Decimal(campaign["maximum_price"])
         ):
             raise ValueError("current anchor is outside the campaign corridor")
+        plan_changed = (
+            campaign["stage"] != state["stage"]
+            or campaign["deployment_fraction"] != state["deployment_fraction"]
+            or campaign["current_anchor_price"] != state["current_anchor_price"]
+            or campaign["adverse_fill_times_json"] != state["adverse_fill_times_json"]
+        )
         cursor = conn.execute(
             """
             UPDATE bootstrap_campaigns SET
@@ -36360,8 +45100,10 @@ def update_bootstrap_campaign_state(
                 stable_since=?, confirmed_fills=?, settlement_clusters=?,
                 independent_depth_sides_json=?, suspected_linked_activity=?,
                 adverse_fill_times_json=?, fee_spent_xch=?, realized_loss_xch=?,
-                marked_inventory_loss_xch=?, revision=revision+1, updated_at=?
+                marked_inventory_loss_xch=?, revision=revision+?,
+                state_revision=state_revision+1, updated_at=?
             WHERE campaign_id=? AND status='active' AND revision=?
+                AND state_revision=?
             """,
             (
                 state["stage"],
@@ -36376,15 +45118,17 @@ def update_bootstrap_campaign_state(
                 state["fee_spent_xch"],
                 state["realized_loss_xch"],
                 state["marked_inventory_loss_xch"],
+                int(plan_changed),
                 state["updated_at"],
                 safe_id,
                 revision,
+                state_revision,
             ),
         )
         if cursor.rowcount != 1:
             raise RuntimeError("Bootstrap state compare-and-set failed")
         conn.commit()
-        return revision + 1
+        return revision + int(plan_changed)
     except Exception:
         conn.rollback()
         raise
@@ -36417,7 +45161,8 @@ def stop_bootstrap_campaign(
             """
             UPDATE bootstrap_campaigns
             SET status='stopped', stage='stopped', deployment_fraction='0',
-                stop_reason=?, stopped_at=?, updated_at=?, revision=revision+1
+                stop_reason=?, stopped_at=?, updated_at=?, revision=revision+1,
+                state_revision=state_revision+1
             WHERE campaign_id=? AND status='active'
             """,
             (safe_reason, stopped, stopped, safe_id),
@@ -36588,3 +45333,17 @@ def list_bootstrap_participation(
         }
         for row in rows
     ]
+
+
+def record_confidence_override_consent(
+    record: Dict[str, Any], scope: Dict[str, Any]
+) -> None:
+    """Persist an audit receipt only. Never load it as a runtime permit."""
+    payload = json.dumps(
+        {**record, "scope": scope},
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    )
+    if not set_setting("confidence_override_consent:" + record["consent_id"], payload):
+        raise ValueError("CONFIDENCE_OVERRIDE_AUDIT_FAILED")

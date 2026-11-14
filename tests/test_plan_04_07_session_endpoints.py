@@ -34,7 +34,7 @@ _FAKE_SESSION_SUMMARY = {
     "coins_cleared": 0,
     "open_offers_cancelled": 0,
     "reset_at": "2026-01-01T00:00:00",
-    "preserve_history": False,
+    "preserve_history": True,
 }
 
 
@@ -73,6 +73,12 @@ class _FlaskBase(unittest.TestCase):
 
 @unittest.skipIf(_SKIP is not None, f"api_server unavailable: {_SKIP}")
 class TestSessionFreshStart(_FlaskBase):
+    def setUp(self):
+        super().setUp()
+        open_offers_patch = patch("blueprints.session.get_open_offers", return_value=[])
+        open_offers_patch.start()
+        self.addCleanup(open_offers_patch.stop)
+
     def test_requires_token(self):
         resp = self._post("/api/session/fresh-start", auth=False)
         self.assertEqual(resp.status_code, 401)

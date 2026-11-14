@@ -111,6 +111,7 @@ class TierGroupCountTests(unittest.TestCase):
         fake_tx_fees = types.ModuleType("tx_fees")
         fake_tx_fees.fee_pool_enabled = lambda: False
         fake_tx_fees.get_effective_transaction_fee_mojos = lambda: 0
+        fake_tx_fees.get_transaction_fee_mode = lambda: "manual"
         fake_tx_fees.get_fee_coin_size_mojos = lambda: 0
         fake_tx_fees.get_fee_coin_size_xch = lambda: Decimal("0")
         fake_tx_fees.get_fee_pool_count = lambda: 0

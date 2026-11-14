@@ -108,11 +108,95 @@ def _preview(*, available: bool = True) -> dict:
     }
 
 
+def test_unbounded_fee_preview_has_no_cumulative_cap_input(page):
+    _open_gui(page)
+    preview = _preview()
+    preview["unbounded_fee_mode"] = True
+    preview["suggested_maximum_fee_mojos"] = None
+    preview["minimum_cumulative_fee_mojos"] = None
+    result = page.evaluate(
+        """preview => {
+            preview.observed_at = Math.floor(Date.now() / 1000);
+            preview.expires_at = preview.observed_at + 60;
+            renderCoinPrepFeePreview(preview);
+            return {
+                capHidden: document.getElementById('cpFeeCapRow').style.display === 'none',
+                mode: validateCoinPrepFeeMaximum(),
+                text: document.getElementById('cpFeeStatus').textContent,
+            };
+        }""",
+        preview,
+    )
+    assert result["capHidden"] is True
+    assert result["mode"] == "unbounded"
+    assert "Each later wallet effect" in result["text"]
+
+
+def test_follow_run_review_omits_legacy_cap_for_unbounded_approval(page):
+    _open_gui(page)
+    result = page.evaluate(
+        """async () => {
+            IS_DESKTOP = true;
+            window.pywebview = {api: {confirm_follow_run_review: async () => ({success: true})}};
+            let requested = null;
+            window.apiFetch = async (path, options = {}) => {
+                if (String(path).endsWith('/coin-prep/status')) {
+                    return new Response(JSON.stringify({
+                        success: true, follow_fee_approval_id: 'a'.repeat(64),
+                        follow_fee_approval: {unbounded: true, total_fee_mojos: 16000000},
+                    }), {status: 200});
+                }
+                if (String(path).endsWith('/follow/run-review')) {
+                    requested = JSON.parse(options.body);
+                    return new Response(JSON.stringify({
+                        success: true, unbounded: true,
+                        review_id: 'b'.repeat(64), review_sha256: 'c'.repeat(64),
+                        buy_limit: 24, sell_limit: 24, continuous: true,
+                        maximum_fee_mojos: 16000000,
+                        replacement_count_gate_passed: true,
+                        current_prep_targets_proven: true,
+                        buy_slots_arithmetic_fit: 24, sell_slots_arithmetic_fit: 24,
+                        shutdown_funding: {
+                            ready: true, full_book_proven: false, dispatch_authorized: false,
+                            expires_at: Math.floor(Date.now() / 1000) + 60,
+                            quoted_fee_mojos: 1000,
+                        },
+                        identity: {wallet_fingerprint: 736588221, network: 'mainnet', ticker: 'MZ', asset_id: 'd'.repeat(64)},
+                        maximum_trade_xch_mojos: 1000000000,
+                        maximum_trade_cat_atoms: 1000000,
+                        protected_fee_principal_mojos: 2000000000,
+                        cancellation_reserve_mojos: 4000000,
+                        largest_spendable_fee_coin_mojos: 50000000,
+                        expires_at_epoch: Math.floor(Date.now() / 1000) + 3600,
+                        review_expires_at_epoch: Math.floor(Date.now() / 1000) + 60,
+                    }), {status: 200});
+                }
+                throw new Error(`Unexpected request ${path}`);
+            };
+            await prepareFollowRunReview();
+            return {
+                requested,
+                capHidden: document.getElementById('followRunFeeCapRow').style.display === 'none',
+                text: document.getElementById('followRunReviewText').textContent,
+            };
+        }"""
+    )
+    assert "maximum_fee_mojos" not in result["requested"]
+    assert result["capHidden"] is True
+    assert "no cumulative ceiling" in result["text"]
+
+
 def test_zero_headroom_is_preserved_in_saved_coin_prep_plan(page):
     _open_gui(page)
     result = page.evaluate(
         """async () => {
             document.getElementById('configCoinPrepHeadroomPct').value = '0';
+            // The static GUI starts with wallet-derived numeric fields blank.
+            // Supply valid values so saveConfig reaches the settings validator.
+            document.querySelectorAll('input[type="number"]').forEach(input => {
+                if (input.value === '') input.value = '0';
+            });
+            document.getElementById('configTradeXch').value = '0.1';
             let validated = null;
             window.showStyledConfirm = async () => true;
             window.apiFetch = async (path, options = {}) => {
@@ -214,6 +298,82 @@ def test_fee_preview_age_advances_and_expired_quote_cannot_be_approved(page):
     assert "expired" in result["after"]
     assert result["disabled"] is True
     assert result["maximum"] is None
+
+
+def test_open_coin_prep_modal_automatically_refreshes_near_expiry_read_only(page):
+    page.clock.install(time="2027-01-15T08:00:00Z")
+    _open_gui(page)
+    preview = _preview()
+    result = page.evaluate(
+        """preview => {
+            const now = Math.floor(Date.now() / 1000);
+            window.__feeCalls = [];
+            window.apiFetch = async (path, options = {}) => {
+                const requestedPath = String(path);
+                window.__feeCalls.push({path: requestedPath, options});
+                if (!requestedPath.endsWith('/coin-prep/fee-preview')) {
+                    return new Response('{}', {status: 200});
+                }
+                const refreshed = structuredClone(preview);
+                refreshed.preview_id = 'e'.repeat(64);
+                refreshed.suggested_maximum_fee_mojos = '18000000';
+                refreshed.observed_at = Math.floor(Date.now() / 1000);
+                refreshed.expires_at = refreshed.observed_at + 60;
+                return new Response(JSON.stringify(refreshed), {status: 200});
+            };
+
+            const overlay = document.getElementById('coinPrepConfirmOverlay');
+            overlay.classList.add('active');
+            showCoinPrepView('confirm');
+            preview.observed_at = now;
+            preview.expires_at = now + 20;
+            renderCoinPrepFeePreview(preview);
+            document.getElementById('cpFeeMaximumInput').value = '0.000020';
+            validateCoinPrepFeeMaximum();
+            return true;
+        }""",
+        preview,
+    )
+    assert result is True
+    page.clock.fast_forward(6_000)
+    preview_calls = page.evaluate(
+        "window.__feeCalls.filter(call => call.path.endsWith('/coin-prep/fee-preview')).length"
+    )
+    assert preview_calls == 1, page.evaluate("window.__feeCalls")
+    expect(page.locator("#cpConfirmBtn")).to_be_enabled()
+    expect(page.locator("#cpFeeMaximumInput")).to_have_value("0.000020")
+    assert page.evaluate(
+        """window.__feeCalls
+            .filter(call => call.path.endsWith('/coin-prep/fee-preview'))
+            .map(call => call.path)"""
+    ) == ["/api/coin-prep/fee-preview"]
+    assert (
+        page.evaluate(
+            "window.__feeCalls.some(call => /trigger|fee-approval|wallet/i.test(call.path))"
+        )
+        is False
+    )
+
+    # A visible but closed confirmation view must not start another preview.
+    page.evaluate(
+        """() => {
+            document.getElementById('coinPrepConfirmOverlay').classList.remove('active');
+            _coinPrepFeePreview.expires_at = Math.floor(Date.now() / 1000) + 10;
+        }"""
+    )
+    page.clock.fast_forward(20_000)
+    assert (
+        page.evaluate(
+            "window.__feeCalls.filter(call => call.path.endsWith('/coin-prep/fee-preview')).length"
+        )
+        == 1
+    )
+    assert (
+        page.evaluate(
+            "window.__feeCalls.some(call => /trigger|fee-approval|wallet/i.test(call.path))"
+        )
+        is False
+    )
 
 
 def test_fee_preview_is_read_only_and_renders_lossless_operator_evidence(page):
@@ -504,6 +664,74 @@ def test_history_cancel_records_no_fee_approval_or_trigger(page):
     assert result == ["/api/coin-prep/fee-preview"]
 
 
+@pytest.mark.parametrize(
+    "change",
+    [
+        "none",
+        "plan",
+        "scope",
+        "unfunded",
+        "over_cap",
+        "protection",
+        "unavailable",
+        "expired",
+    ],
+)
+def test_history_expiry_refreshes_same_plan_with_chosen_cap_only(page, change):
+    _open_gui(page)
+    result = page.evaluate(
+        """async ({preview, change}) => {
+            const originalNow = Date.now;
+            const now = Math.floor(Date.now() / 1000);
+            preview.observed_at = now;
+            preview.expires_at = now + 2;
+            const calls = [];
+            let count = 0;
+            window.apiFetch = async (path, options = {}) => {
+                const body = options.body ? JSON.parse(options.body) : null;
+                calls.push({path: String(path), body});
+                if (String(path).endsWith('/fee-preview')) {
+                    if (++count === 1) return new Response(JSON.stringify(preview));
+                    const fresh = {...preview, preview_id: 'e'.repeat(64),
+                        observed_at: now + 3, expires_at: now + 63};
+                    if (change === 'plan') fresh.plan_sha256 = 'f'.repeat(64);
+                    if (change === 'scope') fresh.scope_sha256 = 'f'.repeat(64);
+                    if (change === 'unfunded') fresh.funded = false;
+                    if (change === 'over_cap') fresh.minimum_cumulative_fee_mojos = '5000000001';
+                    if (change === 'protection') fresh.minimum_cancellation_reserve_mojos = '1';
+                    if (change === 'unavailable') fresh.available = false;
+                    if (change === 'expired') fresh.expires_at = now + 2;
+                    return new Response(JSON.stringify(fresh));
+                }
+                if (String(path).endsWith('/fee-approval')) {
+                    return new Response(JSON.stringify({success: false, reason: 'test stop'}), {status: 400});
+                }
+                throw new Error(`Unexpected wallet effect: ${path}`);
+            };
+            window.askPrepHistoryChoice = async () => {
+                Date.now = () => (now + 3) * 1000;
+                return {action: 'proceed', resets: {pnl: false, offers: false, counters: false}};
+            };
+            try {
+                await refreshCoinPrepFeePreview({coin_multiplier: '1'});
+                document.getElementById('cpFeeMaximumInput').value = '0.005';
+                await startCoinPrepFromModal();
+                return calls;
+            } finally { Date.now = originalNow; }
+        }""",
+        {"preview": _preview(), "change": change},
+    )
+    assert [call["path"] for call in result] == ["/api/coin-prep/fee-preview"] * 2 + (
+        ["/api/coin-prep/fee-approval"] if change == "none" else []
+    )
+    if change == "none":
+        assert result[-1]["body"] == {
+            "preview_id": "e" * 64,
+            "maximum_fee_mojos": "5000000000",
+            "cancellation_reserve_mojos": "4000000",
+        }
+
+
 def test_quote_expiring_during_history_choice_does_not_record_approval(page):
     _open_gui(page)
     preview = _preview()
@@ -536,8 +764,57 @@ def test_quote_expiring_during_history_choice_does_not_record_approval(page):
         }""",
         preview,
     )
-    assert result["calls"] == ["/api/coin-prep/fee-preview"]
+    assert result["calls"] == ["/api/coin-prep/fee-preview"] * 2
     assert result["disabled"] is True
+
+
+@pytest.mark.parametrize("history_failure", ["expired", "exception"])
+def test_failed_history_review_restores_fee_review_without_wallet_effect(
+    page, history_failure
+):
+    _open_gui(page)
+    result = page.evaluate(
+        """async ({preview, historyFailure}) => {
+            const originalNow = Date.now;
+            const now = Math.floor(Date.now() / 1000);
+            preview.observed_at = now;
+            preview.expires_at = now + 2;
+            const calls = [];
+            window.apiFetch = async path => {
+                calls.push(String(path));
+                if (!String(path).endsWith('/fee-preview')) throw new Error('Unexpected wallet effect');
+                return new Response(JSON.stringify(preview), {status: 200});
+            };
+            document.getElementById('coinPrepConfirmView').style.display = 'block';
+            window.askPrepHistoryChoice = async () => {
+                if (historyFailure === 'exception') throw new Error('History unavailable');
+                Date.now = () => (now + 3) * 1000;
+                return {action: 'proceed', resets: {}};
+            };
+            let escaped = false;
+            try {
+                await refreshCoinPrepFeePreview({coin_multiplier: '1'});
+                try { await startCoinPrepFromModal(); } catch (_) { escaped = true; }
+                const btn = document.getElementById('cpConfirmBtn');
+                const failed = {busy: _coinPrepFeeConfirmBusy, label: btn.textContent,
+                    disabled: btn.disabled};
+                Date.now = originalNow;
+                preview.expires_at = now + 60;
+                await refreshCoinPrepFeePreview({coin_multiplier: '1'});
+                return {failed, escaped, calls, retryEnabled: !btn.disabled};
+            } finally { Date.now = originalNow; }
+        }""",
+        {"preview": _preview(), "historyFailure": history_failure},
+    )
+    assert result["escaped"] is False
+    assert result["failed"]["busy"] is False
+    assert result["failed"]["label"] == "Yes, Prepare Coins"
+    if history_failure == "expired":
+        assert result["failed"]["disabled"] is True
+    assert result["retryEnabled"] is True
+    assert result["calls"] == ["/api/coin-prep/fee-preview"] * (
+        3 if history_failure == "expired" else 2
+    )
 
 
 def test_fee_endpoints_have_native_desktop_bridge_equivalence(page):
@@ -562,6 +839,11 @@ def test_coin_prep_cancel_all_forwards_the_confirmed_approval_context(page):
             window.__feeCalls = [];
             window.apiFetch = async (path, options = {}) => {
                 window.__feeCalls.push({path: String(path), body: options.body || null});
+                if (String(path).endsWith('/offers/refresh_abort/preview')) {
+                    return new Response(JSON.stringify({success: true,
+                        stage: 'no_exact_candidate', candidate: null, abort: null,
+                        safety: {state: 'resolved', allowed: true}}), {status: 200});
+                }
                 return new Response(JSON.stringify({success: false, error: 'test stop'}), {
                     status: 400,
                     headers: {'Content-Type': 'application/json'},
@@ -581,13 +863,14 @@ def test_coin_prep_cancel_all_forwards_the_confirmed_approval_context(page):
     )
 
     assert result == [
+        {"path": "/api/offers/refresh_abort/preview", "body": None},
         {
             "path": "/api/offers/cancel_all",
             "body": json.dumps(
                 {"source": "coin_prep", "fee_approval_id": approval_id},
                 separators=(",", ":"),
             ),
-        }
+        },
     ]
 
 
@@ -604,6 +887,11 @@ def test_async_cancel_budget_failure_opens_fresh_fee_review_without_retry(page):
             window.apiFetch = async (path, options = {}) => {
                 const url = String(path);
                 window.__feeCalls.push({path: url, body: options.body || null});
+                if (url.includes('/offers/refresh_abort/preview')) {
+                    return new Response(JSON.stringify({success: true,
+                        stage: 'no_exact_candidate', candidate: null, abort: null,
+                        safety: {state: 'resolved', allowed: true}}), {status: 200});
+                }
                 if (url.includes('/offers/cancel_all/status')) {
                     window.__statusReads += 1;
                     return new Response(JSON.stringify({
@@ -670,25 +958,39 @@ def test_async_cancel_budget_failure_opens_fresh_fee_review_without_retry(page):
     assert "new cumulative maximum" in result["banner"]
 
 
-def test_generic_cancel_budget_failure_opens_campaign_fee_review(page):
+@pytest.mark.parametrize(
+    ("reason_code", "expected_banner"),
+    [
+        ("FEE_CAMPAIGN_BUDGET_EXCEEDED", "new cumulative maximum"),
+        ("FEE_PREP_FUNDING_INSUFFICIENT", "funding is insufficient"),
+    ],
+)
+def test_generic_cancel_budget_failure_opens_campaign_fee_review(
+    page, reason_code, expected_banner
+):
     _open_gui(page)
     preview = _preview()
 
     result = page.evaluate(
-        """async preview => {
+        """async ({preview, reasonCode}) => {
             bot_state = {running: false, offers: {buy: [{}], sell: [{}]}};
             window.__feeCalls = [];
             window.apiFetch = async (path, options = {}) => {
                 const url = String(path);
                 window.__feeCalls.push({path: url, body: options.body || null});
+                if (url.includes('/offers/refresh_abort/preview')) {
+                    return new Response(JSON.stringify({success: true,
+                        stage: 'no_exact_candidate', candidate: null, abort: null,
+                        safety: {state: 'resolved', allowed: true}}), {status: 200});
+                }
                 if (url.includes('/offers/cancel_all/status')) {
                     return new Response(JSON.stringify({
                         success: true,
                         running: false,
                         complete: false,
                         phase: 'error',
-                        reason_code: 'FEE_CAMPAIGN_BUDGET_EXCEEDED',
-                        message: 'Cancel all failed: FEE_CAMPAIGN_BUDGET_EXCEEDED',
+                        reason_code: reasonCode,
+                        message: `Cancel all failed: ${reasonCode}`,
                     }), {status: 200, headers: {'Content-Type': 'application/json'}});
                 }
                 if (url.includes('/coin-prep/fee-preview')) {
@@ -717,7 +1019,7 @@ def test_generic_cancel_budget_failure_opens_campaign_fee_review(page):
                 banner: document.getElementById('cpReasonBanner').textContent,
             };
         }""",
-        preview,
+        {"preview": preview, "reasonCode": reason_code},
     )
 
     cancel_calls = [
@@ -731,7 +1033,7 @@ def test_generic_cancel_budget_failure_opens_campaign_fee_review(page):
     assert len(cancel_calls) == 1
     assert len(preview_calls) == 1
     assert result["overlay"] is True
-    assert "new cumulative maximum" in result["banner"]
+    assert expected_banner in result["banner"]
 
 
 @pytest.mark.parametrize(
@@ -754,6 +1056,11 @@ def test_stale_cancel_approval_opens_fresh_fee_review(page, reason):
             window.apiFetch = async (path, options = {}) => {
                 const url = String(path);
                 window.__feeCalls.push({path: url, body: options.body || null});
+                if (url.includes('/offers/refresh_abort/preview')) {
+                    return new Response(JSON.stringify({success: true,
+                        stage: 'no_exact_candidate', candidate: null, abort: null,
+                        safety: {state: 'resolved', allowed: true}}), {status: 200});
+                }
                 if (url.includes('/offers/cancel_all/status')) {
                     return new Response(JSON.stringify({
                         success: true, running: false, complete: false,

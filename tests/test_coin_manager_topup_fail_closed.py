@@ -94,6 +94,14 @@ class CoinManagerTopupFailClosedTests(unittest.TestCase):
         # than Task 9 coin authority.  Grant the pre-effect authority check
         # explicitly; denial/race behavior is covered by the closure suite.
         self._wallet_effect_authority = ExitStack()
+        # These cases predate reviewed Follow runs. Supply the absence of an
+        # active coordinator rather than querying an uninitialized test DB.
+        self._wallet_effect_authority.enter_context(
+            patch(
+                "follow_run_coordinator.FollowRunCoordinator.read_state",
+                return_value=None,
+            )
+        )
         self._wallet_effect_authority.enter_context(
             patch.object(
                 coin_manager,
@@ -243,6 +251,48 @@ class CoinManagerTopupFailClosedTests(unittest.TestCase):
             coin_manager.CoinManager, "_resolve_fingerprint", return_value="123456789"
         ):
             return coin_manager.CoinManager()
+
+    def test_auto_runtime_topup_requires_positive_estimate_or_saved_fallback(self):
+        manager = coin_manager.CoinManager.__new__(coin_manager.CoinManager)
+        with (
+            patch.object(coin_manager, "get_transaction_fee_mode", return_value="auto"),
+            patch("tx_fees.get_transaction_fee_mode", return_value="auto"),
+            patch(
+                "tx_fees.get_suggested_transaction_fee",
+                return_value={"available": False},
+            ),
+            patch("tx_fees.get_manual_transaction_fee_mojos", return_value=0),
+        ):
+            with self.assertRaisesRegex(ValueError, "AUTO_TRANSACTION_FEE_UNAVAILABLE"):
+                manager._tx_fee_mojos()
+        with (
+            patch.object(coin_manager, "get_transaction_fee_mode", return_value="auto"),
+            patch.object(
+                coin_manager,
+                "get_effective_transaction_fee_mojos",
+                return_value=13_079_100,
+            ),
+        ):
+            self.assertEqual(manager._tx_fee_mojos(), 13_079_100)
+        with (
+            patch.object(coin_manager, "get_transaction_fee_mode", return_value="auto"),
+            patch("tx_fees.get_transaction_fee_mode", return_value="auto"),
+            patch(
+                "tx_fees.get_suggested_transaction_fee",
+                return_value={"available": True, "fee_mojos": 6_778_914},
+            ),
+            patch("tx_fees.get_manual_transaction_fee_mojos", return_value=13_079_100),
+        ):
+            self.assertEqual(manager._tx_fee_mojos(), 6_778_914)
+        with (
+            patch.object(
+                coin_manager, "get_transaction_fee_mode", return_value="manual"
+            ),
+            patch.object(
+                coin_manager, "get_effective_transaction_fee_mojos", return_value=0
+            ),
+        ):
+            self.assertEqual(manager._tx_fee_mojos(), 0)
 
     def test_missing_fingerprint_is_startup_info_not_error(self):
         manager = coin_manager.CoinManager.__new__(coin_manager.CoinManager)

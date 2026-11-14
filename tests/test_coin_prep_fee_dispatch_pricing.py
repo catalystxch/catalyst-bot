@@ -2,11 +2,53 @@
 
 from importlib import import_module
 from datetime import datetime, timedelta, timezone
+import json
 import time
 from types import SimpleNamespace
 import sqlite3
 
 import pytest
+
+
+def test_zero_floor_organic_reserve_can_fund_approved_prep(monkeypatch):
+    """A claimed top-up leftover stays eligible after exact fee pricing."""
+    import coin_prep_fee_dispatch as dispatch
+    from coin_prep_batch_plan import CoinSnapshot, SelectableCoin
+
+    cat_id, fee_id = "1" * 64, "2" * 64
+    before = CoinSnapshot(
+        (
+            SelectableCoin("cat", cat_id, 100, "reserve", True, True),
+            SelectableCoin("xch", fee_id, 50),
+        )
+    )
+    claimed = CoinSnapshot(
+        (
+            SelectableCoin("cat", cat_id, 100, "protected", True, True),
+            SelectableCoin("xch", fee_id, 50, "protected", True, True),
+        )
+    )
+    monkeypatch.setattr(
+        dispatch.database, "wallet_effect_claim_is_current", lambda *a, **kw: True
+    )
+    monkeypatch.setattr(dispatch.database, "get_reserve_coins", lambda _asset: [])
+    claim = {
+        "claim_token": "claim",
+        "generation": 1,
+        "source_coin_ids_json": json.dumps([cat_id]),
+        "fee_coin_ids_json": json.dumps([fee_id]),
+    }
+    plan = SimpleNamespace(source_coin_ids=(cat_id,), fee_source_id=fee_id)
+    context = {
+        "snapshot": claimed,
+        "recipe": {"economic_plan": {"reserve_floors_mojos": {"cat": 0, "xch": 0}}},
+    }
+    dispatch._verify_current_inventory(context, before, plan, "operation", claim)
+
+    context["recipe"]["economic_plan"]["reserve_floors_mojos"]["cat"] = 1
+    with pytest.raises(ValueError, match="FEE_WALLET_CONTEXT_CHANGED"):
+        dispatch._verify_current_inventory(context, before, plan, "operation", claim)
+
 
 import database
 import fee_approval_test_utils as utils
@@ -59,21 +101,17 @@ def test_actual_unsigned_fee_can_rise_inside_approved_preparation_allowance(
     assert utils._counts()["wallet_effect_claims"] == 0
 
 
-def test_higher_fee_cannot_consume_protected_cancellation_allowance(
-    approved, monkeypatch
-):
+def test_higher_exact_fee_is_not_blocked_by_cumulative_allowance(approved, monkeypatch):
     _network_quote(approved, monkeypatch, 41)
     result = _price(approved)
-    assert result["available"] is False
-    assert result["reason"] == "FEE_BUDGET_EXCEEDED"
-    assert result["required_fee_mojos"] == 41
-    assert result["approval"]["remaining_preparation_fee_mojos"] == 40
-    assert "pricing" not in result
+    assert result["available"] is True
+    assert result["pricing"]["plan"].fee_mojos == 41
+    assert result["approval"]["unbounded"] is True
     assert result["dispatch_authorized"] is False
     assert utils._counts()["approved_fee_reservations"] == 0
 
 
-def test_existing_unknown_hold_blocks_overlapping_network_repricing(
+def test_plain_reservation_hold_requires_recovery_even_without_cumulative_cap(
     approved, monkeypatch
 ):
     account = approved["approval"]
@@ -85,20 +123,11 @@ def test_existing_unknown_hold_blocks_overlapping_network_repricing(
         fee_mojos=15,
         cancellation=False,
     )
-    service = import_module("coin_prep_fee_dispatch")
-    monkeypatch.setattr(
-        service,
-        "read_approved_prep_fee_snapshot",
-        lambda _approval_id: pytest.fail(
-            "recovery gate must run before fresh wallet inventory reads"
-        ),
-    )
     result = _price(approved)
     assert result["available"] is False
     assert result["reason"] == "FEE_EFFECT_RECOVERY_REQUIRED"
-    assert result["recovery_state"] == "held_before_submission"
+    assert result["approval"]["unbounded"] is True
     assert result["approval"]["held_fee_mojos"] == 15
-    assert result["approval"]["remaining_preparation_fee_mojos"] == 25
     assert utils._counts()["approved_fee_reservations"] == 1
 
 
@@ -119,6 +148,62 @@ def test_manual_fee_mode_cannot_bypass_unavailable_network_estimate(
     assert "pricing" not in result
     assert result["dispatch_authorized"] is False
     assert utils._counts()["coin_prep_operations"] == 0
+
+
+def test_unavailable_pricing_identifies_provider_failure_without_raw_details(
+    approved, monkeypatch
+):
+    monkeypatch.setattr(
+        import_module("coin_prep_fee_pricing"),
+        "quote_fee",
+        lambda *_args, **_kwargs: {
+            "available": False,
+            "source": "coinset",
+            "reason": "fee_provider_rate_limited",
+            "observed_at": 1000,
+            "raw": "private provider response",
+        },
+    )
+    result = _price(approved)
+    assert result["available"] is False
+    assert result["diagnostic_stage"] == "unsigned_pricing"
+    assert result["provider_failures"] == [
+        {
+            "source": "coinset",
+            "reason": "fee_provider_rate_limited",
+            "observed_at": 1000,
+        }
+    ]
+    assert "private provider response" not in str(result)
+    assert utils._counts()["wallet_effect_claims"] == 0
+
+
+def test_quote_expiry_after_inventory_recheck_has_distinct_diagnostic(
+    approved, monkeypatch
+):
+    service = import_module("coin_prep_fee_dispatch")
+    original = service.read_approved_prep_fee_snapshot
+    calls = 0
+
+    def slow_read(approval_id):
+        nonlocal calls
+        result = original(approval_id)
+        calls += 1
+        if calls == 2:
+            approved["now"] = 1060
+        return result
+
+    monkeypatch.setattr(service, "read_approved_prep_fee_snapshot", slow_read)
+    result = _price(approved)
+    assert result["available"] is False
+    assert result["reason"] == "FEE_ESTIMATE_UNAVAILABLE"
+    assert result["diagnostic_stage"] == "post_inventory_quote_recheck"
+    assert result["quote_timing"] == {
+        "observed_at": 1000,
+        "expires_at": 1060,
+        "checked_at": 1060,
+    }
+    assert utils._counts()["wallet_effect_claims"] == 0
 
 
 def test_configuration_changed_while_building_unsigned_bundle_cannot_be_priced(
@@ -265,6 +350,38 @@ def test_executable_cost_and_frozen_plan_connect_to_exact_journal_hold(exact_jou
     )
 
 
+def test_follow_fee_cap_holds_executed_fee_below_network_recommendation(
+    exact_journal, monkeypatch
+):
+    service = import_module("coin_prep_fee_dispatch")
+    monkeypatch.setattr(service, "_follow_prep_fee_cap", lambda *_args: 20)
+    priced = exact_journal["priced"]
+    priced["follow_fee_cap_mojos"] = 20
+    priced["pricing"]["quote"]["fee_mojos"] = 30
+
+    result = _reserve(exact_journal)
+
+    assert priced["pricing"]["quote"]["fee_mojos"] == 30
+    assert result["fee_mojos"] == 20
+    assert utils._counts()["approved_fee_reservations"] == 1
+
+
+def test_dispatch_hold_rejects_executed_fee_above_network_recommendation(
+    exact_journal,
+):
+    approval = exact_journal["approval"]
+    with pytest.raises(ValueError, match="FEE_QUOTE_INVALID"):
+        database.reserve_coin_prep_fee_for_dispatch(
+            approval_id=approval["approval_id"],
+            scope_sha256=approval["scope_sha256"],
+            plan_sha256=approval["plan_sha256"],
+            operation_id=exact_journal["operation_id"],
+            final_quote=exact_journal["priced"]["pricing"]["quote"],
+            executed_fee_mojos=30,
+        )
+    assert utils._counts()["approved_fee_reservations"] == 0
+
+
 def test_expired_quote_cannot_hold_fee_after_operation_was_prepared(exact_journal):
     exact_journal["now"] = 1060
     with pytest.raises(ValueError, match="FEE_ESTIMATE_UNAVAILABLE"):
@@ -279,7 +396,19 @@ def test_different_operation_cannot_inherit_valid_unsigned_fee(exact_journal):
     assert utils._counts()["approved_fee_reservations"] == 0
 
 
-def test_new_competing_hold_is_counted_atomically_at_final_boundary(exact_journal):
+def test_different_attempt_cannot_inherit_prepared_journal_fee(exact_journal):
+    boundary = import_module("coin_prep_fee_dispatch").reserve_approved_prep_dispatch
+    with pytest.raises(ValueError, match="FEE_DISPATCH_PLAN_MISMATCH"):
+        boundary(
+            approval_id=exact_journal["approval"]["approval_id"],
+            operation_id=exact_journal["operation_id"],
+            priced_batch=exact_journal["priced"],
+            attempt_id="1" * 32,
+        )
+    assert utils._counts()["approved_fee_reservations"] == 0
+
+
+def test_new_plain_ledger_hold_does_not_create_a_fee_cap(exact_journal):
     account = exact_journal["approval"]
     database.reserve_approved_fee(
         approval_id=account["approval_id"],
@@ -289,9 +418,9 @@ def test_new_competing_hold_is_counted_atomically_at_final_boundary(exact_journa
         fee_mojos=25,
         cancellation=False,
     )
-    with pytest.raises(ValueError, match="FEE_BUDGET_EXCEEDED"):
-        _reserve(exact_journal)
-    assert database.get_fee_approval(account["approval_id"])["held_fee_mojos"] == 25
+    _reserve(exact_journal)
+    assert database.get_fee_approval(account["approval_id"])["held_fee_mojos"] == 45
+    assert utils._counts()["approved_fee_reservations"] == 2
 
 
 def test_fee_hold_retrieval_never_authorizes_operation_replay(exact_journal):
@@ -393,4 +522,61 @@ def test_new_reserve_designation_is_checked_inside_atomic_hold(
     )
     with pytest.raises(ValueError, match="FEE_EFFECT_NOT_DISPATCHABLE"):
         _reserve(exact_journal)
+    assert utils._counts()["approved_fee_reservations"] == 0
+
+
+@pytest.mark.parametrize(
+    "refreshed_fee, expected",
+    [(20, True), (21, False), (None, False), ("exception", False), ("short", False)],
+)
+def test_slow_inventory_read_refreshes_exact_quote_without_resizing_plan(
+    approved, monkeypatch, refreshed_fee, expected
+):
+    service = import_module("coin_prep_fee_dispatch")
+    original = service.read_approved_prep_fee_snapshot
+    calls = 0
+
+    def slow_read(approval_id):
+        nonlocal calls
+        result = original(approval_id)
+        calls += 1
+        if calls == 2:
+            approved["now"] = 1051
+        return result
+
+    def fresh_quote(cost, target_seconds, *, force_refresh=False):
+        assert force_refresh is True
+        if refreshed_fee is None:
+            return {"available": False}
+        if refreshed_fee == "exception":
+            raise TimeoutError("private transport details")
+        if refreshed_fee == "short":
+            return {
+                "available": True,
+                "source": "coinset",
+                "cost": cost,
+                "target_seconds": target_seconds,
+                "fee_mojos": 20,
+                "observed_at": 1001,
+                "expires_at": 1061,
+            }
+        return {
+            "available": True,
+            "source": "coinset",
+            "cost": cost,
+            "target_seconds": target_seconds,
+            "fee_mojos": refreshed_fee,
+            "observed_at": 1051,
+            "expires_at": 1111,
+        }
+
+    monkeypatch.setattr(service, "read_approved_prep_fee_snapshot", slow_read)
+    monkeypatch.setattr(import_module("fee_estimation"), "quote_fee", fresh_quote)
+    result = _price(approved)
+    assert result["available"] is expected
+    if expected:
+        assert result["pricing"]["quote"]["observed_at"] == 1051
+        assert result["pricing"]["plan"].fee_mojos == 20
+        assert result["approval"]["remaining_preparation_fee_mojos"] == 40
+    assert utils._counts()["wallet_effect_claims"] == 0
     assert utils._counts()["approved_fee_reservations"] == 0

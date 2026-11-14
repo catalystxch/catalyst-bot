@@ -11,7 +11,7 @@ from __future__ import annotations
 from flask import Blueprint, jsonify, request
 
 import api_server
-from database import log_event
+from database import get_open_offers, log_event
 
 
 bp = Blueprint("session", __name__)
@@ -19,19 +19,29 @@ bp = Blueprint("session", __name__)
 
 @bp.route("/api/session/fresh-start", methods=["POST"])
 def api_session_fresh_start():
-    """Begin a brand new run without carrying forward old session state."""
+    """Begin a new run while retaining trading history and proof records."""
     try:
+        open_offers = get_open_offers()
+        if open_offers:
+            return jsonify(
+                {
+                    "success": False,
+                    "reason": "OPEN_OFFERS_REQUIRE_CANCELLATION",
+                    "open_offer_count": len(open_offers),
+                }
+            ), 409
         payload = api_server._reset_fresh_run_session(
             clear_coins=False,
             clear_price_history=False,
             clear_inventory=False,
             cancel_open_offers=False,
+            preserve_history=True,
             reason="session_fresh_start",
         )
         if not payload["success"]:
             return jsonify(api_server._serialize_dict(payload)), 409
         # Persist the choice so check-resume returns can_resume=False on the
-        # next page load, even though the old live offers are still in Sage.
+        # next page load after all locally known offers have been cancelled.
         # Cleared automatically when the bot starts a new run.
         api_server._fresh_start_set()
         return jsonify(

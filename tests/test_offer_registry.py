@@ -1142,6 +1142,78 @@ def test_parent_retirement_requires_visible_child_but_proven_fill_does_not(outco
     assert fill.allowed is True
 
 
+def test_fenced_refresh_abort_allows_only_exact_proven_parent_cancellation():
+    """A cleanup fence may record chain truth without inventing child visibility."""
+
+    from offer_registry import RefreshAbortAuthority
+
+    parent = record(child_intent_id="intent-child", state=RegistryState.VISIBLE)
+    child = record(
+        intent_id="intent-child",
+        state=RegistryState.CREATED,
+        parent_intent_id=parent.intent_id,
+        generation=2,
+        trade_id="1" * 64,
+        offer_hash="2" * 64,
+    )
+    snapshot = RegistrySnapshot((parent, child))
+    proof = evidence(
+        outcome=TerminalOutcome.CANCELLED,
+        source=EvidenceSource.EXACT_COIN_SPEND,
+    )
+    authority = RefreshAbortAuthority(
+        abort_id="a" * 64,
+        parent_intent_id=parent.intent_id,
+        child_intent_id=child.intent_id,
+        wallet_fingerprint_hash=WALLET,
+        network=NETWORK,
+    )
+    assert (
+        authorize_transition(
+            snapshot,
+            reference(),
+            RegistryState.TERMINAL,
+            WALLET,
+            NETWORK,
+            evidence=proof,
+        ).code
+        is AuthorizationCode.REPLACEMENT_CHILD_NOT_VISIBLE
+    )
+    assert authorize_transition(
+        snapshot,
+        reference(),
+        RegistryState.TERMINAL,
+        WALLET,
+        NETWORK,
+        evidence=proof,
+        refresh_abort=authority,
+    ).allowed
+    assert (
+        authorize_transition(
+            snapshot,
+            reference(),
+            RegistryState.TERMINAL,
+            WALLET,
+            NETWORK,
+            evidence=proof,
+            refresh_abort=replace(authority, child_intent_id="wrong"),
+        ).code
+        is AuthorizationCode.INVALID_INPUT
+    )
+    assert (
+        authorize_transition(
+            snapshot,
+            reference(),
+            RegistryState.TERMINAL,
+            WALLET,
+            NETWORK,
+            evidence=evidence(outcome=TerminalOutcome.EXPIRED),
+            refresh_abort=authority,
+        ).code
+        is AuthorizationCode.INVALID_INPUT
+    )
+
+
 def test_terminal_transition_requires_exact_authoritative_proof():
     """Catches absence/status guesses becoming terminal registry truth."""
 

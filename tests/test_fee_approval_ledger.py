@@ -43,6 +43,31 @@ def test_observed_relay_fee_cannot_consume_cancellation_reserve(ledger):
     assert ledger.get_fee_approval(approval["approval_id"])["committed_fee_mojos"] == 0
 
 
+def test_unbounded_approval_keeps_exact_reservations_without_cumulative_cap(ledger):
+    approval = ledger.create_fee_approval(
+        scope_sha256="a" * 64,
+        plan_sha256="b" * 64,
+        total_fee_mojos=100,
+        cancellation_reserve_mojos=20,
+        unbounded=True,
+    )
+    ledger.reserve_approved_fee(
+        approval_id=approval["approval_id"],
+        scope_sha256="a" * 64,
+        plan_sha256="b" * 64,
+        operation_id="1" * 64,
+        fee_mojos=101,
+        cancellation=False,
+    )
+    state = ledger.get_fee_approval(approval["approval_id"])
+    assert state["held_fee_mojos"] == 101
+    assert state["unbounded"] is True
+    assert state["remaining_fee_mojos"] == 0
+    ledger.close_connection()
+    ledger.init_database()
+    assert ledger.get_fee_approval(approval["approval_id"])["unbounded"] is True
+
+
 def test_cap_increase_counts_prior_pending_fees(ledger):
     first = _approval(ledger, total=100_000_000_000, cancellation=20_000_000_000)
     ledger.reserve_approved_fee(
@@ -323,6 +348,26 @@ def test_exact_pr218_schema_upgrades_without_losing_pending_fee(ledger):
     assert (
         ledger.get_fee_approval(approval["approval_id"])["committed_fee_mojos"] == 123
     )
+    wallet_guard = (
+        ledger.get_connection()
+        .execute(
+            "SELECT sql FROM sqlite_master WHERE type='trigger' "
+            "AND name='wallet_effect_claim_resolutions_guard'"
+        )
+        .fetchone()
+    )
+    assert wallet_guard is not None
+    assert "approved_fee_reservations" in wallet_guard[0]
+    ceiling_guard = (
+        ledger.get_connection()
+        .execute(
+            "SELECT sql FROM sqlite_master WHERE type='trigger' "
+            "AND name='follow_fee_ceiling_revisions_binding_guard'"
+        )
+        .fetchone()
+    )
+    assert ceiling_guard is not None
+    assert "fee_approvals" in ceiling_guard[0]
     with pytest.raises(sqlite3.IntegrityError):
         ledger.get_connection().execute("DELETE FROM approved_fee_reservations")
     ledger.get_connection().rollback()

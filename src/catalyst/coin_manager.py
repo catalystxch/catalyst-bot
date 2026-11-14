@@ -202,6 +202,7 @@ def _run_claimed_wallet_effect(
     fee_mojos: int = 0,
     fee_coin_ids: Optional[List[str]] = None,
     _prep_contract: Optional[dict] = None,
+    _on_prepared=None,
 ):
     """Linearize one exact durable coin claim before adapter dispatch."""
 
@@ -318,6 +319,8 @@ def _run_claimed_wallet_effect(
                 effect_claim_generation=claim["generation"],
             )
             prepared_operation = dict(prepared["operation"])
+            if _on_prepared is not None:
+                _on_prepared(prepared_operation["operation_id"])
         except Exception as exc:
             retain_wallet_effect_claim_for_reconciliation(
                 claim["claim_token"],
@@ -457,6 +460,7 @@ def consume_fast_reconcile() -> bool:
 from tx_fees import (
     fee_pool_enabled,
     get_effective_transaction_fee_mojos,
+    get_transaction_fee_mode,
     get_fee_coin_size_mojos,
     get_fee_coin_size_xch,
     get_fee_pool_count,
@@ -725,6 +729,7 @@ class FeeCoinPool:
         self._available: list = []  # [(coin_id, amount_mojos), ...]
         self._reserved: set = set()  # coin IDs handed out this cycle
         self._reservation_tickets: dict[str, int] = {}
+        self._external_recovery_ids: set[str] = set()
         self._next_reservation_ticket = 0
         self._lock = threading.Lock()
 
@@ -736,6 +741,7 @@ class FeeCoinPool:
             self._available = []
             self._reserved = set()
             self._reservation_tickets = {}
+            self._external_recovery_ids = set()
             for rec in fee_coin_records:
                 cid = _coin_id_from_record(rec)
                 if cid:
@@ -794,6 +800,30 @@ class FeeCoinPool:
             self._reservation_tickets[coin_id] = ticket
             return coin_id, amount, ticket
 
+    def reserve_external_recovery_with_ticket(
+        self, coin_id: str, amount_mojos: int
+    ) -> tuple[str, int, int] | None:
+        """Reserve one separately verified recovery input without exposing it to normal offers."""
+        if (
+            type(coin_id) is not str
+            or len(coin_id) != 64
+            or any(ch not in "0123456789abcdef" for ch in coin_id)
+            or type(amount_mojos) is not int
+            or amount_mojos <= 0
+        ):
+            return None
+        with self._lock:
+            if coin_id in self._reserved or any(
+                cid == coin_id for cid, _ in self._available
+            ):
+                return None
+            self._next_reservation_ticket += 1
+            ticket = self._next_reservation_ticket
+            self._reserved.add(coin_id)
+            self._reservation_tickets[coin_id] = ticket
+            self._external_recovery_ids.add(coin_id)
+            return coin_id, amount_mojos, ticket
+
     def release_ticket(self, coin_id: str, ticket: int) -> bool:
         """Release only the same in-memory reservation, never a newer one."""
         with self._lock:
@@ -801,6 +831,7 @@ class FeeCoinPool:
                 return False
             del self._reservation_tickets[coin_id]
             self._reserved.discard(coin_id)
+            self._external_recovery_ids.discard(coin_id)
             return True
 
     # ---- introspection ----
@@ -1634,8 +1665,9 @@ def get_tier_sizes_mojos_from_cfg(
         max_sell_offers = int(getattr(cfg, "MAX_ACTIVE_SELL_OFFERS", 0) or 0)
         if max_sell_offers <= 0:
             max_sell_offers = sum(sell_tier_counts.values())
+        # Match the per-side half spread used to create live offers.
         spread_fraction = Decimal(str(getattr(cfg, "SPREAD_BPS", 0) or 0)) / Decimal(
-            "10000"
+            "20000"
         )
         min_edge_bps = Decimal(str(getattr(cfg, "MIN_EDGE_BPS", 0) or 0))
         ladder_summary = summarize_sell_ladder_cat(
@@ -2152,6 +2184,8 @@ class CoinManager:
         self._prep_running: bool = False
         self._topup_running: bool = False
         self._topup_thread: Optional[threading.Thread] = None
+        self._topup_follow_fee_binding: Optional[dict] = None
+        self._active_runtime_topup_prep_id: Optional[str] = None
 
         # F71: Coin reservation registry (see coin_reservations.py).
         # Short-lived reservations prevent trade-create and topup-reshape
@@ -2272,12 +2306,12 @@ class CoinManager:
         for pending cancel transactions.
 
         Much lighter than a full update_coin_counts() — one RPC call,
-        filtered to fee-sized coins only.
+        restricted to durable fee-reserve coins. When the configured fee tier
+        is disabled, previously prepared reserves remain usable for cancelling
+        outstanding offers.
         """
         try:
             fee_size = get_fee_coin_size_mojos()
-            if fee_size <= 0:
-                return
             result = get_exact_spendable_coins_rpc(WALLET_ID_XCH)
             if not result or not result.get("success"):
                 return  # can't refresh — keep existing pool
@@ -2299,7 +2333,7 @@ class CoinManager:
             fee_records = []
             for record in records:
                 amount = int((record.get("coin") or {}).get("amount", 0))
-                if not (low <= amount <= high):
+                if amount <= 0 or (fee_size > 0 and not (low <= amount <= high)):
                     continue
                 enriched = dict(record)
                 enriched["_catalyst_policy_purpose"] = purpose_by_coin_id.get(
@@ -2430,7 +2464,86 @@ class CoinManager:
         return bool(getattr(cfg, "ENABLE_COIN_PREP", False)) and fee_pool_enabled()
 
     def _tx_fee_mojos(self) -> int:
-        return get_effective_transaction_fee_mojos()
+        fee_mojos = get_effective_transaction_fee_mojos()
+        if get_transaction_fee_mode() in {"auto", "node", "suggested"}:
+            if fee_mojos <= 0:
+                raise ValueError("AUTO_TRANSACTION_FEE_UNAVAILABLE")
+        cap = self._verified_topup_follow_fee_cap()
+        if cap is not None and fee_mojos > cap:
+            log_event(
+                "warning",
+                "follow_topup_fee_cap_below_recommendation",
+                "Runtime coin top-up is being attempted at the approved per-transaction fee cap; raise the reviewed maximum if the wallet rejects this fee.",
+                data={
+                    "code": "FOLLOW_FEE_RECOMMENDATION_ABOVE_POLICY_CAP",
+                    "run_id": (
+                        getattr(self, "_topup_follow_fee_binding", None) or {}
+                    ).get("run_id"),
+                    "recommended_fee_mojos": fee_mojos,
+                    "approved_maximum_fee_mojos": cap,
+                },
+            )
+            fee_mojos = cap
+        return fee_mojos
+
+    def _verified_topup_follow_fee_cap(self) -> Optional[int]:
+        """Verify a supplied top-up binding against the current coordinator state."""
+        try:
+            from follow_run_coordinator import FollowRunCoordinator
+
+            reader = FollowRunCoordinator()
+            state_reader = getattr(reader, "read_state", None)
+            state = state_reader() if callable(state_reader) else reader.get_state()
+        except Exception as exc:
+            raise ValueError("FOLLOW_TOPUP_FEE_AUTHORITY_UNAVAILABLE") from exc
+        if state is None or (type(state) is dict and state.get("state") == "stopped"):
+            return None
+        if type(state) is not dict or state.get("state") not in {
+            "start_pending",
+            "running",
+        }:
+            return None
+
+        binding = getattr(self, "_topup_follow_fee_binding", None)
+        if type(binding) is not dict:
+            raise ValueError("FOLLOW_TOPUP_FEE_BINDING_REQUIRED")
+        try:
+            import database
+            from confidence_override import current_configuration_digest, current_scope
+
+            policy = database.get_active_follow_run_policy()
+            config_digest = current_configuration_digest()
+            scope = current_scope()
+            identity = database.get_follow_run_identity(state.get("run_id"))
+        except Exception as exc:
+            raise ValueError("FOLLOW_TOPUP_FEE_AUTHORITY_UNAVAILABLE") from exc
+        if (
+            policy is None
+            or state.get("run_id") != binding.get("run_id")
+            or state.get("policy_digest") != binding.get("policy_digest")
+            or policy.digest != binding.get("policy_digest")
+            or state.get("configuration_sha256") != binding.get("configuration_sha256")
+            or state.get("configuration_sha256") != config_digest
+            or binding.get("identity") != identity
+            or type(scope) is not dict
+            or scope.get("follow_run_id") != state.get("run_id")
+            or scope.get("configuration_sha256") != config_digest
+            or scope.get("identity") != identity
+            or identity.get("network") != policy.network
+            or identity.get("asset_id") != policy.asset_id
+            or str(identity.get("wallet_fingerprint")) != policy.wallet_fingerprint
+        ):
+            raise ValueError("FOLLOW_TOPUP_FEE_AUTHORITY_MISMATCH")
+        cap = policy.maximum_fee_mojos_per_tx
+        if state.get("state") == "running":
+            from follow_run_fee_cap_grant import get_follow_run_fee_cap_grant
+
+            grant = get_follow_run_fee_cap_grant(run_id=state["run_id"])
+            if grant is not None:
+                cap = grant["maximum_fee_mojos_per_tx"]
+        if type(cap) is not int or cap <= 0:
+            raise ValueError("FOLLOW_TOPUP_FEE_CAP_INVALID")
+        return cap
 
     def _wallet_rpc_failed(self, rpc_result) -> bool:
         return (
@@ -5414,6 +5527,12 @@ class CoinManager:
         # Don't re-scan during active topup/prep (would interfere)
         if not (self._prep_running or self._topup_running):
             self.update_coin_counts()
+            if reason == "startup":
+                # The normal tier scan can omit durable fee_reserve outputs when
+                # new fee-coin preparation is disabled. Restore the exact
+                # spendable reserves before startup market safety may need to
+                # cancel an existing offer.
+                self.refresh_fee_pool_from_wallet()
 
         # --- Coin change detection ---
         self._detect_coin_changes(reason)
@@ -6268,6 +6387,7 @@ class CoinManager:
         active_buy_count: int = 0,
         active_sell_count: int = 0,
         is_drip: Optional[bool] = None,
+        follow_fee_binding: Optional[dict] = None,
     ) -> bool:
         """Start a live coin top-up in a background thread.
 
@@ -6300,7 +6420,7 @@ class CoinManager:
 
         self._topup_thread = threading.Thread(
             target=self._topup_worker,
-            args=(active_buy_count, active_sell_count),
+            args=(active_buy_count, active_sell_count, follow_fee_binding),
             daemon=True,
             name="coin-topup",
         )
@@ -6468,7 +6588,12 @@ class CoinManager:
             )
         return deficits
 
-    def _topup_worker(self, active_buy: int, active_sell: int):
+    def _topup_worker(
+        self,
+        active_buy: int,
+        active_sell: int,
+        follow_fee_binding: Optional[dict] = None,
+    ):
         """Smart topup worker — classifies coins and decides strategy.
 
         Decision tree:
@@ -6477,6 +6602,7 @@ class CoinManager:
           3. Nothing available → back off
         """
         try:
+            self._topup_follow_fee_binding = follow_fee_binding
             self._topup_abort_logged = False
             if self._topup_should_stop():
                 log_event(
@@ -7714,6 +7840,8 @@ class CoinManager:
                 with self._lock:
                     self._topup_running = False
                     self._topup_stop_requested = False
+                    self._active_runtime_topup_prep_id = None
+                    self._topup_follow_fee_binding = None
                     if self._topup_thread is threading.current_thread():
                         self._topup_thread = None
             except Exception as _flag_err:
@@ -9574,6 +9702,22 @@ class CoinManager:
                         data={"coin_id": output["coin_id"][:18]},
                     )
                     return False
+            pending_status = mutation_gate.read_only_status()
+            release_args = None
+            if (
+                getattr(self, "_active_runtime_topup_prep_id", None)
+                == operation["operation_id"]
+                and pending_status.reason_code == "COIN_PREP_EFFECT_UNKNOWN"
+                and set(pending_status.blocking_operation_ids)
+                == {
+                    operation["operation_id"],
+                    f"wallet-effect:{operation['effect_claim_token']}",
+                }
+            ):
+                release_args = (
+                    pending_status.latch_generation,
+                    list(pending_status.blocking_operation_ids),
+                )
             record_coin_prep_operation_outcome(
                 operation["operation_id"],
                 outcome="CONFIRMED",
@@ -9587,6 +9731,16 @@ class CoinManager:
                     "expected_wallet_identity": expected_identity,
                 },
             )
+            if release_args is not None:
+                released = mutation_gate.release_resolved(*release_args)
+                if released.get("released") is not True:
+                    log_event(
+                        "warning",
+                        "runtime_topup_gate_release_pending",
+                        "Confirmed top-up could not release its exact mutation fence",
+                        data={"reason": released.get("reason")},
+                    )
+                    return False
             return True
         except Exception as exc:
             log_event(
@@ -9597,6 +9751,129 @@ class CoinManager:
                 data={"error": str(exc)[:160]},
             )
             return False
+
+    def _price_sage_xch_fee_reserve_split(
+        self,
+        *,
+        pre_owned_map: Dict[str, int],
+        source_coin_id: str,
+        num_to_create: int,
+        trading_size_mojos: int,
+        address: str,
+    ) -> dict:
+        """Price and seal the exact unsigned fee-reserve split before claiming it."""
+
+        from coin_prep_fee_pricing import is_current_fee_quote
+        from fee_estimation import quote_fee
+        from wallet import build_transaction_rpc, inspect_unsigned_transaction_effect
+
+        target_seconds = int(getattr(cfg, "TRANSACTION_FEE_TARGET_SECS", 300) or 300)
+        if not 1 <= target_seconds <= 86_400:
+            return {"available": False, "reason": "FEE_PRICING_CONSTRAINTS_INVALID"}
+        fee_mojos = 1  # Unsigned-only seed; the network quote sets the submitted fee.
+        for _round in range(4):
+            prep_contract = self._build_runtime_topup_prep_contract(
+                pre_owned_map=pre_owned_map,
+                source_coin_id=source_coin_id,
+                num_to_create=num_to_create,
+                trading_size_mojos=trading_size_mojos,
+                fee_mojos=fee_mojos,
+                is_cat=False,
+                output_purpose="fee_reserve",
+            )
+            if prep_contract is None:
+                return {"available": False, "reason": "FEE_SOURCE_CAPACITY_UNAVAILABLE"}
+            expected_outputs = prep_contract["target_contract"]["outputs"]
+            contract = {
+                "source_asset": "xch",
+                "source_coin_ids": [source_coin_id],
+                "fee_coin_ids": [],
+                "cat_asset_id": None,
+                "fee_mojos": fee_mojos,
+                "outputs": [
+                    {
+                        "asset": "xch",
+                        "address": address,
+                        "amount_mojos": output["amount_mojos"],
+                        "purpose": output["purpose"],
+                        "ordinal": output["output_index"],
+                    }
+                    for output in expected_outputs
+                ],
+            }
+            actions = [
+                {
+                    "type": "send",
+                    "id": {"type": "xch"},
+                    "address": address,
+                    "amount": str(output["amount_mojos"]),
+                    "memos": [],
+                }
+                for output in expected_outputs
+            ]
+            actions.append({"type": "fee", "amount": str(fee_mojos)})
+            try:
+                unsigned = build_transaction_rpc([source_coin_id], actions)
+                validated = inspect_unsigned_transaction_effect(unsigned, contract)
+            except Exception:
+                return {"available": False, "reason": "FEE_UNSIGNED_COST_UNAVAILABLE"}
+            cost = (
+                validated.get("_catalyst_exact_unsigned_cost")
+                if type(validated) is dict
+                and validated.get("_catalyst_executable_effect_bound") is True
+                else None
+            )
+            if type(cost) is not int or cost <= 0:
+                return {"available": False, "reason": "FEE_UNSIGNED_COST_UNAVAILABLE"}
+            try:
+                quote = quote_fee(
+                    cost, target_seconds=target_seconds, force_refresh=True
+                )
+            except Exception:
+                return {"available": False, "reason": "FEE_ESTIMATE_UNAVAILABLE"}
+            if not is_current_fee_quote(quote, cost, target_seconds):
+                return {"available": False, "reason": "FEE_ESTIMATE_UNAVAILABLE"}
+            quoted_fee = quote["fee_mojos"]
+            if type(quoted_fee) is not int or quoted_fee <= 0:
+                return {
+                    "available": False,
+                    "reason": "AUTO_TRANSACTION_FEE_UNAVAILABLE",
+                }
+            try:
+                fee_cap = self._verified_topup_follow_fee_cap()
+            except ValueError as exc:
+                return {"available": False, "reason": str(exc)}
+            selected_fee = (
+                min(quoted_fee, fee_cap) if fee_cap is not None else quoted_fee
+            )
+            if selected_fee == fee_mojos:
+                if fee_cap is not None and quoted_fee > fee_cap:
+                    log_event(
+                        "warning",
+                        "follow_topup_fee_cap_below_recommendation",
+                        "Runtime fee-reserve top-up is being attempted at the approved per-transaction fee cap; raise the reviewed maximum if the wallet rejects this fee.",
+                        data={
+                            "code": "FOLLOW_FEE_RECOMMENDATION_ABOVE_POLICY_CAP",
+                            "run_id": (
+                                getattr(self, "_topup_follow_fee_binding", None) or {}
+                            ).get("run_id"),
+                            "recommended_fee_mojos": quoted_fee,
+                            "approved_maximum_fee_mojos": fee_cap,
+                        },
+                    )
+                return {
+                    "available": True,
+                    "fee_mojos": fee_mojos,
+                    "fee_cap_mojos": fee_cap,
+                    "fee_cap_warning": (
+                        quoted_fee > fee_cap if fee_cap is not None else False
+                    ),
+                    "prep_contract": prep_contract,
+                    "validated_unsigned": validated,
+                    "quote": quote,
+                }
+            fee_mojos = selected_fee
+        return {"available": False, "reason": "FEE_PRICING_NOT_CONVERGED"}
 
     def _sage_one_step_split(
         self,
@@ -9623,7 +9900,7 @@ class CoinManager:
         _two_step_split step 2 — poll for num_to_create new owned coins that
         match trading_size_mojos.
         """
-        from wallet import sage_topup_split
+        from wallet import sage_topup_split, submit_built_transaction_rpc
 
         tag = f"topup_{name.lower()}"
 
@@ -9832,22 +10109,44 @@ class CoinManager:
             )
             return _TOPUP_PENDING
 
-        fee_mojos = self._tx_fee_mojos()
-        prep_contract = self._build_runtime_topup_prep_contract(
-            pre_owned_map=pre_owned_map,
-            source_coin_id=source_coin_id,
-            num_to_create=num_to_create,
-            trading_size_mojos=trading_size_mojos,
-            fee_mojos=fee_mojos,
-            is_cat=is_cat,
-            output_purpose=(
-                "fee_reserve"
-                if not is_cat
-                and str(name or "").strip().lower().rsplit("-", 1)[-1]
-                == get_fee_tier_name()
-                else "replacement"
-            ),
+        output_purpose = (
+            "fee_reserve"
+            if not is_cat
+            and str(name or "").strip().lower().rsplit("-", 1)[-1]
+            == get_fee_tier_name()
+            else "replacement"
         )
+        priced_split = None
+        if output_purpose == "fee_reserve":
+            priced_split = self._price_sage_xch_fee_reserve_split(
+                pre_owned_map=pre_owned_map,
+                source_coin_id=source_coin_id,
+                num_to_create=num_to_create,
+                trading_size_mojos=trading_size_mojos,
+                address=address,
+            )
+            if priced_split.get("available") is not True:
+                log_event(
+                    "warning",
+                    f"{tag}_fee_quote_unavailable",
+                    "Runtime fee-reserve split paused before wallet dispatch because "
+                    "its exact unsigned cost could not be priced",
+                    data={"reason": priced_split.get("reason")},
+                )
+                return False
+            fee_mojos = priced_split["fee_mojos"]
+            prep_contract = priced_split["prep_contract"]
+        else:
+            fee_mojos = self._tx_fee_mojos()
+            prep_contract = self._build_runtime_topup_prep_contract(
+                pre_owned_map=pre_owned_map,
+                source_coin_id=source_coin_id,
+                num_to_create=num_to_create,
+                trading_size_mojos=trading_size_mojos,
+                fee_mojos=fee_mojos,
+                is_cat=is_cat,
+                output_purpose=output_purpose,
+            )
         if prep_contract is None:
             log_event(
                 "warning",
@@ -9896,9 +10195,35 @@ class CoinManager:
                 if fee_mojos > 0 and not is_cat
                 else []
             )
-            effect_result = _run_claimed_wallet_effect(
-                "coin_manager.topup_split_sage",
-                lambda: sage_topup_split(
+            if priced_split is not None:
+                from coin_prep_fee_pricing import is_current_fee_quote
+
+                unsigned_cost = priced_split["validated_unsigned"].get(
+                    "_catalyst_exact_unsigned_cost"
+                )
+                quote = priced_split.get("quote")
+                try:
+                    quote_ready = is_current_fee_quote(
+                        quote,
+                        unsigned_cost,
+                        int(getattr(cfg, "TRANSACTION_FEE_TARGET_SECS", 300) or 300),
+                        now=int(time.time()) + 10,
+                    )
+                except Exception:
+                    quote_ready = False
+                if not quote_ready:
+                    log_event(
+                        "warning",
+                        f"{tag}_fee_quote_expired",
+                        "Runtime fee-reserve split paused before wallet claim because "
+                        "its cost-specific network quote is stale",
+                    )
+                    return False
+                effect_callback = lambda: submit_built_transaction_rpc(
+                    priced_split["validated_unsigned"]
+                )
+            else:
+                effect_callback = lambda: sage_topup_split(
                     source_coin_id=source_coin_id,
                     num_coins=num_to_create,
                     trading_size_mojos=trading_size_mojos,
@@ -9906,11 +10231,17 @@ class CoinManager:
                     fee_mojos=fee_mojos,
                     is_cat=is_cat,
                     fee_coin_id=fee_coin_id,
-                ),
+                )
+            effect_result = _run_claimed_wallet_effect(
+                "coin_manager.topup_split_sage",
+                effect_callback,
                 source_coin_ids=[source_coin_id],
                 fee_mojos=fee_mojos,
                 fee_coin_ids=fee_coin_ids,
                 _prep_contract=prep_contract,
+                _on_prepared=lambda operation_id: setattr(
+                    self, "_active_runtime_topup_prep_id", operation_id
+                ),
             )
             if effect_result is _WALLET_EFFECT_DENIED:
                 return False

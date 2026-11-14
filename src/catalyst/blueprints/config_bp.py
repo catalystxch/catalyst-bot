@@ -14,6 +14,7 @@ Named `config_bp` (not `config`) to avoid shadowing the top-level
 from __future__ import annotations
 
 import json as _json
+import math
 import sys
 from datetime import datetime, timezone, timedelta
 from decimal import Decimal
@@ -223,6 +224,7 @@ _KEY_MAP = {
     "skew_intensity": "SKEW_INTENSITY",
     "max_position_xch": "MAX_POSITION_XCH",
     "liquidity_mode": "LIQUIDITY_MODE",
+    "thin_market_enabled": "THIN_MARKET_ENABLED",
     "tier_enabled": "TIER_ENABLED",
     "buy_ladder_reversed": "BUY_LADDER_REVERSED",
     "inner_size_xch": "INNER_SIZE_XCH",
@@ -389,6 +391,19 @@ def api_config_update():
     )
 
     def _write_setting(env_key, raw_value):
+        if env_key == "THIN_MARKET_ENABLED" and str(raw_value).strip().lower() in {
+            "true",
+            "1",
+            "yes",
+            "on",
+        }:
+            from confidence_override import record_saved_thin_market_choice
+
+            try:
+                if not record_saved_thin_market_choice():
+                    return False
+            except (ValueError, TypeError, KeyError):
+                return False
         if _defer_runtime:
             writer = getattr(cfg, "update_persisted", None)
             if writer is None:
@@ -532,6 +547,43 @@ def api_config_update():
             env_key = _KEY_MAP.get(gui_key, gui_key.upper())
             if env_key in _DEXIE_ONLY_BETA_KEYS:
                 return _dexie_only_beta_response(env_key)
+    # Blank Smart Settings numeric inputs serialize as JSON null. Validate
+    # the whole payload before writing any setting or derived trade bound.
+    for gui_key, value in data.items():
+        env_key = _KEY_MAP.get(gui_key, gui_key.upper())
+        if value is None or (isinstance(value, float) and not math.isfinite(value)):
+            message = (
+                "SPREAD_BPS must be a positive integer"
+                if env_key == "SPREAD_BPS"
+                else f"{env_key} must not be empty or non-finite"
+            )
+            return jsonify(
+                {
+                    "success": False,
+                    "status": "invalid",
+                    "updated": [],
+                    "errors": [message],
+                    "warnings": None,
+                    "change_address_result": None,
+                }
+            )
+        if env_key != "SPREAD_BPS":
+            continue
+        try:
+            spread_bps = int(float(value))
+        except (ValueError, TypeError, OverflowError):
+            spread_bps = 0
+        if spread_bps <= 0:
+            return jsonify(
+                {
+                    "success": False,
+                    "status": "invalid",
+                    "updated": [],
+                    "errors": ["SPREAD_BPS must be a positive integer"],
+                    "warnings": None,
+                    "change_address_result": None,
+                }
+            )
     data = _with_coherent_trade_bounds(data, cfg)
     updated = []
     errors = []
@@ -862,6 +914,8 @@ def api_settings_validate():
             n = int(data["NUM_OFFERS"])
             if n < 1:
                 errors.append("NUM_OFFERS must be at least 1")
+            if n > 2**63 - 1:
+                errors.append("NUM_OFFERS must fit a signed 64-bit integer")
             if n > 50:
                 warnings.append("More than 50 offers per side requires many coins")
         except ValueError:
@@ -1199,15 +1253,15 @@ def api_check_resume():
         else:
             from wallet import get_all_offers, classify_offers_from_list
 
-            offers = get_all_offers(include_completed=False, start=0, end=200)
-            if not offers:
+            offers = get_all_offers(include_completed=False, start=0, end=10000)
+            if type(offers) is not list:
                 return jsonify(
                     {
                         "can_resume": False,
                         "has_session": False,
                         "buy_count": 0,
                         "sell_count": 0,
-                        "reason": "no offers",
+                        "reason": "wallet_offer_query_not_fresh",
                     }
                 )
 
@@ -1334,9 +1388,62 @@ def api_check_resume():
         except Exception as e:
             print(f"[RESUME] Gap closer detection error: {e}", flush=True)
 
+        auto_resume_requested = False
+        from follow_restart_intent import (
+            read_follow_restart_intent,
+            restart_intent_matches,
+        )
+
+        restart_intent = read_follow_restart_intent()
+        automatic_resume_pending = bool(
+            type(restart_intent) is dict
+            and type(asset_id) is str
+            and restart_intent.get("identity", {}).get("asset_id") == asset_id
+        )
+        if restart_intent and type(asset_id) is str and len(asset_id) == 64:
+            try:
+                from wallet import (
+                    get_pending_transactions,
+                    get_wallet_sync_status,
+                    preflight_wallet_identity,
+                )
+                from follow_principal import reviewed_follow_start_readiness
+
+                wallet_identity = preflight_wallet_identity()
+                sync = get_wallet_sync_status()
+                pending = get_pending_transactions()
+                follow_readiness = reviewed_follow_start_readiness(
+                    cfg, resume_existing_offers=total > 0
+                )
+                scope = follow_readiness.get("scope")
+                auto_resume_requested = bool(
+                    type(wallet_identity) is dict
+                    and wallet_identity.get("success") is True
+                    and type(sync) is dict
+                    and sync.get("reachable") is True
+                    and sync.get("synced") is True
+                    and sync.get("sync_state") == "synced"
+                    and type(pending) is list
+                    and not pending
+                    and follow_readiness.get("ready") is True
+                    and type(scope) is dict
+                    and restart_intent_matches(
+                        restart_intent,
+                        run_id=follow_readiness.get("run_id"),
+                        identity=scope.get("identity"),
+                        configuration_sha256=scope.get("configuration_sha256"),
+                    )
+                    and scope["identity"].get("asset_id") == asset_id
+                )
+            except Exception:
+                # A restart hint is advisory. Missing current proof suppresses
+                # automatic resume and leaves the normal session UI available.
+                auto_resume_requested = False
         return jsonify(
             {
                 "can_resume": can_resume,
+                "auto_resume_requested": auto_resume_requested,
+                "automatic_resume_pending": automatic_resume_pending,
                 "has_session": can_resume,
                 "buy_count": len(open_buy),
                 "sell_count": len(open_sell),

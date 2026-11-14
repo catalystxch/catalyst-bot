@@ -82,6 +82,7 @@ load_dotenv()
 _LOCAL_API_TOKEN = os.environ.get("BOT_LOCAL_WRITE_TOKEN", "").strip()
 _API_LOG_POST_TIMEOUT_S = 0.15
 _API_LOG_QUEUE_MAX = 400
+_PRE_DISPATCH_QUOTE_MIN_REMAINING_SECONDS = 10
 _WORKER_DELEGATION_ENV_NAMES = (
     mutation_gate.DELEGATION_ID_ENV,
     mutation_gate.DELEGATION_TOKEN_ENV,
@@ -350,9 +351,9 @@ def get_recoverable_coin_prep_operations(*args, **kwargs):
 
 
 def get_coin_reconciliation_protected_ids(*args, **kwargs):
-    """Load durable coin fences without widening DB bootstrap coupling."""
+    """Load preparation fences while retaining the worker's patchable seam."""
 
-    from database import get_coin_reconciliation_protected_ids as repository_call
+    from database import get_coin_preparation_protected_ids as repository_call
 
     return repository_call(*args, **kwargs)
 
@@ -2040,6 +2041,14 @@ class CoinPrepWorker:
             for plan_amount, tier_name, _exp in plan_entries:
                 if slots_remaining.get((plan_amount, tier_name), 0) <= 0:
                     continue
+                # Approved fee targets fund later protected wallet operations.
+                # A cancellation-change coin cannot replace an exact fee coin.
+                if (
+                    tier_name == get_fee_tier_name()
+                    and getattr(self, "fee_approval_id", None)
+                    and coin_amount != plan_amount
+                ):
+                    continue
                 if tier_name != get_fee_tier_name() and coin_amount < plan_amount:
                     continue
                 if not _within_tolerance(coin_amount, plan_amount):
@@ -2439,13 +2448,32 @@ class CoinPrepWorker:
         target = batch_target_contract(
             plan, address, priced_batch["identity"]["asset_id"]
         )
+        from uuid import uuid4
+
+        attempt_id = uuid4().hex
         canonical = canonical_coin_prep_contract(
             operation_kind="split",
             purpose="replacement",
             source_coin_ids=list(plan.source_coin_ids),
             target_contract=target,
+            attempt_id=attempt_id,
         )
         target = canonical["target_contract"]
+        # Pricing can spend most of a short quote's lifetime in wallet/RPC
+        # reads.  Reject it before claiming any coin authority when there is
+        # too little time left to persist PREPARED and reserve its exact fee.
+        from coin_prep_fee_pricing import _now, is_current_fee_quote
+
+        quote = pricing["quote"]
+        cost = pricing["inspection"]["cost"]
+        target_seconds = priced_batch["recipe"]["economic_plan"]["target_seconds"]
+        if not is_current_fee_quote(
+            quote,
+            cost,
+            target_seconds,
+            now=_now() + _PRE_DISPATCH_QUOTE_MIN_REMAINING_SECONDS,
+        ):
+            raise ValueError("FEE_ESTIMATE_UNAVAILABLE")
         claim = claim_wallet_effect(
             operation_id=canonical["operation_id"],
             source_coin_ids=list(plan.source_coin_ids),
@@ -2466,9 +2494,11 @@ class CoinPrepWorker:
                         set(plan.source_coin_ids) | set(fee_coin_ids)
                     ),
                     "execution_mode": "direct_final_batch_v2",
+                    "attempt_id": attempt_id,
                 },
                 effect_claim_token=claim["claim_token"],
                 effect_claim_generation=claim["generation"],
+                attempt_id=attempt_id,
             )["operation"]
         except Exception as exc:
             retain_wallet_effect_claim_for_reconciliation(
@@ -2483,6 +2513,7 @@ class CoinPrepWorker:
                 approval_id=approval_id,
                 operation_id=canonical["operation_id"],
                 priced_batch=priced_batch,
+                attempt_id=attempt_id,
             )
             validated = hold["validated_unsigned"]
             recheck_approved_prep_dispatch(
@@ -2496,6 +2527,38 @@ class CoinPrepWorker:
                 claim["generation"],
                 reason_code="DIRECT_BATCH_FEE_APPROVAL_FAILED",
             )
+            # The reserve/recheck stage may fail before any output binding or
+            # adapter dispatch (for example, a quote aging out during an RPC).
+            # Keep the fence unless a new authoritative wallet view proves the
+            # exact source and fee cohort is still selectable with no pending
+            # transaction.  The database repeats every no-dispatch check in
+            # the same transaction that releases the claim.
+            try:
+                from database import (
+                    get_coin_prep_operation_for_observation,
+                    recover_coin_prep_predispatch_no_effect,
+                )
+
+                current = get_coin_prep_operation_for_observation(
+                    canonical["operation_id"]
+                )
+                observation = self._observe_recoverable_coin_prep_operation(current)
+                if (
+                    type(observation) is dict
+                    and type(observation.get("no_effect_view")) is dict
+                    and recover_coin_prep_predispatch_no_effect(
+                        canonical["operation_id"], observation["no_effect_view"]
+                    )
+                ):
+                    self.log(
+                        "Direct batch fee validation failed before dispatch; "
+                        "authoritative no-effect proof released its exact inputs"
+                    )
+            except Exception as recovery_exc:
+                self.log(
+                    "Direct batch pre-dispatch no-effect proof unavailable: "
+                    f"{recovery_exc}"
+                )
             raise
         if not wallet_effect_claim_is_current(
             claim["claim_token"],
@@ -2522,6 +2585,7 @@ class CoinPrepWorker:
                 prep_fee_context={
                     "approval_id": approval_id,
                     "quote": pricing["quote"],
+                    "executed_fee_mojos": plan.fee_mojos,
                 },
             )
         except Exception:
@@ -2678,6 +2742,20 @@ class CoinPrepWorker:
         for batch_number in range(1, MAX_PREP_BATCHES + 1):
             priced = price_approved_prep_batch(approval_id)
             if priced["available"] is not True:
+                from fee_estimation import fee_failure_diagnostics
+
+                self.log(
+                    "Approved batch pricing unavailable: "
+                    + json.dumps(
+                        {
+                            "reason": priced["reason"],
+                            "stage": priced.get("diagnostic_stage"),
+                            "provider_failures": fee_failure_diagnostics(priced),
+                            "quote_timing": priced.get("quote_timing"),
+                        },
+                        sort_keys=True,
+                    )
+                )
                 raise ValueError(priced["reason"])
             plan = priced["pricing"]["plan"]
             targets = priced["recipe"]["targets"]
@@ -2910,6 +2988,8 @@ class CoinPrepWorker:
             self.log("   DB: final sweep SKIPPED - DB not ready")
             return
 
+        from database import batch_upsert_coins
+
         self.log("\n   DB: Final designation sweep...")
 
         try:
@@ -2994,21 +3074,31 @@ class CoinPrepWorker:
             desig_ok = 0
             desig_fail = 0
 
-            for coin in coins:
-                coin_id = self._ensure_0x(coin.get("coin_id", ""))
-                amount = coin.get("amount", 0)
-                if not coin_id:
-                    continue
+            upsert_inputs = [
+                {
+                    "coin_id": self._ensure_0x(coin.get("coin_id", "")),
+                    "amount_mojos": coin.get("amount", 0),
+                    "tier": None,
+                }
+                for coin in coins
+                if coin.get("coin_id")
+            ]
+            # Keep each protection snapshot and write transaction small. A
+            # wallet-wide stream of single-row IMMEDIATE writes can starve the
+            # main process's mutation-lease heartbeat even though no one row
+            # holds the lock for long. Recheck durable protection inside each
+            # bounded batch, then give the heartbeat a chance to acquire it.
+            for start in range(0, len(upsert_inputs), 8):
+                batch = upsert_inputs[start : start + 8]
                 try:
-                    result = upsert_coin(coin_id, wallet_type, amount)
-                    if result:
-                        upsert_ok += 1
-                    else:
-                        upsert_fail += 1
-                        self.log(f"   DB: upsert returned False for {coin_id[:20]}...")
+                    count = batch_upsert_coins(batch, wallet_type)
                 except Exception as e:
-                    upsert_fail += 1
-                    self.log(f"   DB: upsert EXCEPTION: {e}")
+                    self.log(f"   DB: bounded upsert EXCEPTION: {e}")
+                    raise
+                upsert_ok += count
+                upsert_fail += len(batch) - count
+                if start + 8 < len(upsert_inputs):
+                    time.sleep(0.02)
 
             assigned_by_tier, unmatched = self._partition_coins_for_designation(
                 coins, wallet_type
@@ -3259,7 +3349,8 @@ class CoinPrepWorker:
                 )
                 if max_sell_offers <= 0:
                     max_sell_offers = sum(sell_tier_counts.values())
-            spread_fraction = _env_decimal("SPREAD_BPS", "0") / Decimal("10000")
+            # SPREAD_BPS covers both sides; sell slot distances use half.
+            spread_fraction = _env_decimal("SPREAD_BPS", "0") / Decimal("20000")
             min_edge_bps = _env_decimal("MIN_EDGE_BPS", "0")
             from coin_prep_economics import prepared_cat_sizes
 
@@ -3270,7 +3361,7 @@ class CoinPrepWorker:
                 cat_decimals=self.cat_decimals,
                 sell_counts=sell_tier_counts,
                 max_offers=max_sell_offers,
-                spread_bps=spread_fraction * Decimal("10000"),
+                spread_bps=spread_fraction * Decimal("20000"),
                 min_edge_bps=min_edge_bps,
             )
             self.log(
@@ -9667,9 +9758,29 @@ class CoinPrepWorker:
         except Exception as exc:
             self.log(f"Coin prep recovery inventory unavailable: {exc}")
             return False
+        rbf_recovery = {"operation_ids": set(), "settled": set()}
+        if any(
+            row.get("purpose") == "fee_reserve"
+            and row.get("operation_kind") == "split"
+            and row.get("outcome") == "SUBMITTED_UNKNOWN"
+            for row in operations
+        ):
+            try:
+                from coin_prep_rbf_recovery import (
+                    recover_dispatched_coin_prep_rbf_attempts_read_only,
+                )
+
+                rbf_recovery = recover_dispatched_coin_prep_rbf_attempts_read_only()
+            except Exception as exc:
+                self.log(f"Coin prep RBF recovery inventory unavailable: {exc}")
+                return False
         all_confirmed = True
         for operation in operations:
             try:
+                if operation["operation_id"] in rbf_recovery["operation_ids"]:
+                    if operation["operation_id"] not in rbf_recovery["settled"]:
+                        all_confirmed = False
+                    continue
                 source_coin_ids = json.loads(operation["source_coin_ids_json"])
                 expected_identity = json.loads(operation["wallet_identity_json"])
                 observation = observer(dict(operation))
@@ -9696,6 +9807,22 @@ class CoinPrepWorker:
                     fee_coin_ids = json.loads(
                         operation.get("effect_fee_coin_ids_json") or "[]"
                     )
+                    if (
+                        operation.get("outcome") in {"PREPARED", "SUBMITTED_UNKNOWN"}
+                        and operation.get("effect_dispatch_token") is None
+                    ):
+                        from database import recover_coin_prep_predispatch_no_effect
+
+                        if recover_coin_prep_predispatch_no_effect(
+                            operation["operation_id"], no_effect_view
+                        ):
+                            self.log(
+                                "Coin prep recovery proved the pre-dispatch effect "
+                                "had no effect; exact inputs are selectable"
+                            )
+                            continue
+                        all_confirmed = False
+                        continue
                     record_coin_prep_operation_outcome(
                         operation["operation_id"],
                         outcome="FAILED",
@@ -9835,7 +9962,13 @@ class CoinPrepWorker:
                 else self._get_sage_selectable_coin_ids_for_recovery(self.xch_wallet_id)
             )
             if (
-                operation.get("outcome") == "SUBMITTED_UNKNOWN"
+                (
+                    operation.get("outcome") == "SUBMITTED_UNKNOWN"
+                    or (
+                        operation.get("outcome") == "PREPARED"
+                        and operation.get("effect_dispatch_token") is None
+                    )
+                )
                 and type(pending) is list
                 and not pending
                 and target_selectable is not None
@@ -10434,9 +10567,9 @@ class CoinPrepWorker:
                 if xch_prepared_ok and cat_prepared_ok:
                     self.log(
                         "Existing selectable tier coins already satisfy the current "
-                        "prep target; skipping full consolidation and split."
+                        "tier target; checking the approved fee plan for remaining "
+                        "reserve or top-up outputs."
                     )
-                    return self._complete_existing_tier_preparation()
 
             self._xch_plan_already_satisfied = xch_prepared_ok
             self._cat_plan_already_satisfied = cat_prepared_ok
@@ -11677,7 +11810,8 @@ def recover_coin_prep_operations_at_startup() -> bool:
     worker.update_status = lambda *_args, **_kwargs: None
     legacy_recovered = _recover_legacy_sage_consolidation(worker)
     try:
-        if not get_recoverable_coin_prep_operations():
+        operations = get_recoverable_coin_prep_operations()
+        if not operations:
             return legacy_recovered
     except Exception as exc:
         slog(
@@ -11687,6 +11821,26 @@ def recover_coin_prep_operations_at_startup() -> bool:
             level="warning",
         )
         return False
+    if any(
+        row.get("purpose") == "fee_reserve"
+        and row.get("operation_kind") == "split"
+        and row.get("outcome") == "SUBMITTED_UNKNOWN"
+        for row in operations
+    ):
+        try:
+            from coin_prep_rbf_recovery import (
+                recover_crashed_coin_prep_rbf_sign_intents,
+            )
+
+            recover_crashed_coin_prep_rbf_sign_intents()
+        except Exception as exc:
+            slog(
+                "COIN_PREP",
+                "Startup RBF sign-only recovery remained unresolved",
+                {"error_type": type(exc).__name__},
+                level="warning",
+            )
+            return False
     try:
         return worker._recover_coin_prep_operations_read_only(
             worker._observe_recoverable_coin_prep_operation

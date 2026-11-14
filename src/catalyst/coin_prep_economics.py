@@ -54,6 +54,7 @@ def normalize_fee_prep_options(options):
         "bootstrap_campaign_id",
         "bootstrap_campaign_revision",
         "cancellation_recovery_action",
+        "follow_run_session_id",
     }
     try:
         if type(options) is not dict or set(options) - allowed:
@@ -66,6 +67,14 @@ def normalize_fee_prep_options(options):
             ),
             "target_seconds": _integer(options.get("target_seconds", 300), 1, 86_400),
         }
+        if "follow_run_session_id" in options:
+            session_id = options.get("follow_run_session_id")
+            if (
+                type(session_id) is not str
+                or re.fullmatch(r"[0-9a-f]{64}", session_id) is None
+            ):
+                raise ValueError("invalid Follow run session")
+            result["follow_run_session_id"] = session_id
         if (
             "bootstrap_campaign_id" in options
             or "bootstrap_campaign_revision" in options
@@ -142,9 +151,10 @@ def prepared_cat_sizes(
         tier: _integer(count, 0, MAX_PLAN_OUTPUTS)
         for tier, count in sell_counts.items()
     }
+    # SPREAD_BPS is the total bid/ask spread; Follow places each side at half.
     summary = summarize_sell_ladder_cat(
         mid_price=price,
-        spread_fraction=_decimal(spread_bps) / Decimal("10000"),
+        spread_fraction=_decimal(spread_bps) / Decimal("20000"),
         max_offers=max_offers,
         tier_counts=counts,
         tier_sizes_xch=sizes,

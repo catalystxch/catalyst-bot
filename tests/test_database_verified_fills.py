@@ -522,9 +522,13 @@ class DatabaseVerifiedFillsTests(unittest.TestCase):
             "fresh-run-sell", filled_at="2026-03-28T22:10:00+00:00"
         )
 
+        lifetime = database.get_stats(asset_id)
         stats = database.get_stats(asset_id, since="2026-03-28T22:07:28+00:00")
 
+        self.assertEqual(lifetime["total_fills"], 2)
+        self.assertEqual(lifetime["history_scope"], "lifetime")
         self.assertEqual(stats["total_fills"], 1)
+        self.assertEqual(stats["history_scope"], "fresh_run")
         self.assertEqual(stats["net_position"], "-200")
         self.assertEqual(stats["net_cat_flow"], "-200")
 

@@ -602,6 +602,42 @@ class TestComputeCoinId(unittest.TestCase):
 
 
 class TestPartitionCoinsForDesignation(unittest.TestCase):
+    def test_approved_fee_target_rejects_cancellation_change_coin(self):
+        from types import SimpleNamespace
+
+        from coin_prep_economics import PREP_TIERS
+
+        worker = object.__new__(CoinPrepWorker)
+        worker.tier_enabled = True
+        worker.tier_order = ["fees"]
+        worker.xch_tier_counts = {"fees": 50}
+        worker.cat_tier_counts = {}
+        worker.tier_xch_sizes = {"fees": Decimal("0.01")}
+        worker.tier_cat_sizes = {}
+        worker.fee_approval_id = "approved-fee-session"
+        worker._approved_targets = [
+            SimpleNamespace(
+                asset="xch",
+                tier_rank=PREP_TIERS.index("fees"),
+                amount_mojos=10_000_000_000,
+            )
+            for _ in range(50)
+        ]
+        worker._tx_fee_mojos = lambda: 26_585_838
+        coins = [
+            {"coin_id": f"fee-{index}", "amount": 10_000_000_000} for index in range(49)
+        ] + [
+            {"coin_id": "cancel-change", "amount": 9_973_414_162},
+            {"coin_id": "reserve", "amount": 77_000_000_000_000},
+        ]
+        worker._get_coins_via_rpc = lambda *_args, **_kwargs: coins
+
+        satisfied, detail = worker._tier_plan_satisfied_by_wallet(1, "xch")
+
+        self.assertFalse(satisfied)
+        self.assertEqual(detail["assigned"], {"fees": 49})
+        self.assertEqual(detail["missing"], {"fees": 1})
+
     def test_cat_coins_outside_relative_tolerance_do_not_match_tier(self):
         worker = object.__new__(CoinPrepWorker)
         worker.tier_enabled = True

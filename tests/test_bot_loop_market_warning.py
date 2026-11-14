@@ -11,6 +11,7 @@ def test_unchanged_missing_trusted_price_logs_one_warning_per_outage(monkeypatch
     loop._recovery_state = {}
     loop._runtime_recovery_cycle_boundary = lambda: True
     loop._set_cycle_step = lambda _step: None
+    loop._set_state = lambda **_state: None
     loop._process_authoritative_sweep_events = lambda: None
     loop.offer_manager = SimpleNamespace(clear_cycle_coins=lambda: None)
     loop._refresh_offer_book_market = lambda: SimpleNamespace(
@@ -94,6 +95,7 @@ def test_active_bootstrap_campaign_uses_its_bound_anchor_when_market_has_no_trus
     loop._recovery_state = {}
     loop._runtime_recovery_cycle_boundary = lambda: True
     loop._set_cycle_step = lambda _step: None
+    loop._set_state = lambda **_state: None
     loop._process_authoritative_sweep_events = lambda: None
     cycle_stop_steps = []
     loop._cycle_stop_requested = lambda step: (
@@ -144,6 +146,7 @@ def test_startup_requote_baseline_uses_active_bootstrap_anchor_when_book_is_red(
     import bot_loop
 
     loop = bot_loop.BotLoop.__new__(bot_loop.BotLoop)
+    loop._set_state = lambda **_state: None
     loop._last_quoted_price = {"buy": Decimal("0"), "sell": Decimal("0")}
     loop._last_quoted_plain_mid = {"buy": Decimal("0"), "sell": Decimal("0")}
     loop._current_mid_price = Decimal("0")

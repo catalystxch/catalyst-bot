@@ -144,6 +144,157 @@ def _fake_cfg(cat_asset_id="ab" * 32, spread_bps=200):
 
 @unittest.skipIf(_SKIP is not None, f"api_server unavailable: {_SKIP}")
 class TestBotStart(_FlaskBase):
+    def test_coordinator_bound_red_start_marks_pending_then_running(self):
+        from follow_run_policy import FollowRunPolicy
+
+        bot = _make_bot(running=False)
+        bot.get_state.return_value["market_confidence"] = "RED"
+        policy = FollowRunPolicy(
+            wallet_fingerprint="123456789",
+            network="mainnet",
+            asset_id="ab" * 32,
+            buy_target=1,
+            sell_target=1,
+            price_anchor=Decimal("0.01"),
+            price_min=Decimal("0.005"),
+            price_max=Decimal("0.02"),
+            maximum_fee_mojos_per_tx=100,
+            fee_coin_principal_mojos=0,
+            xch_reserve_mojos=0,
+            cat_reserve_atoms=0,
+            maximum_trade_xch_mojos=0,
+            maximum_trade_cat_atoms=0,
+        )
+        binding = {
+            "session_id": "b" * 64,
+            "run_id": "a" * 64,
+            "policy_digest": policy.digest,
+            "configuration_sha256": "c" * 64,
+            "state": "ready",
+        }
+        coordinator = MagicMock()
+        coordinator.read_state.return_value = binding
+        calls = []
+        coordinator.mark_start_pending.side_effect = lambda **kwargs: calls.append(
+            "pending"
+        )
+        coordinator.mark_running.side_effect = lambda **kwargs: calls.append("running")
+        bot.start.side_effect = lambda: calls.append("bot.start") or True
+        readiness = {
+            "ready": True,
+            "run_id": "a" * 64,
+            "scope": {
+                "identity": {
+                    "network": "mainnet",
+                    "wallet_fingerprint": 123456789,
+                    "asset_id": "ab" * 32,
+                },
+                "configuration_sha256": "c" * 64,
+            },
+        }
+        with (
+            patch.object(api_server, "bot", bot),
+            patch.object(api_server, "cfg", _fake_cfg()),
+            patch.object(
+                api_server, "_get_sage_signing_block_reason", return_value=None
+            ),
+            patch(
+                "wallet.get_wallet_sync_status",
+                return_value={"reachable": True, "sync_state": "synced"},
+            ),
+            patch(
+                "blueprints.bot._reviewed_follow_start_readiness",
+                return_value=readiness,
+            ),
+            patch(
+                "follow_run_coordinator.FollowRunCoordinator", return_value=coordinator
+            ),
+            patch("database.get_active_follow_run_policy", return_value=policy),
+        ):
+            resp = self._post("/api/bot/start")
+
+        self.assertEqual(resp.status_code, 200, resp.get_json())
+        self.assertEqual(calls, ["pending", "bot.start", "running"])
+        coordinator.mark_start_pending.assert_called_once_with(
+            session_id="b" * 64,
+            policy_digest=policy.digest,
+            configuration_sha256="c" * 64,
+        )
+        coordinator.mark_running.assert_called_once_with(
+            session_id="b" * 64,
+            policy_digest=policy.digest,
+            configuration_sha256="c" * 64,
+        )
+
+    def test_coordinator_start_failure_records_recoverable_error(self):
+        from follow_run_policy import FollowRunPolicy
+
+        bot = _make_bot(running=False, start_returns=False)
+        policy = FollowRunPolicy(
+            wallet_fingerprint="123456789",
+            network="mainnet",
+            asset_id="ab" * 32,
+            buy_target=1,
+            sell_target=1,
+            price_anchor=Decimal("0.01"),
+            price_min=Decimal("0.005"),
+            price_max=Decimal("0.02"),
+            maximum_fee_mojos_per_tx=100,
+            fee_coin_principal_mojos=0,
+            xch_reserve_mojos=0,
+            cat_reserve_atoms=0,
+            maximum_trade_xch_mojos=0,
+            maximum_trade_cat_atoms=0,
+        )
+        coordinator = MagicMock()
+        coordinator.read_state.return_value = {
+            "session_id": "b" * 64,
+            "run_id": "a" * 64,
+            "policy_digest": policy.digest,
+            "configuration_sha256": "c" * 64,
+            "state": "ready",
+        }
+        readiness = {
+            "ready": True,
+            "run_id": "a" * 64,
+            "scope": {
+                "identity": {
+                    "network": "mainnet",
+                    "wallet_fingerprint": 123456789,
+                    "asset_id": "ab" * 32,
+                },
+                "configuration_sha256": "c" * 64,
+            },
+        }
+        with (
+            patch.object(api_server, "bot", bot),
+            patch.object(api_server, "cfg", _fake_cfg()),
+            patch.object(
+                api_server, "_get_sage_signing_block_reason", return_value=None
+            ),
+            patch(
+                "wallet.get_wallet_sync_status",
+                return_value={"reachable": True, "sync_state": "synced"},
+            ),
+            patch(
+                "blueprints.bot._reviewed_follow_start_readiness",
+                return_value=readiness,
+            ),
+            patch(
+                "follow_run_coordinator.FollowRunCoordinator", return_value=coordinator
+            ),
+            patch("database.get_active_follow_run_policy", return_value=policy),
+        ):
+            resp = self._post("/api/bot/start")
+
+        self.assertEqual(resp.status_code, 400)
+        coordinator.record_recoverable_error.assert_called_once_with(
+            session_id="b" * 64,
+            policy_digest=policy.digest,
+            configuration_sha256="c" * 64,
+            reason="BOT_START_FAILED",
+        )
+
     def test_start_rejects_stale_wallet_offer_book_before_bot_start(self):
         """A direct API caller cannot bypass the GUI's fresh-offer check."""
         bot = _make_bot(running=False)
@@ -223,6 +374,145 @@ class TestBotStart(_FlaskBase):
         self.assertTrue(result["ready"])
         self.assertEqual(result["reason"], "exact_live_book")
         self.assertEqual(result["offer_count"], 3)
+
+    def test_bootstrap_resume_accepts_policy_only_revision_of_exact_live_book(self):
+        from blueprints import bot as bot_blueprint
+
+        asset_id = "ab" * 32
+        trade_ids = ["01" * 32, "02" * 32]
+        campaign = {
+            "campaign_id": "cd" * 32,
+            "revision": 1,
+            "status": "active",
+            "stage": "bootstrap",
+        }
+        original_purpose = f"bootstrap:{campaign['campaign_id']}:revision:0"
+        intents = [
+            {
+                "asset_id": asset_id,
+                "purpose": original_purpose,
+                "lifecycle_state": "visible",
+                "sage_trade_id": trade_id,
+            }
+            for trade_id in trade_ids
+        ]
+        wallet_offers = [
+            {
+                "trade_id": trade_id,
+                "status": 0,
+                "summary": {
+                    "offered": {asset_id: 5_000_000},
+                    "requested": {"xch": 550_000_000_000},
+                },
+            }
+            for trade_id in trade_ids
+        ]
+        fake_cfg = _fake_cfg(cat_asset_id=asset_id)
+
+        with (
+            patch("database.get_offer_intents_for_registry", return_value=intents),
+            patch(
+                "database.get_open_offers",
+                return_value=[{"trade_id": trade_id} for trade_id in trade_ids],
+            ),
+            patch(
+                "database.bootstrap_campaign_immutable_authority_valid",
+                return_value=True,
+            ),
+            patch(
+                "wallet.get_authoritative_offer_history",
+                return_value={
+                    "success": True,
+                    "offers": wallet_offers,
+                    "end_of_history": True,
+                },
+            ),
+            patch(
+                "wallet.classify_offers_from_list", return_value=([], wallet_offers, [])
+            ),
+        ):
+            result = bot_blueprint._bootstrap_existing_offer_resume_readiness(
+                fake_cfg, campaign
+            )
+
+        self.assertTrue(result["ready"])
+        self.assertEqual(result["reason"], "exact_live_book")
+        self.assertEqual(result["offer_count"], 2)
+
+    def test_bootstrap_resume_rejects_mixed_intent_revisions(self):
+        from blueprints import bot as bot_blueprint
+
+        asset_id = "ab" * 32
+        campaign = {
+            "campaign_id": "cd" * 32,
+            "revision": 1,
+            "status": "active",
+            "stage": "bootstrap",
+        }
+        trade_ids = ["01" * 32, "02" * 32]
+        intents = [
+            {
+                "asset_id": asset_id,
+                "purpose": f"bootstrap:{campaign['campaign_id']}:revision:{revision}",
+                "lifecycle_state": "visible",
+                "sage_trade_id": trade_id,
+            }
+            for trade_id, revision in zip(trade_ids, (0, 1))
+        ]
+        fake_cfg = _fake_cfg(cat_asset_id=asset_id)
+
+        with (
+            patch("database.get_offer_intents_for_registry", return_value=intents),
+            patch(
+                "database.get_open_offers",
+                return_value=[{"trade_id": trade_id} for trade_id in trade_ids],
+            ),
+            patch(
+                "database.bootstrap_campaign_immutable_authority_valid",
+                return_value=True,
+            ),
+            patch("wallet.get_authoritative_offer_history") as history,
+        ):
+            result = bot_blueprint._bootstrap_existing_offer_resume_readiness(
+                fake_cfg, campaign
+            )
+
+        self.assertFalse(result["ready"])
+        self.assertEqual(result["reason"], "existing_offer_resume_proof_unavailable")
+        history.assert_not_called()
+
+    def test_bootstrap_resume_rejects_older_book_without_immutable_authority(self):
+        from blueprints import bot as bot_blueprint
+
+        asset_id = "ab" * 32
+        campaign = {
+            "campaign_id": "cd" * 32,
+            "revision": 1,
+            "status": "active",
+            "stage": "bootstrap",
+        }
+        intent = {
+            "asset_id": asset_id,
+            "purpose": f"bootstrap:{campaign['campaign_id']}:revision:0",
+            "lifecycle_state": "visible",
+            "sage_trade_id": "01" * 32,
+        }
+        with (
+            patch("database.get_offer_intents_for_registry", return_value=[intent]),
+            patch("database.get_open_offers", return_value=[{"trade_id": "01" * 32}]),
+            patch(
+                "database.bootstrap_campaign_immutable_authority_valid",
+                return_value=False,
+            ),
+            patch("wallet.get_authoritative_offer_history") as history,
+        ):
+            result = bot_blueprint._bootstrap_existing_offer_resume_readiness(
+                _fake_cfg(cat_asset_id=asset_id), campaign
+            )
+
+        self.assertFalse(result["ready"])
+        self.assertEqual(result["reason"], "existing_offer_resume_proof_unavailable")
+        history.assert_not_called()
 
     def test_bootstrap_resume_readiness_fails_closed_on_db_wallet_mismatch(self):
         from blueprints import bot as bot_blueprint
@@ -762,11 +1052,58 @@ class TestBotStart(_FlaskBase):
                 "wallet.get_wallet_sync_status",
                 return_value={"reachable": True, "sync_state": "synced"},
             ),
+            patch(
+                "blueprints.bot._reviewed_follow_start_readiness",
+                return_value={"ready": True, "run_id": "a" * 64},
+            ),
         ):
             resp = self._post("/api/bot/start")
         self.assertEqual(resp.status_code, 200)
         body = resp.get_json()
         self.assertEqual(body.get("status"), "started")
+
+    def test_red_follow_start_requires_override_before_running(self):
+        bot = _make_bot(running=False, start_returns=True)
+        bot.get_state.return_value["market_confidence"] = "RED"
+        with (
+            patch.object(api_server, "bot", bot),
+            patch.object(api_server, "cfg", _fake_cfg()),
+            patch.object(
+                api_server, "_get_sage_signing_block_reason", return_value=None
+            ),
+            patch(
+                "wallet.get_wallet_sync_status",
+                return_value={"reachable": True, "sync_state": "synced"},
+            ),
+            patch(
+                "blueprints.bot._reviewed_follow_start_readiness",
+                return_value={"ready": True, "run_id": "a" * 64},
+            ),
+        ):
+            resp = self._post("/api/bot/start")
+        self.assertEqual(resp.status_code, 409)
+        self.assertEqual(
+            resp.get_json().get("reason"), "CONFIDENCE_OVERRIDE_REVIEW_REQUIRED"
+        )
+        bot.start.assert_not_called()
+
+    def test_two_sided_follow_start_requires_current_review(self):
+        bot = _make_bot(running=False, start_returns=True)
+        with (
+            patch.object(api_server, "bot", bot),
+            patch.object(api_server, "cfg", _fake_cfg()),
+            patch.object(
+                api_server, "_get_sage_signing_block_reason", return_value=None
+            ),
+            patch(
+                "blueprints.bot._reviewed_follow_start_readiness",
+                return_value={"ready": False, "reason": "FOLLOW_REVIEW_REQUIRED"},
+            ),
+        ):
+            resp = self._post("/api/bot/start")
+        self.assertEqual(resp.status_code, 409)
+        self.assertEqual(resp.get_json().get("reason"), "FOLLOW_REVIEW_REQUIRED")
+        bot.start.assert_not_called()
 
     def test_wallet_identity_preflight_denial_blocks_start_with_stable_error(self):
         fake_cfg = _fake_cfg()
@@ -819,6 +1156,10 @@ class TestBotStart(_FlaskBase):
             patch(
                 "wallet.get_wallet_sync_status",
                 return_value={"reachable": True, "sync_state": "synced"},
+            ),
+            patch(
+                "blueprints.bot._reviewed_follow_start_readiness",
+                return_value={"ready": True, "run_id": "a" * 64},
             ),
         ):
             resp = self._post("/api/bot/start")
@@ -963,6 +1304,10 @@ class TestBotStart(_FlaskBase):
                 create=True,
             ),
             patch(
+                "blueprints.bot._bootstrap_cancellation_fee_start_readiness",
+                return_value={"ready": True, "approval_id": "a" * 64},
+            ),
+            patch(
                 "coin_manager.check_tier_size_drift_standalone",
                 return_value=legacy_drift,
             ) as drift_check,
@@ -973,6 +1318,58 @@ class TestBotStart(_FlaskBase):
         self.assertEqual(resp.get_json().get("status"), "started")
         drift_check.assert_not_called()
         bot.start.assert_called_once_with()
+
+    def test_active_bootstrap_start_requires_cancellation_fee_consent(self):
+        fake_cfg = _fake_cfg()
+        fake_cfg.CAT_WALLET_ID = 2
+        fake_cfg.WALLET_TYPE = "sage"
+        bot = _make_bot(running=False)
+        campaign = {
+            "campaign_id": "cd" * 32,
+            "revision": 0,
+            "expires_at": "2099-01-01T00:00:00.000000Z",
+            "asset_id": fake_cfg.CAT_ASSET_ID,
+            "network": "mainnet",
+            "wallet_fingerprint": 123456789,
+            "wallet_id": 2,
+            "wallet_type": "sage",
+            "status": "active",
+        }
+        with (
+            patch.object(api_server, "bot", bot),
+            patch.object(api_server, "cfg", fake_cfg),
+            patch.object(
+                api_server, "_get_sage_signing_block_reason", return_value=None
+            ),
+            patch(
+                "blueprints.bot._matching_active_bootstrap_campaign",
+                return_value=campaign,
+            ),
+            patch(
+                "blueprints.bot._bootstrap_coin_prep_start_readiness",
+                return_value={
+                    "ready": True,
+                    "reason": "ready",
+                    "campaign_id": campaign["campaign_id"],
+                    "campaign_revision": 0,
+                },
+            ),
+            patch(
+                "blueprints.bot._bootstrap_cancellation_fee_start_readiness",
+                return_value={
+                    "ready": False,
+                    "reason": "bootstrap_cancellation_fee_approval_required",
+                },
+            ),
+        ):
+            resp = self._post("/api/bot/start")
+
+        self.assertEqual(resp.status_code, 409)
+        self.assertEqual(
+            resp.get_json().get("reason"),
+            "bootstrap_cancellation_fee_approval_required",
+        )
+        bot.start.assert_not_called()
 
     def test_active_bootstrap_start_fails_closed_when_exact_prep_is_not_ready(self):
         """Historical completion cannot bypass current campaign readiness."""
@@ -1137,6 +1534,10 @@ class TestBotStart(_FlaskBase):
                 return_value={"ready": True, "reason": "exact_live_book"},
                 create=True,
             ) as resume_readiness,
+            patch(
+                "blueprints.bot._bootstrap_cancellation_fee_start_readiness",
+                return_value={"ready": True, "approval_id": "a" * 64},
+            ),
         ):
             resp = self._post("/api/bot/start", {"resume_existing_offers": True})
 
@@ -1398,20 +1799,82 @@ class TestBotStart(_FlaskBase):
 
 @unittest.skipIf(_SKIP is not None, f"api_server unavailable: {_SKIP}")
 class TestBotStop(_FlaskBase):
+    def setUp(self):
+        super().setUp()
+        self._restart_clear = patch(
+            "follow_restart_intent.clear_follow_restart_intent",
+            return_value={"state": "stopped"},
+        )
+        self._restart_clear.start()
+        self.addCleanup(self._restart_clear.stop)
+        self._restart_read = patch("database.get_setting", return_value=None)
+        self._restart_read.start()
+        self.addCleanup(self._restart_read.stop)
+
     def test_requires_token(self):
         resp = self._post("/api/bot/stop", auth=False)
         self.assertEqual(resp.status_code, 401)
 
-    def test_bot_none_returns_500(self):
+    def test_bot_none_is_already_stopped_for_pre_wallet_shutdown(self):
         with patch.object(api_server, "bot", None):
             resp = self._post("/api/bot/stop")
-        self.assertEqual(resp.status_code, 500)
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(
+            resp.get_json(),
+            {"status": "stopped", "running": False, "bot_initialized": False},
+        )
 
     def test_bot_running_stop_returns_200(self):
         bot = _make_bot(running=True)
         with patch.object(api_server, "bot", bot):
             resp = self._post("/api/bot/stop")
         self.assertEqual(resp.status_code, 200)
+
+    def test_manual_stop_clears_existing_automatic_restart_intent(self):
+        bot = _make_bot(running=True)
+
+        def setting(key):
+            return '{"state":"running"}' if key == "follow_restart_intent_v1" else None
+
+        with (
+            patch.object(api_server, "bot", bot),
+            patch("database.get_setting", side_effect=setting),
+            patch("follow_restart_intent.clear_follow_restart_intent") as clear,
+        ):
+            resp = self._post("/api/bot/stop")
+        self.assertEqual(resp.status_code, 200)
+        clear.assert_called_once_with(reason="manual_stop")
+        bot.stop.assert_called_once()
+
+    def test_manual_stop_stops_coordinator_authority_without_legacy_clear(self):
+        bot = _make_bot(running=True)
+        state = {
+            "session_id": "b" * 64,
+            "policy_digest": "a" * 64,
+            "configuration_sha256": "c" * 64,
+            "state": "running",
+        }
+        coordinator = MagicMock()
+        coordinator.read_state.return_value = state
+        with (
+            patch.object(api_server, "bot", bot),
+            patch(
+                "follow_run_coordinator.FollowRunCoordinator",
+                return_value=coordinator,
+            ),
+            patch("database.get_setting", return_value='{"state":"running"}'),
+            patch("follow_restart_intent.clear_follow_restart_intent") as legacy_clear,
+        ):
+            resp = self._post("/api/bot/stop")
+
+        self.assertEqual(resp.status_code, 200, resp.get_json())
+        coordinator.stop_run.assert_called_once_with(
+            session_id="b" * 64,
+            policy_digest="a" * 64,
+            configuration_sha256="c" * 64,
+        )
+        legacy_clear.assert_not_called()
+        bot.stop.assert_called_once_with(wait=False)
 
     def test_stop_response_has_status_key(self):
         bot = _make_bot(running=True)

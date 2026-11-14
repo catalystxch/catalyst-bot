@@ -9,6 +9,7 @@ from types import SimpleNamespace
 import database
 import pytest
 from market_runtime import OfferBookMarketRuntime
+from thin_market_reference import select_thin_market_reference
 
 
 ASSET_ID = "b8" * 32
@@ -87,6 +88,42 @@ def test_runtime_persists_one_coherent_green_decision(isolated_db):
     assert stored["snapshot_id"] == result.snapshot_id
     providers = database.get_market_provider_observations(ASSET_ID, limit=10)
     assert {row["provider_id"] for row in providers} == {"dexie", "splash"}
+
+
+def test_one_sided_runtime_exposes_fresh_settled_trade_reference(isolated_db):
+    book = _book()
+    book["asks"] = []
+    runtime = OfferBookMarketRuntime(
+        asset_id=ASSET_ID,
+        risk_preset="balanced",
+        fetch_dexie_book=lambda _asset: book,
+        fetch_splash_offers=lambda _asset: [],
+        fetch_splash_health=lambda: {
+            "running": False,
+            "api_reachable": False,
+            "peers": 0,
+        },
+        fetch_dexie_settled_trades=lambda _asset: [
+            {
+                "trade_id": "trade-1",
+                "price": "0.00010",
+                "type": "buy",
+                "base_volume": "2",
+                "target_volume": "2",
+                "trade_timestamp": NOW.isoformat(),
+            }
+        ],
+    )
+    result = runtime.refresh(
+        own_offer_identities=frozenset(),
+        configured_offer_size_mojos=1_000_000_000_000,
+        now=NOW,
+    )
+    assert result.confidence.state == "RED"
+    reference = select_thin_market_reference(result.confidence, now=NOW)
+    assert reference is not None
+    assert reference.source == "settled_trade"
+    assert reference.midpoint == Decimal("0.00010")
 
 
 def test_runtime_allows_restricted_creation_from_one_valid_exact_provider(isolated_db):
@@ -1075,6 +1112,39 @@ def test_bot_refreshes_aging_confidence_before_mutation(monkeypatch):
     assert refreshed == [True]
 
 
+def test_bot_rechecks_expired_confidence_before_mutation(monkeypatch):
+    import bot_loop
+
+    loop = bot_loop.BotLoop.__new__(bot_loop.BotLoop)
+    loop._market_runtime_required = True
+    loop._market_degraded_decision = SimpleNamespace(can_create=True, can_requote=True)
+    loop._market_confidence_result = SimpleNamespace(
+        state="GREEN", derived_at=datetime.now(timezone.utc) - timedelta(seconds=31)
+    )
+    loop._market_confidence_valid_until = datetime.now(timezone.utc) - timedelta(
+        seconds=1
+    )
+    monkeypatch.setattr(loop, "_runtime_recovery_cycle_boundary", lambda: True)
+    loop._runtime_recovery_monotonic = lambda: 1
+    loop._runtime_recovery_wall_clock = lambda: NOW
+    loop._runtime_recovery_gap_seconds = 10
+    loop._runtime_recovery_skew_seconds = 2
+    refreshed = []
+
+    def refresh():
+        refreshed.append(True)
+        loop._market_confidence_result = SimpleNamespace(
+            state="GREEN", derived_at=datetime.now(timezone.utc)
+        )
+        loop._market_confidence_valid_until = datetime.now(timezone.utc) + timedelta(
+            seconds=30
+        )
+
+    loop._refresh_offer_book_market = refresh
+    assert loop._enter_runtime_effect_phase("create") is True
+    assert refreshed == [True]
+
+
 def test_active_cycle_wait_refreshes_market_evidence_every_five_seconds(monkeypatch):
     import bot_loop
 
@@ -1301,6 +1371,73 @@ def test_market_withdrawal_preserves_current_bootstrap_campaign_offers(monkeypat
     assert loop._market_withdrawal_attempted_trade_ids == {"follow-buy"}
 
 
+def test_market_withdrawal_preserves_known_bootstrap_offers_when_wallet_unavailable(
+    monkeypatch,
+):
+    import bot_loop
+
+    loop = bot_loop.BotLoop.__new__(bot_loop.BotLoop)
+    dispatched = []
+    loop.offer_manager = SimpleNamespace(
+        cancel_offers=lambda ids, **kwargs: dispatched.extend(ids) or {}
+    )
+    loop._bootstrap_campaign_context = lambda: {
+        "active": True,
+        "blocked": True,
+        "reason": "bootstrap_wallet_identity_unavailable",
+        "campaign": {"campaign_id": "campaign-1", "revision": 4},
+    }
+    monkeypatch.setattr(loop, "_enter_runtime_effect_phase", lambda phase: True)
+    monkeypatch.setattr(
+        bot_loop.database,
+        "get_offer_intents_for_registry",
+        lambda: [
+            {
+                "sage_trade_id": "bootstrap-sell",
+                "purpose": "bootstrap:campaign-1:revision:4",
+            },
+            {"sage_trade_id": "follow-buy", "purpose": "ladder"},
+        ],
+    )
+    monkeypatch.setattr(
+        bot_loop,
+        "get_open_offers",
+        lambda cat_asset_id=None: [
+            {"trade_id": "bootstrap-sell", "tier": "inner"},
+            {"trade_id": "follow-buy", "tier": "inner"},
+        ],
+        raising=False,
+    )
+
+    loop._apply_market_withdrawal(
+        SimpleNamespace(cancel_tiers=("inner",), reason_code="MARKET_DEGRADED_ALL")
+    )
+
+    assert dispatched == ["follow-buy"]
+
+
+def test_bootstrap_campaign_context_retains_known_campaign_when_wallet_unavailable(
+    monkeypatch,
+):
+    import bot_loop
+    import wallet
+
+    campaign = {"campaign_id": "campaign-1", "revision": 4}
+    monkeypatch.setattr(bot_loop.cfg, "CAT_ASSET_ID", ASSET_ID)
+    monkeypatch.setattr(
+        bot_loop.database,
+        "list_active_bootstrap_campaigns_for_asset",
+        lambda asset_id: [campaign],
+    )
+    monkeypatch.setattr(wallet, "get_wallet_identity", lambda: {"success": False})
+
+    context = bot_loop.BotLoop.__new__(bot_loop.BotLoop)._bootstrap_campaign_context()
+
+    assert context["active"] is True
+    assert context["blocked"] is True
+    assert context["campaign"] == campaign
+
+
 def test_market_withdrawal_uses_sage_native_bulk_cancel_capacity(monkeypatch):
     import bot_loop
 
@@ -1369,6 +1506,176 @@ def test_market_withdrawal_immediately_enters_durable_retry_for_unresolved_outco
     )
 
     assert retries == [True]
+
+
+def test_red_market_withdrawal_is_suppressed_only_for_proven_active_follow_run(
+    monkeypatch,
+):
+    import bot_loop
+    import wallet
+
+    loop = bot_loop.BotLoop.__new__(bot_loop.BotLoop)
+    dispatched = []
+    loop.offer_manager = SimpleNamespace(
+        cancel_offers=lambda ids, **kwargs: (
+            dispatched.append(tuple(ids))
+            or {trade_id: {"outcome": "CANCEL_FAILED"} for trade_id in ids}
+        )
+    )
+    monkeypatch.setattr(loop, "_enter_runtime_effect_phase", lambda _phase: True)
+    monkeypatch.setattr(
+        bot_loop,
+        "get_open_offers",
+        lambda cat_asset_id=None: [
+            {"trade_id": "a" * 64, "tier": "inner", "price_xch": "1"}
+        ],
+        raising=False,
+    )
+    monkeypatch.setattr(bot_loop.cfg, "CAT_ASSET_ID", "b" * 64, raising=False)
+    monkeypatch.setattr(bot_loop.cfg, "CAT_WALLET_ID", 2, raising=False)
+    monkeypatch.setattr(bot_loop.cfg, "WALLET_ID_XCH", 1, raising=False)
+    identity = {
+        "network": "mainnet",
+        "wallet_type": "sage",
+        "wallet_fingerprint": 12345,
+        "wallet_id": 2,
+        "xch_wallet_id": 1,
+        "asset_id": "b" * 64,
+    }
+    policy = SimpleNamespace(
+        network="mainnet",
+        wallet_fingerprint="12345",
+        asset_id="b" * 64,
+        digest="e" * 64,
+        price_min=Decimal("0.9"),
+        price_max=Decimal("1.1"),
+    )
+    monkeypatch.setattr(
+        database, "get_active_follow_run_policy", lambda: policy, raising=False
+    )
+    monkeypatch.setattr(
+        database,
+        "get_unexpired_follow_run_marker",
+        lambda **_kwargs: {"run_id": "c" * 64, "stopped": False},
+    )
+    monkeypatch.setattr(database, "get_follow_run_identity", lambda _run: identity)
+    monkeypatch.setattr(
+        "follow_run_coordinator.FollowRunCoordinator.get_state",
+        lambda _self: {
+            "state": "running",
+            "run_id": "c" * 64,
+            "policy_digest": "e" * 64,
+            "configuration_sha256": "d" * 64,
+        },
+    )
+    monkeypatch.setattr(
+        "follow_restart_intent.read_follow_restart_intent",
+        lambda: {
+            "run_id": "c" * 64,
+            "identity": identity,
+            "configuration_sha256": "d" * 64,
+        },
+    )
+    monkeypatch.setattr(
+        "confidence_override.current_configuration_digest", lambda: "d" * 64
+    )
+    monkeypatch.setattr(
+        wallet,
+        "get_wallet_identity",
+        lambda: {
+            "success": True,
+            "backend": "sage",
+            "fingerprint": 12345,
+            "network_id": "mainnet",
+            "has_secrets": True,
+        },
+    )
+    loop._override_protected_trade_ids = lambda: set()
+
+    assert (
+        loop._apply_market_withdrawal(
+            SimpleNamespace(cancel_tiers=("inner",), reason_code="MARKET_RED")
+        )
+        == 0
+    )
+    assert dispatched == []
+
+
+def test_follow_red_suppression_requires_live_offer_inside_approved_range(
+    monkeypatch,
+):
+    import bot_loop
+
+    loop = bot_loop.BotLoop.__new__(bot_loop.BotLoop)
+    policy = SimpleNamespace(
+        network="mainnet",
+        wallet_fingerprint="12345",
+        asset_id="b" * 64,
+        price_min=Decimal("0.9"),
+        price_max=Decimal("1.1"),
+    )
+    monkeypatch.setattr(
+        database, "get_active_follow_run_policy", lambda: policy, raising=False
+    )
+    monkeypatch.setattr(bot_loop.cfg, "CAT_ASSET_ID", "b" * 64, raising=False)
+
+    assert loop._active_follow_red_withdrawal_protected([{"price_xch": "1.2"}]) is False
+
+
+def test_follow_red_withdrawal_proof_fails_closed_on_wallet_fingerprint_mismatch(
+    monkeypatch,
+):
+    import bot_loop
+    import wallet
+
+    loop = bot_loop.BotLoop.__new__(bot_loop.BotLoop)
+    monkeypatch.setattr(bot_loop.cfg, "CAT_ASSET_ID", "b" * 64, raising=False)
+    monkeypatch.setattr(
+        database,
+        "get_active_follow_run_policy",
+        lambda: SimpleNamespace(
+            network="mainnet", wallet_fingerprint="12345", asset_id="b" * 64
+        ),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        "follow_run_coordinator.FollowRunCoordinator.get_state",
+        lambda _self: None,
+    )
+    monkeypatch.setattr(
+        "follow_restart_intent.read_follow_restart_intent",
+        lambda: {"run_id": "c" * 64},
+    )
+    monkeypatch.setattr(
+        database,
+        "get_unexpired_follow_run_marker",
+        lambda **_kwargs: {"run_id": "c" * 64, "stopped": False},
+    )
+    monkeypatch.setattr(
+        database,
+        "get_follow_run_identity",
+        lambda _run: {
+            "network": "mainnet",
+            "wallet_type": "sage",
+            "wallet_fingerprint": 12345,
+            "wallet_id": 2,
+            "xch_wallet_id": 1,
+            "asset_id": "b" * 64,
+        },
+    )
+    monkeypatch.setattr(
+        wallet,
+        "get_wallet_identity",
+        lambda: {
+            "success": True,
+            "backend": "sage",
+            "fingerprint": 98765,
+            "network_id": "mainnet",
+            "has_secrets": True,
+        },
+    )
+
+    assert loop._active_follow_red_withdrawal_protected([{"price_xch": "1"}]) is False
 
 
 def test_market_withdrawal_reports_failed_dispatch_once_without_false_submission(

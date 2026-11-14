@@ -499,6 +499,48 @@ def test_runtime_topup_confirmation_records_exact_new_outputs(monkeypatch):
     ]
     assert designated == [((CHANGE, "reserve", "none"), {"purpose": "top_up"})]
 
+    released = []
+    manager._active_runtime_topup_prep_id = operation["operation_id"]
+    monkeypatch.setattr(
+        mutation_gate,
+        "read_only_status",
+        lambda: SimpleNamespace(
+            reason_code="COIN_PREP_EFFECT_UNKNOWN",
+            blocking_operation_ids=(
+                operation["operation_id"],
+                "wallet-effect:" + operation["effect_claim_token"],
+            ),
+            latch_generation=17,
+        ),
+    )
+    monkeypatch.setattr(
+        mutation_gate,
+        "release_resolved",
+        lambda generation, ids: (
+            released.append((generation, ids)) or {"released": True}
+        ),
+    )
+    assert manager._confirm_runtime_topup_prep(
+        receipt, owned_map={"0x" + TARGET: 100, "0x" + CHANGE: 400}
+    )
+    assert released == [
+        (
+            17,
+            [
+                operation["operation_id"],
+                "wallet-effect:" + operation["effect_claim_token"],
+            ],
+        )
+    ]
+    monkeypatch.setattr(
+        mutation_gate,
+        "release_resolved",
+        lambda *_args: {"released": False, "reason": "generation_mismatch"},
+    )
+    assert not manager._confirm_runtime_topup_prep(
+        receipt, owned_map={"0x" + TARGET: 100, "0x" + CHANGE: 400}
+    )
+
 
 def test_top_up_purpose_repairs_stale_tier_designation(monkeypatch):
     """Confirmed top-up capacity must remain reserve across later scans."""

@@ -4,12 +4,15 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import ROUND_CEILING, Decimal, InvalidOperation
 from typing import Any, Iterable, Mapping
 
 from market_evidence import MarketConfidenceSnapshot
 from providers.models import Capability, ObservationQuality, ProviderObservation
+
+
+_MAX_PRICE_EDGE_EVIDENCE_MOJOS = 500_000_000_000  # 0.5 XCH
 
 
 _PRESETS: dict[str, dict[str, Decimal | int]] = {
@@ -96,6 +99,8 @@ class MarketConfidenceResult:
     follow_capacity_fraction: Decimal
     market_stage: str
     derived_at: datetime
+    last_trusted_at: datetime | None
+    last_trusted_evidence_digests: tuple[str, ...]
     trusted_midpoint: Decimal | None
     trusted_bid: Decimal | None
     trusted_ask: Decimal | None
@@ -112,6 +117,15 @@ class MarketConfidenceResult:
     source_health: Mapping[str, str]
     evidence_digests: tuple[str, ...]
     derived_thresholds: Mapping[str, int | str]
+
+    observed_bid: Decimal | None = None
+    observed_ask: Decimal | None = None
+    settled_trade_price: Decimal | None = None
+    settled_trade_evidence_digests: tuple[str, ...] = ()
+    observed_book_evidence_digests: tuple[str, ...] = ()
+    thin_anchor_midpoint: Decimal | None = None
+    thin_anchor_at: datetime | None = None
+    thin_anchor_evidence_digests: tuple[str, ...] = ()
 
     def to_snapshot(
         self,
@@ -168,6 +182,11 @@ class MarketConfidenceEngine:
         self._last_trusted_midpoint: Decimal | None = None
         self._last_trusted_bid: Decimal | None = None
         self._last_trusted_ask: Decimal | None = None
+        self._last_trusted_at: datetime | None = None
+        self._last_trusted_evidence_digests: tuple[str, ...] = ()
+        self._thin_anchor_midpoint: Decimal | None = None
+        self._thin_anchor_at: datetime | None = None
+        self._thin_anchor_evidence_digests: tuple[str, ...] = ()
         self._pending_midpoint: Decimal | None = None
         self._pending_refreshes = 0
         self._prior_offer_ids: frozenset[str] = frozenset()
@@ -197,6 +216,11 @@ class MarketConfidenceEngine:
             "last_trusted_midpoint": decimal_text(self._last_trusted_midpoint),
             "last_trusted_bid": decimal_text(self._last_trusted_bid),
             "last_trusted_ask": decimal_text(self._last_trusted_ask),
+            "last_trusted_at": iso(self._last_trusted_at),
+            "last_trusted_evidence_digests": list(self._last_trusted_evidence_digests),
+            "thin_anchor_midpoint": decimal_text(self._thin_anchor_midpoint),
+            "thin_anchor_at": iso(self._thin_anchor_at),
+            "thin_anchor_evidence_digests": list(self._thin_anchor_evidence_digests),
             "pending_midpoint": decimal_text(self._pending_midpoint),
             "pending_refreshes": self._pending_refreshes,
             "prior_offer_ids": sorted(self._prior_offer_ids),
@@ -227,12 +251,71 @@ class MarketConfidenceEngine:
         midpoint = optional_price("last_trusted_midpoint")
         bid = optional_price("last_trusted_bid")
         ask = optional_price("last_trusted_ask")
+        trusted_at_raw = state.get("last_trusted_at")
+        if trusted_at_raw is None:
+            trusted_at = None
+        elif type(trusted_at_raw) is str:
+            try:
+                timestamp_text = (
+                    trusted_at_raw[:-1] + "+00:00"
+                    if trusted_at_raw.endswith("Z")
+                    else trusted_at_raw
+                )
+                trusted_at = datetime.fromisoformat(timestamp_text)
+                if trusted_at.tzinfo is None or trusted_at.utcoffset() is None:
+                    raise ValueError("timestamp has no timezone")
+                trusted_at = _utc(trusted_at)
+            except (TypeError, ValueError, OverflowError) as exc:
+                raise ValueError("trusted price timestamp is invalid") from exc
+        else:
+            raise ValueError("trusted price timestamp is invalid")
+        if trusted_at is not None and midpoint is None:
+            raise ValueError("trusted price timestamp has no trusted midpoint")
+        trusted_digests = state.get("last_trusted_evidence_digests", [])
+        if type(trusted_digests) is not list or any(
+            type(digest) is not str
+            or len(digest) != 64
+            or any(character not in "0123456789abcdef" for character in digest)
+            for digest in trusted_digests
+        ):
+            raise ValueError("trusted price evidence digests are invalid")
+        if trusted_digests and midpoint is None:
+            raise ValueError("trusted price evidence has no trusted midpoint")
         if (bid is None) != (ask is None):
             raise ValueError("trusted restart range is incomplete")
         if bid is not None and (
             bid > ask or midpoint is None or not bid <= midpoint <= ask
         ):
             raise ValueError("trusted restart range is invalid")
+        thin_midpoint = optional_price("thin_anchor_midpoint")
+        thin_at_raw = state.get("thin_anchor_at")
+        if thin_at_raw is None:
+            thin_at = None
+        elif type(thin_at_raw) is str:
+            try:
+                thin_at = _utc(
+                    datetime.fromisoformat(
+                        thin_at_raw[:-1] + "+00:00"
+                        if thin_at_raw.endswith("Z")
+                        else thin_at_raw
+                    )
+                )
+            except (TypeError, ValueError, OverflowError) as exc:
+                raise ValueError("thin anchor timestamp is invalid") from exc
+        else:
+            raise ValueError("thin anchor timestamp is invalid")
+        thin_digests = state.get("thin_anchor_evidence_digests", [])
+        if type(thin_digests) is not list or any(
+            type(digest) is not str
+            or len(digest) != 64
+            or any(character not in "0123456789abcdef" for character in digest)
+            for digest in thin_digests
+        ):
+            raise ValueError("thin anchor evidence is invalid")
+        if (thin_midpoint is None) != (thin_at is None) or (thin_midpoint is None) != (
+            not thin_digests
+        ):
+            raise ValueError("thin anchor state is incomplete")
         pending_midpoint = (
             None if preset_changed else optional_price("pending_midpoint")
         )
@@ -266,6 +349,11 @@ class MarketConfidenceEngine:
         self._last_trusted_midpoint = midpoint
         self._last_trusted_bid = bid
         self._last_trusted_ask = ask
+        self._last_trusted_at = trusted_at
+        self._last_trusted_evidence_digests = tuple(sorted(set(trusted_digests)))
+        self._thin_anchor_midpoint = thin_midpoint
+        self._thin_anchor_at = thin_at
+        self._thin_anchor_evidence_digests = tuple(sorted(set(thin_digests)))
         self._pending_midpoint = pending_midpoint
         self._pending_refreshes = pending_refreshes
         self._prior_offer_ids = frozenset(prior_ids)
@@ -306,11 +394,16 @@ class MarketConfidenceEngine:
                 * Decimal(self._thresholds["minimum_evidence_ratio"])
             ).to_integral_value(rounding=ROUND_CEILING)
         )
+        # Large planned tiers must still see meaningful smaller book edges in
+        # a thin market. The depth requirement below remains based on the full
+        # configured offer size, so this cannot manufacture GREEN capacity.
+        minimum_offer_amount = min(minimum_offer_amount, _MAX_PRICE_EDGE_EVIDENCE_MOJOS)
 
         reasons: list[str] = []
         source_health: dict[str, str] = {}
         evidence_digests: list[str] = []
         provider_offers: dict[str, list[_Offer]] = {}
+        provider_evidence_digests: dict[str, str] = {}
         provider_midpoints: dict[str, Decimal] = {}
         excluded_own = 0
         dust_offers: list[_Offer] = []
@@ -349,6 +442,9 @@ class MarketConfidenceEngine:
                 else:
                     independent.append(offer)
             provider_offers[observation.provider_id] = independent
+            provider_evidence_digests[observation.provider_id] = (
+                observation.payload_sha256
+            )
             bids = [offer.price for offer in independent if offer.side == "buy"]
             asks = [offer.price for offer in independent if offer.side == "sell"]
             if bids and asks:
@@ -392,8 +488,10 @@ class MarketConfidenceEngine:
 
         bids = [offer for offer in offers if offer.side == "buy"]
         asks = [offer for offer in offers if offer.side == "sell"]
-        best_bid = max((offer.price for offer in bids), default=None)
-        best_ask = min((offer.price for offer in asks), default=None)
+        best_bid_offer = max(bids, key=lambda offer: offer.price, default=None)
+        best_ask_offer = min(asks, key=lambda offer: offer.price, default=None)
+        best_bid = best_bid_offer.price if best_bid_offer is not None else None
+        best_ask = best_ask_offer.price if best_ask_offer is not None else None
         envelope = Decimal(self._thresholds["depth_price_envelope_bps"]) / Decimal(
             10_000
         )
@@ -480,7 +578,13 @@ class MarketConfidenceEngine:
             and not source_conflict
             and manipulation_score < int(self._thresholds["manipulation_red"])
         )
-        if proposed_midpoint is not None and self._last_trusted_midpoint is not None:
+        if (
+            proposed_midpoint is not None
+            and self._last_trusted_midpoint is not None
+            and self._last_trusted_at is not None
+            and self._last_trusted_evidence_digests
+            and current_time - self._last_trusted_at <= timedelta(hours=24)
+        ):
             move_bps = _basis_points(proposed_midpoint, self._last_trusted_midpoint)
             hard_cap = move_bps > Decimal(self._thresholds["hard_move_cap_bps"])
             if hard_cap:
@@ -591,9 +695,71 @@ class MarketConfidenceEngine:
             self._last_trusted_midpoint = proposed_midpoint
             self._last_trusted_bid = best_bid
             self._last_trusted_ask = best_ask
+            self._last_trusted_at = current_time
+            contributing_providers = {
+                offer.provider_id
+                for offer in (best_bid_offer, best_ask_offer)
+                if offer is not None
+            }
+            self._last_trusted_evidence_digests = tuple(
+                sorted(
+                    {
+                        provider_evidence_digests[provider]
+                        for provider in contributing_providers
+                        if provider in provider_evidence_digests
+                    }
+                )
+            )
         trusted_midpoint = self._last_trusted_midpoint
         trusted_bid = self._last_trusted_bid
         trusted_ask = self._last_trusted_ask
+
+        observed_book_digests = tuple(
+            sorted(
+                {
+                    provider_evidence_digests[offer.provider_id]
+                    for offer in (best_bid_offer, best_ask_offer)
+                    if offer is not None
+                    and offer.provider_id in provider_evidence_digests
+                }
+            )
+        )
+        thin_book_safe = bool(
+            proposed_midpoint is not None
+            and observed_book_digests
+            and not source_conflict
+            and manipulation_score == 0
+            and not hard_cap
+            and not pending
+            and not {
+                "invalid_provider_data",
+                "malformed_provider_response",
+                "rapid_offer_churn",
+            }.intersection(reasons)
+        )
+        if (
+            thin_book_safe
+            and self._thin_anchor_midpoint is not None
+            and self._thin_anchor_at is not None
+            and self._thin_anchor_evidence_digests
+            and current_time - self._thin_anchor_at <= timedelta(hours=24)
+        ):
+            thin_move = _basis_points(proposed_midpoint, self._thin_anchor_midpoint)
+            trade_confirms = bool(
+                settled_trade_price is not None
+                and _basis_points(proposed_midpoint, settled_trade_price)
+                <= Decimal(100)
+            )
+            if (
+                thin_move > Decimal(self._thresholds["material_move_bps"])
+                and not trade_confirms
+            ):
+                thin_book_safe = False
+                reasons.append("thin_move_pending_confirmation")
+        if thin_book_safe:
+            self._thin_anchor_midpoint = proposed_midpoint
+            self._thin_anchor_at = current_time
+            self._thin_anchor_evidence_digests = observed_book_digests
 
         self._prior_offer_ids = frozenset(churn_ids)
         self._prior_observed_at = current_time if churn_ids else None
@@ -604,6 +770,8 @@ class MarketConfidenceEngine:
             follow_capacity_fraction=follow_capacity_fraction,
             market_stage=market_stage,
             derived_at=current_time,
+            last_trusted_at=self._last_trusted_at,
+            last_trusted_evidence_digests=self._last_trusted_evidence_digests,
             trusted_midpoint=trusted_midpoint,
             trusted_bid=trusted_bid,
             trusted_ask=trusted_ask,
@@ -620,6 +788,14 @@ class MarketConfidenceEngine:
             source_health=dict(sorted(source_health.items())),
             evidence_digests=tuple(dict.fromkeys(evidence_digests)),
             derived_thresholds=self.derived_thresholds,
+            observed_bid=best_bid,
+            observed_ask=best_ask,
+            settled_trade_price=settled_trade_price,
+            settled_trade_evidence_digests=supporting_evidence_digests,
+            observed_book_evidence_digests=observed_book_digests,
+            thin_anchor_midpoint=self._thin_anchor_midpoint,
+            thin_anchor_at=self._thin_anchor_at,
+            thin_anchor_evidence_digests=self._thin_anchor_evidence_digests,
         )
 
     def _source_conflict(self, midpoints: Mapping[str, Decimal]) -> bool:

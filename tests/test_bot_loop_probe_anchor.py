@@ -86,6 +86,7 @@ fake_database.get_active_offer_market_identities = lambda *args, **kwargs: set()
 fake_database.get_runtime_mutation_lease = lambda: {"network": "testnet11"}
 fake_database.update_offer_status = lambda *args, **kwargs: True
 fake_database.backfill_verified_fills_from_offers = lambda *args, **kwargs: 0
+fake_database.get_coin_prep_operation_for_observation = lambda operation_id: {}
 sys.modules["database"] = fake_database
 
 
@@ -191,6 +192,9 @@ class _DummySplashManager:
     def queue_post(self, *args, **kwargs):
         pass
 
+    def set_peer_readiness_provider(self, provider):
+        self.peer_readiness_provider = provider
+
     def flush_queue(self):
         return {"posted": 0, "failed": 0, "skipped": 0}
 
@@ -200,7 +204,8 @@ class _DummySplashManager:
 
 
 class _DummySplashNode:
-    pass
+    def get_metrics(self):
+        return {"reachable": False, "peers": 0}
 
 
 class _DummyCoinsetClient:
@@ -412,6 +417,13 @@ class ProbeAnchorTests(unittest.TestCase):
             bot_loop.BotLoop, "_enter_runtime_effect_phase", return_value=True
         )
         self._effect_gate_patcher.start()
+        # Probe arithmetic starts after durable Follow authorization; its
+        # positive and negative policy cases live in the authority suites.
+        authority = patch.object(
+            bot_loop.BotLoop, "_require_follow_creation_run_id", return_value="f" * 64
+        )
+        authority.start()
+        self.addCleanup(authority.stop)
 
     def tearDown(self):
         self._effect_gate_patcher.stop()
@@ -571,6 +583,51 @@ class ProbeAnchorTests(unittest.TestCase):
             self.assertTrue(
                 loop.can_defer_mutation_safety_stop("UNRESOLVED_OPERATIONS")
             )
+
+    def test_submitted_runtime_topup_pauses_cycle_only_for_its_exact_worker(self):
+        loop = bot_loop.BotLoop()
+        loop._running = True
+        operation_id = "coin-prep:" + ("a" * 64)
+        token = "b" * 64
+        loop.coin_manager._active_runtime_topup_prep_id = operation_id
+        loop.coin_manager._topup_thread = types.SimpleNamespace(is_alive=lambda: True)
+        status = types.SimpleNamespace(
+            reason_code="COIN_PREP_EFFECT_UNKNOWN",
+            blocking_operation_ids=(operation_id, f"wallet-effect:{token}"),
+            latch_generation=9,
+        )
+        operation = {
+            "outcome": "SUBMITTED_UNKNOWN",
+            "operation_kind": "split",
+            "purpose": "fee_reserve",
+            "effect_adapter_operation": operation_id,
+            "effect_claim_token": token,
+        }
+        with (
+            patch.object(
+                bot_loop.mutation_gate, "read_only_status", return_value=status
+            ),
+            patch.object(
+                bot_loop.database,
+                "get_coin_prep_operation_for_observation",
+                return_value=operation,
+            ),
+            patch.object(loop, "_runtime_recovery_cycle_boundary") as boundary,
+            patch.object(loop, "stop") as stop,
+            patch.object(bot_loop, "log_event"),
+        ):
+            self.assertTrue(
+                loop.can_defer_mutation_safety_stop("COIN_PREP_EFFECT_UNKNOWN")
+            )
+            self.assertFalse(loop._run_one_cycle())
+            boundary.assert_not_called()
+            stop.assert_not_called()
+            status.blocking_operation_ids = (operation_id, "wallet-effect:" + "c" * 64)
+            self.assertFalse(
+                loop.can_defer_mutation_safety_stop("COIN_PREP_EFFECT_UNKNOWN")
+            )
+            self.assertFalse(loop._run_one_cycle())
+            stop.assert_called_once_with(wait=False)
 
     def test_cycle_aborts_before_wallet_sync_when_stop_requested_during_price_fetch(
         self,
@@ -1520,8 +1577,8 @@ class ProbeAnchorTests(unittest.TestCase):
         sell_call = next(
             call for call in loop.offer_manager.create_calls if call[0] == "sell"
         )
-        self.assertEqual(buy_call[2]["num_offers"], 3)
-        self.assertEqual(sell_call[2]["num_offers"], 3)
+        self.assertEqual(buy_call[2]["num_offers"], 2)
+        self.assertEqual(sell_call[2]["num_offers"], 2)
 
     def test_create_offers_if_needed_waits_for_wallet_active_pending_cancels(self):
         loop = bot_loop.BotLoop()
@@ -1549,7 +1606,8 @@ class ProbeAnchorTests(unittest.TestCase):
         A live 45/44 DBX ladder was created in one cycle, while the durable
         publisher could acknowledge only 13-14 offers per cycle. The remaining
         49 then hit the fixed 90-second exact-discovery deadline and were safely
-        cancelled. Stage a balanced maximum of ten new offers per cycle.
+        cancelled. Stage a balanced maximum of four new offers per cycle,
+        keeping each serial Sage side below the unfinished-thread ceiling.
         """
         loop = bot_loop.BotLoop()
 
@@ -1564,7 +1622,7 @@ class ProbeAnchorTests(unittest.TestCase):
             for call in loop.offer_manager.create_calls
             for side in [call[0]]
         }
-        self.assertEqual(requested, {"buy": 5, "sell": 5})
+        self.assertEqual(requested, {"buy": 2, "sell": 2})
 
     def test_create_offers_if_needed_waits_for_exact_publication_discovery(self):
         loop = bot_loop.BotLoop()

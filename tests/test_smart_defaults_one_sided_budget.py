@@ -77,7 +77,25 @@ _CONFIDENCE = SimpleNamespace(
 )
 
 
-def _recommend(mode, *, xch_mojos, cat_mojos):
+def _recommend(
+    mode,
+    *,
+    xch_mojos,
+    cat_mojos,
+    fee_mojos=None,
+    target_offers=None,
+    fills_per_day=None,
+    shutdown_fee_mojos=None,
+):
+    analysis = (
+        _ANALYSIS
+        if fills_per_day is None
+        else {
+            **_ANALYSIS,
+            "liquidity": {**_ANALYSIS["liquidity"], "fills_per_day": fills_per_day},
+        }
+    )
+
     def balance(wallet_id):
         amount = xch_mojos if wallet_id == 1 else cat_mojos
         return {
@@ -93,7 +111,7 @@ def _recommend(mode, *, xch_mojos, cat_mojos):
     with (
         patch("wallet.get_wallet_balance", side_effect=balance),
         patch("market_data_collector.collect_all_market_data", return_value=_MARKET),
-        patch("market_data_collector.analyze_market_data", return_value=_ANALYSIS),
+        patch("market_data_collector.analyze_market_data", return_value=analysis),
         patch.object(
             smart_defaults, "_fetch_dexie_orderbook_standalone", return_value=_BOOK
         ),
@@ -116,7 +134,14 @@ def _recommend(mode, *, xch_mojos, cat_mojos):
             },
         ),
         patch(
-            "tx_fees.get_suggested_transaction_fee", return_value={"available": False}
+            "tx_fees.get_suggested_transaction_fee",
+            side_effect=lambda *, target_seconds, cost: (
+                {"available": True, "fee_mojos": shutdown_fee_mojos}
+                if cost == 11_000_000_000 and shutdown_fee_mojos is not None
+                else {"available": True, "fee_mojos": fee_mojos}
+                if fee_mojos is not None
+                else {"available": False}
+            ),
         ),
     ):
         with api_server.app.test_request_context("/api/smart-defaults"):
@@ -130,6 +155,7 @@ def _recommend(mode, *, xch_mojos, cat_mojos):
                 cat_decimals=3,
                 cat_ticker_id="TST_XCH",
                 cat_name="TestCAT",
+                target_offers_per_side=target_offers,
             )
     assert response.status_code == 200
     return response.get_json()
@@ -161,6 +187,117 @@ def test_buy_only_tiny_cat_balance_does_not_zero_xch_ladder():
     ) <= Decimal("10")
 
 
+def test_requested_24_per_side_resizes_the_ladder_from_available_balances():
+    plan = _recommend(
+        "two_sided",
+        xch_mojos=127_908_416_089_710,
+        cat_mojos=1_235_383_474,
+        target_offers=24,
+    )
+
+    assert plan["max_active_buy"] == 24
+    assert plan["max_active_sell"] == 24
+    assert (
+        sum(
+            plan[f"buy_{tier}_tier_count"]
+            for tier in ("inner", "mid", "outer", "extreme")
+        )
+        == 24
+    )
+    assert (
+        sum(
+            plan[f"sell_{tier}_tier_count"]
+            for tier in ("inner", "mid", "outer", "extreme")
+        )
+        == 24
+    )
+    fee_pool = Decimal(str(plan["fee_coin_size_xch"])) * plan["fee_prep_count"]
+    assert _active_ladder_xch(plan, "buy") + fee_pool + Decimal(
+        str(plan["topup_pool_xch"])
+    ) <= Decimal("127.908416089710")
+
+
+def test_requested_100_per_side_is_not_limited_by_market_default_count():
+    plan = _recommend(
+        "two_sided",
+        xch_mojos=10_000_000_000_000_000,
+        cat_mojos=100_000_000_000,
+        target_offers=100,
+    )
+
+    assert plan["max_active_buy"] == 100
+    assert plan["max_active_sell"] == 100
+
+
+def test_requested_100_per_side_can_have_a_lower_capital_sizing_estimate():
+    plan = _recommend(
+        "two_sided",
+        xch_mojos=1_000_000_000_000,
+        cat_mojos=100_000_000_000,
+        target_offers=100,
+    )
+
+    assert plan["max_active_buy"] < 100
+    assert plan["max_active_sell"] < 100
+
+
+def test_thin_market_target_does_not_lose_a_slot_to_capacity_rounding():
+    plan = _recommend(
+        "two_sided",
+        xch_mojos=127_908_416_089_710,
+        cat_mojos=1_235_383_474,
+        target_offers=24,
+        fills_per_day=0.87,
+    )
+
+    assert plan["max_active_buy"] == 24
+    assert plan["max_active_sell"] == 24
+    assert plan["_capital_plan"]["n_final"] == 24
+    fee_pool = Decimal(str(plan["fee_coin_size_xch"])) * plan["fee_prep_count"]
+    assert _active_ladder_xch(plan, "buy") + fee_pool + Decimal(
+        str(plan["topup_pool_xch"])
+    ) <= Decimal("127.908416089710")
+    assert _active_ladder_xch(plan, "sell") / Decimal(
+        str(plan["smart_mid_price"])
+    ) + Decimal(str(plan["topup_pool_cat"])) <= Decimal("1235383.474")
+
+
+def test_smart_fee_coin_covers_full_book_shutdown_quote():
+    plan = _recommend(
+        "two_sided",
+        xch_mojos=127_908_416_089_710,
+        cat_mojos=1_235_383_474,
+        target_offers=24,
+        fills_per_day=0.87,
+        fee_mojos=13_079_100,
+        shutdown_fee_mojos=2_326_137_840,
+    )
+
+    assert plan["max_active_buy"] == 24
+    assert plan["max_active_sell"] == 24
+    assert Decimal(str(plan["fee_coin_size_xch"])) >= Decimal("0.004652275680")
+    assert Decimal(str(plan["fee_coin_size_xch"])) * plan["fee_prep_count"] <= 1
+
+
+def test_smart_settings_keeps_existing_one_xch_fee_pool_when_it_fits():
+    with (
+        patch.object(smart_defaults.cfg, "FEE_COIN_SIZE_XCH", Decimal("0.02")),
+        patch.object(smart_defaults.cfg, "FEE_PREP_COUNT", 50),
+    ):
+        plan = _recommend(
+            "two_sided",
+            xch_mojos=127_908_416_089_710,
+            cat_mojos=1_235_383_474,
+            target_offers=24,
+            fee_mojos=7_473_753,
+        )
+    assert plan["fee_coin_size_xch"] == 0.02
+    assert plan["fee_prep_count"] == 50
+    assert _active_ladder_xch(plan, "buy") + Decimal("1") + Decimal(
+        str(plan["topup_pool_xch"])
+    ) <= Decimal("127.908416089710")
+
+
 def test_sell_only_tiny_fee_funded_xch_balance_does_not_shrink_cat_ladder():
     plan = _recommend("sell_only", xch_mojos=200_000_000_000, cat_mojos=1_000_000_000)
     assert plan["max_active_sell"] >= 20
@@ -172,3 +309,40 @@ def test_sell_only_tiny_fee_funded_xch_balance_does_not_shrink_cat_ladder():
     assert _active_ladder_xch(plan, "sell") / Decimal(
         str(plan["smart_mid_price"])
     ) + Decimal(str(plan["topup_pool_cat"])) <= Decimal("1000000")
+
+
+def test_fee_inventory_can_use_more_than_three_percent_after_buy_principal_reserve():
+    plan = _recommend(
+        "two_sided",
+        xch_mojos=10_000_000_000_000,
+        cat_mojos=1_000_000_000_000_000,
+        fee_mojos=1_000_000_000,
+    )
+
+    fee_pool = Decimal(str(plan["fee_coin_size_xch"])) * plan["fee_prep_count"]
+    assert fee_pool > Decimal("0.3")  # old 3% cap on a 10 XCH wallet
+    assert _active_ladder_xch(plan, "buy") + fee_pool + Decimal(
+        str(plan["topup_pool_xch"])
+    ) <= Decimal("10"), plan["_capital_plan"]
+
+
+def test_final_fee_reconciliation_shrinks_weekly_inventory_to_safe_remainder():
+    plan = {
+        "coin_prep_headroom_pct": 0,
+        "buy_inner_size_xch": 0.005,
+        "buy_inner_tier_count": 10,
+        "buy_inner_tier_spare_count": 0,
+        "fee_coin_size_xch": 0.001,
+        "fee_prep_count": 100,
+        "topup_pool_xch": 0.02,
+        "_capital_plan": {},
+    }
+
+    smart_defaults._reconcile_smart_fee_inventory(plan, Decimal("0.1"))
+
+    assert plan["fee_prep_count"] == 30
+    assert Decimal("0.005") * plan["buy_inner_tier_count"] + Decimal(
+        str(plan["topup_pool_xch"])
+    ) + Decimal(str(plan["fee_coin_size_xch"])) * plan["fee_prep_count"] <= Decimal(
+        "0.1"
+    )

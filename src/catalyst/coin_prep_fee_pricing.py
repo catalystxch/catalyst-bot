@@ -71,6 +71,7 @@ def price_next_prep_batch(
     receive_address,
     cat_asset_id,
     target_seconds=300,
+    maximum_fee_mojos=None,
 ):
     """Rebuild until the exact effect's fee matches its fresh cost-specific quote.
 
@@ -84,6 +85,8 @@ def price_next_prep_batch(
         or set(reserve_floors) != {"xch", "cat"}
         or not all(_integer(value) for value in reserve_floors.values())
     ):
+        raise ValueError("FEE_PRICING_CONSTRAINTS_INVALID")
+    if maximum_fee_mojos is not None and not _integer(maximum_fee_mojos):
         raise ValueError("FEE_PRICING_CONSTRAINTS_INVALID")
     fee = 0
     for _round in range(4):
@@ -128,15 +131,37 @@ def price_next_prep_batch(
             return _unavailable("FEE_ESTIMATE_UNAVAILABLE")
         if not is_current_fee_quote(quote, inspection["cost"], target_seconds):
             return _unavailable("FEE_ESTIMATE_UNAVAILABLE", quote)
-        if quote["fee_mojos"] == fee:
+        if quote["fee_mojos"] == fee or (
+            maximum_fee_mojos is not None
+            and fee == maximum_fee_mojos
+            and quote["fee_mojos"] > maximum_fee_mojos
+        ):
             return {
                 "available": True,
-                "reason": "cost_fee_consistent",
+                "reason": (
+                    "approved_fee_cap_applied"
+                    if quote["fee_mojos"] > fee
+                    else "cost_fee_consistent"
+                ),
+                "fee_cap_warning": (
+                    {
+                        "code": "RECOMMENDED_FEE_EXCEEDS_APPROVED_MAX",
+                        "recommended_fee_mojos": quote["fee_mojos"],
+                        "approved_maximum_fee_mojos": maximum_fee_mojos,
+                        "planned_fee_mojos": fee,
+                    }
+                    if quote["fee_mojos"] > fee
+                    else None
+                ),
                 "plan": plan,
                 "inspection": inspection,
                 "quote": quote,
                 "transaction_required": True,
                 "dispatch_authorized": False,
             }
-        fee = quote["fee_mojos"]
+        fee = (
+            maximum_fee_mojos
+            if maximum_fee_mojos is not None and quote["fee_mojos"] > maximum_fee_mojos
+            else quote["fee_mojos"]
+        )
     return _unavailable("FEE_PRICING_NOT_CONVERGED")

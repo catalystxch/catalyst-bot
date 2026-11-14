@@ -9,7 +9,11 @@ from bootstrap_campaign import (
     CampaignStage,
 )
 import api_server  # noqa: F401 - initializes blueprint imports in app order
-from blueprints.coin_prep import bootstrap_coin_prep_requirements
+from blueprints.coin_prep import (
+    bootstrap_coin_prep_requirements,
+    bootstrap_coin_prep_worker_args,
+)
+from coin_prep_economics import build_exact_prep_economics
 from offer_book_policy import derive_bootstrap_plan
 from offer_manager import bootstrap_offer_specs
 
@@ -74,6 +78,47 @@ def _balances(**overrides):
     return values
 
 
+def test_bootstrap_sell_levels_split_market_budget_into_atomic_mz_amounts():
+    campaign = _campaign(xch_budget=Decimal("61"), cat_budget=Decimal("725000"))
+    plan = derive_bootstrap_plan(
+        campaign,
+        _decision(campaign),
+        _balances(
+            xch_available=Decimal("138"),
+            cat_available=Decimal("1089357"),
+            minimum_profit_xch=Decimal("0"),
+        ),
+        cat_decimals=3,
+    )
+
+    assert plan["authorized"] is True
+    assert [level["cat_amount"] for level in plan["sides"]["sell"]["levels"]] == [
+        Decimal("24166.667"),
+        Decimal("24166.667"),
+        Decimal("24166.666"),
+    ]
+    assert sum(
+        level["cat_amount"] for level in plan["sides"]["sell"]["levels"]
+    ) == Decimal("72500")
+    worker_args = bootstrap_coin_prep_worker_args(
+        plan, replacement_waves={"buy": 10, "sell": 10}
+    )
+    exact = build_exact_prep_economics(
+        configuration={
+            "CAT_DECIMALS": 3,
+            "LIQUIDITY_MODE": "two_sided",
+            "XCH_RESERVE": Decimal("0"),
+            "CAT_RESERVE": Decimal("0"),
+        },
+        worker_args=worker_args,
+        campaign_revision=0,
+    )
+    assert (
+        sum(output.amount_mojos for output in exact["targets"] if output.asset == "cat")
+        == 725_000_000
+    )
+
+
 def test_below_floor_quote_requires_the_exact_separate_subsidy_shortfall():
     unsubsidized = _campaign()
     blocked = derive_bootstrap_plan(
@@ -128,6 +173,47 @@ def test_coin_prep_projection_contains_only_staged_purpose_separated_outputs():
         "cancellation_fee_reserve_xch": Decimal("0.004"),
         "subsidy_remaining_xch": campaign.subsidy_budget_xch - plan["subsidy_used_xch"],
     }
+
+
+def test_manual_zero_fee_still_prepares_configured_protected_fee_pool():
+    campaign = _campaign(xch_budget=Decimal("61"), cat_budget=Decimal("725000"))
+    plan = derive_bootstrap_plan(
+        campaign,
+        _decision(campaign),
+        _balances(
+            xch_available=Decimal("138"),
+            cat_available=Decimal("1089357"),
+            minimum_profit_xch=Decimal("0"),
+            network_fee_xch=Decimal("0"),
+            fee_pool_enabled=True,
+        ),
+        cat_decimals=3,
+    )
+
+    assert plan["authorized"] is True
+    assert plan["creation_fee_required_xch"] == Decimal("0")
+    assert len(plan["coin_prep"]["fee_coins"]) == 6
+    assert all(
+        coin["amount_xch"] == Decimal("0.001")
+        for coin in plan["coin_prep"]["fee_coins"]
+    )
+    worker_args = bootstrap_coin_prep_worker_args(plan)
+    assert "fees=0.001" in worker_args["buy_tier_sizes"]
+    assert "fees=6" in worker_args["tier_counts_xch"]
+
+    without_pool = derive_bootstrap_plan(
+        campaign,
+        _decision(campaign),
+        _balances(
+            xch_available=Decimal("138"),
+            cat_available=Decimal("1089357"),
+            minimum_profit_xch=Decimal("0"),
+            network_fee_xch=Decimal("0"),
+            fee_pool_enabled=False,
+        ),
+        cat_decimals=3,
+    )
+    assert without_pool["coin_prep"]["fee_coins"] == []
 
 
 def test_offer_specs_preserve_exact_bootstrap_level_purpose_and_amounts():

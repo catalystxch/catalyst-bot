@@ -7,8 +7,10 @@ the existing wallet-effect fence. No manual fee/price/plan override is accepted.
 
 from coin_prep_fee_funding import prepare_fee_inventory
 from coin_prep_fee_pricing import is_current_fee_quote, price_next_prep_batch
+import coin_prep_fee_pricing
 from coin_prep_fee_runtime import read_approved_prep_fee_snapshot
 from fee_estimation import fee_failure_diagnostics
+from super_log import slog
 import database
 import json
 from dataclasses import replace
@@ -22,6 +24,31 @@ def _paused(context, reason, **details):
         "dispatch_authorized": False,
         **details,
     }
+
+
+def _follow_prep_fee_cap(approval_id, approved_snapshot=None):
+    """Return a cap only when the durable Follow session binds this approval."""
+    from follow_run_coordinator import FollowRunCoordinator
+
+    state = FollowRunCoordinator().get_state()
+    if type(state) is not dict or state.get("fee_approval_id") != approval_id:
+        return None
+    policy = database.get_active_follow_run_policy()
+    if policy is None:
+        raise ValueError("FOLLOW_RUN_PREP_FEE_BINDING_REQUIRED")
+    if approved_snapshot is None:
+        approved_snapshot = read_approved_prep_fee_snapshot(approval_id)
+    from confidence_override import current_configuration_digest
+    from follow_prep_fee_authority import verified_prep_fee_cap
+
+    return verified_prep_fee_cap(
+        policy=policy,
+        coordinator_state=state,
+        current_configuration_sha256=current_configuration_digest(),
+        approved_snapshot=approved_snapshot,
+        requested_approval_id=approval_id,
+        run_session_id=state.get("session_id"),
+    )
 
 
 def _verify_current_inventory(context, saved_snapshot, plan, operation_id, claim):
@@ -40,17 +67,48 @@ def _verify_current_inventory(context, saved_snapshot, plan, operation_id, claim
         for coin_id in json.loads(claim[key])
     }
     original = {coin.coin_id: coin for coin in saved_snapshot.coins}
+    reserve_floors = context["recipe"]["economic_plan"]["reserve_floors_mojos"]
     reserves = {
         row["coin_id"].removeprefix("0x")
         for asset in ("xch", "cat")
         for row in database.get_reserve_coins(asset)
     }
-    if own_ids & reserves or any(
-        coin_id not in original
-        or original[coin_id].protected
-        or not original[coin_id].selectable
+    prior_invalid = [
+        coin_id
         for coin_id in own_ids
-    ):
+        if coin_id not in original
+        or not original[coin_id].selectable
+        or (
+            original[coin_id].protected
+            and not (
+                original[coin_id].purpose == "reserve"
+                and reserve_floors[original[coin_id].asset] == 0
+            )
+        )
+    ]
+    if own_ids & reserves or prior_invalid:
+        invalid_kinds = {
+            "missing": sum(coin_id not in original for coin_id in prior_invalid),
+            "protected": sum(
+                coin_id in original and original[coin_id].protected
+                for coin_id in prior_invalid
+            ),
+            "nonselectable": sum(
+                coin_id in original and not original[coin_id].selectable
+                for coin_id in prior_invalid
+            ),
+            "fee_source": sum(coin_id in fee_ids for coin_id in prior_invalid),
+        }
+        slog(
+            "coin_prep",
+            "Direct batch preclaim inventory changed",
+            {
+                "reserve_overlap_count": len(own_ids & reserves),
+                "invalid_source_count": len(prior_invalid),
+                "invalid_kinds": invalid_kinds,
+            },
+            level="warning",
+        )
         raise ValueError("FEE_WALLET_CONTEXT_CHANGED")
     fresh = {}
     for coin in context["snapshot"].coins:
@@ -62,6 +120,33 @@ def _verify_current_inventory(context, saved_snapshot, plan, operation_id, claim
                 coin = replace(coin, protected=before.protected, purpose=before.purpose)
         fresh[coin.coin_id] = coin
     if fresh != original:
+        old_ids, new_ids = set(original), set(fresh)
+        changed = [
+            coin_id
+            for coin_id in old_ids & new_ids
+            if original[coin_id] != fresh[coin_id]
+        ]
+        changed_fields = sorted(
+            {
+                field
+                for coin_id in changed
+                for field in vars(original[coin_id])
+                if getattr(original[coin_id], field) != getattr(fresh[coin_id], field)
+            }
+        )
+        slog(
+            "coin_prep",
+            "Direct batch inventory changed before dispatch",
+            {
+                "missing_count": len(old_ids - new_ids),
+                "added_count": len(new_ids - old_ids),
+                "changed_count": len(changed),
+                "changed_fields": changed_fields,
+                "own_missing_count": len(own_ids - new_ids),
+                "own_changed_count": len(own_ids & set(changed)),
+            },
+            level="warning",
+        )
         raise ValueError("FEE_WALLET_CONTEXT_CHANGED")
 
 
@@ -87,6 +172,7 @@ def price_approved_prep_batch(approval_id: str) -> dict:
             "dispatch_authorized": False,
         }
     context = read_approved_prep_fee_snapshot(approval_id)
+    follow_fee_cap = _follow_prep_fee_cap(approval_id, context)
     recipe = context["recipe"]
     plan = recipe["economic_plan"]
     funding = prepare_fee_inventory(
@@ -101,6 +187,7 @@ def price_approved_prep_batch(approval_id: str) -> dict:
         receive_address=context["receive_address"],
         cat_asset_id=context["identity"]["asset_id"],
         target_seconds=plan["target_seconds"],
+        maximum_fee_mojos=follow_fee_cap,
     )
     after = read_approved_prep_fee_snapshot(approval_id)
     if any(
@@ -123,15 +210,76 @@ def price_approved_prep_batch(approval_id: str) -> dict:
         return _paused(
             context,
             pricing["reason"],
+            diagnostic_stage="unsigned_pricing",
             provider_failures=fee_failure_diagnostics(pricing),
+        )
+    if pricing.get("fee_cap_warning"):
+        slog(
+            "coin_prep",
+            "Follow prep recommended fee exceeds approved per-transaction maximum; trying the approved maximum",
+            pricing["fee_cap_warning"],
+            level="warning",
         )
     if pricing["transaction_required"] is True:
         fee = pricing["plan"].fee_mojos
+        # Slow inventory reads can leave a valid quote too close to expiry for
+        # the worker's pre-claim guard. Reprice the already inspected cost only;
+        # never renew a cached timestamp or resize an approved executable fee.
+        if is_current_fee_quote(
+            pricing["quote"], pricing["inspection"]["cost"], plan["target_seconds"]
+        ) and not is_current_fee_quote(
+            pricing["quote"],
+            pricing["inspection"]["cost"],
+            plan["target_seconds"],
+            now=coin_prep_fee_pricing._now() + 10,
+        ):
+            from fee_estimation import quote_fee
+
+            try:
+                fresh = quote_fee(
+                    pricing["inspection"]["cost"],
+                    target_seconds=plan["target_seconds"],
+                    force_refresh=True,
+                )
+            except Exception:
+                fresh = None
+            if not is_current_fee_quote(
+                fresh,
+                pricing["inspection"]["cost"],
+                plan["target_seconds"],
+                now=coin_prep_fee_pricing._now() + 10,
+            ) or (
+                fresh["fee_mojos"] != fee
+                and not (
+                    follow_fee_cap is not None
+                    and fee == follow_fee_cap
+                    and fresh["fee_mojos"] > follow_fee_cap
+                )
+            ):
+                return _paused(
+                    context,
+                    "FEE_ESTIMATE_UNAVAILABLE",
+                    diagnostic_stage="post_inventory_fresh_quote",
+                )
+            pricing = {**pricing, "quote": fresh}
         if not is_current_fee_quote(
             pricing["quote"], pricing["inspection"]["cost"], plan["target_seconds"]
         ):
-            return _paused(context, "FEE_ESTIMATE_UNAVAILABLE")
-        if fee > context["approval"]["remaining_preparation_fee_mojos"]:
+            quote = pricing["quote"]
+            return _paused(
+                context,
+                "FEE_ESTIMATE_UNAVAILABLE",
+                diagnostic_stage="post_inventory_quote_recheck",
+                quote_timing={
+                    "observed_at": quote.get("observed_at"),
+                    "expires_at": quote.get("expires_at"),
+                    "checked_at": coin_prep_fee_pricing._now(),
+                },
+            )
+        if (
+            context["approval"].get("unbounded") is not True
+            and fee > context["approval"]["remaining_preparation_fee_mojos"]
+        ):
             return _paused(context, "FEE_BUDGET_EXCEEDED", required_fee_mojos=fee)
         if fee > funding["fee_funding_mojos"]:
             return _paused(
@@ -143,12 +291,18 @@ def price_approved_prep_batch(approval_id: str) -> dict:
         "reason": pricing["reason"],
         "funding": funding,
         "pricing": pricing,
+        "follow_fee_cap_mojos": follow_fee_cap,
+        "fee_cap_warning": pricing.get("fee_cap_warning"),
         "dispatch_authorized": False,
     }
 
 
 def reserve_approved_prep_dispatch(
-    *, approval_id: str, operation_id: str, priced_batch: dict
+    *,
+    approval_id: str,
+    operation_id: str,
+    priced_batch: dict,
+    attempt_id: str | None = None,
 ) -> dict:
     """Bind executable cost/effects to PREPARED journal and hold the exact fee.
 
@@ -166,6 +320,7 @@ def reserve_approved_prep_dispatch(
     if type(priced_batch) is not dict or priced_batch.get("available") is not True:
         raise ValueError("FEE_DISPATCH_PLAN_MISMATCH")
     context = read_approved_prep_fee_snapshot(approval_id)
+    follow_fee_cap = _follow_prep_fee_cap(approval_id, context)
     if priced_batch.get("approval", {}).get("approval_id") != approval_id or any(
         priced_batch.get(key) != context[key]
         for key in (
@@ -213,6 +368,7 @@ def reserve_approved_prep_dispatch(
         purpose="replacement",
         source_coin_ids=list(plan.source_coin_ids),
         target_contract=target,
+        attempt_id=attempt_id,
     )
     if canonical["operation_id"] != operation_id:
         raise ValueError("FEE_DISPATCH_PLAN_MISMATCH")
@@ -235,10 +391,38 @@ def reserve_approved_prep_dispatch(
         raise ValueError("FEE_UNSIGNED_COST_UNAVAILABLE")
     quote = pricing.get("quote")
     cost = validated.get("_catalyst_exact_unsigned_cost")
+    capped_recommendation = (
+        follow_fee_cap is not None
+        and plan.fee_mojos == follow_fee_cap
+        and type(quote) is dict
+        and type(quote.get("fee_mojos")) is int
+        and quote.get("fee_mojos", 0) > follow_fee_cap
+    )
     if (
         not is_current_fee_quote(quote, cost, economics["target_seconds"])
-        or quote["fee_mojos"] != plan.fee_mojos
+        or (quote["fee_mojos"] != plan.fee_mojos and not capped_recommendation)
+        or priced_batch.get("follow_fee_cap_mojos") != follow_fee_cap
     ):
+        slog(
+            "coin_prep",
+            "Direct batch fee quote rejected before wallet dispatch",
+            {
+                "operation_id": operation_id,
+                "quote_observed_at": quote.get("observed_at")
+                if type(quote) is dict
+                else None,
+                "quote_expires_at": quote.get("expires_at")
+                if type(quote) is dict
+                else None,
+                "quoted_cost": quote.get("cost") if type(quote) is dict else None,
+                "validated_cost": cost,
+                "quoted_fee_mojos": quote.get("fee_mojos")
+                if type(quote) is dict
+                else None,
+                "planned_fee_mojos": plan.fee_mojos,
+            },
+            level="warning",
+        )
         raise ValueError("FEE_ESTIMATE_UNAVAILABLE")
     # Bind actual derived additions; a different earlier binding cannot survive.
     database.bind_coin_prep_constructed_outputs(
@@ -268,6 +452,7 @@ def reserve_approved_prep_dispatch(
         plan_sha256=final["approval"]["plan_sha256"],
         operation_id=operation_id,
         final_quote=quote,
+        executed_fee_mojos=plan.fee_mojos,
     )
     return {**hold, "validated_unsigned": validated, "dispatch_authorized": False}
 

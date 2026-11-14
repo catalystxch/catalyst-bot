@@ -7,6 +7,7 @@ from coin_prep_batch_plan import (
     BatchPlan,
     BatchRefusal,
     CoinSnapshot,
+    PlannedOutput,
     SelectableCoin,
     TargetOutput,
     plan_batch,
@@ -126,6 +127,40 @@ def test_fragmentation_over_input_cap_requests_bounded_prerequisite():
     assert result.prerequisite_allowed is True
 
 
+def test_cat_prerequisite_conserves_fifty_sources_and_claims_distinct_fee():
+    snapshot = CoinSnapshot(
+        tuple(coin("cat", f"c{i:03}", 200) for i in range(55))
+        + (coin("xch", "fee", 100),)
+    )
+    result = plan_batch(
+        snapshot,
+        (target("cat", "tier", 11000, 0),),
+        constraints(
+            reserve_floors={"xch": 0, "cat": 0}, allow_bounded_prerequisite=True
+        ),
+    )
+    assert isinstance(result, BatchPlan)
+    assert result.asset == "cat" and len(result.source_coin_ids) == 50
+    assert result.fee_source_id == "fee" and result.fee_mojos == 10
+    assert result.outputs == (
+        PlannedOutput("cat", "change", 10000, -1),
+        PlannedOutput("xch", "fee_change", 90, -1),
+    )
+    after = CoinSnapshot(
+        (coin("cat", "confirmed", 10000), coin("xch", "fee-change", 90))
+        + tuple(coin("cat", f"c{i:03}", 200) for i in range(50, 55))
+    )
+    final = plan_batch(
+        after,
+        (target("cat", "tier", 11000, 0),),
+        constraints(
+            reserve_floors={"xch": 0, "cat": 0}, allow_bounded_prerequisite=True
+        ),
+    )
+    assert isinstance(final, BatchPlan) and len(final.source_coin_ids) == 6
+    assert any(o.purpose == "tier" and o.amount_mojos == 11000 for o in final.outputs)
+
+
 def test_output_cap_refuses_before_selecting_inputs():
     result = plan_batch(
         CoinSnapshot((coin("cat", "cat-source", 1000), coin("xch", "fee", 100))),
@@ -134,6 +169,35 @@ def test_output_cap_refuses_before_selecting_inputs():
     )
     assert isinstance(result, BatchRefusal)
     assert result.code == "OUTPUT_CAP_EXCEEDED"
+
+
+def test_cat_prerequisite_excludes_reused_and_protected_roots():
+    result = plan_batch(
+        CoinSnapshot(
+            tuple(coin("cat", f"c{i:03}", 200) for i in range(55))
+            + (
+                coin("cat", "cat-ready", 50, purpose="tier"),
+                coin("cat", "cat-protected", 20000, protected=True),
+                coin("xch", "x-ready", 20, purpose="tier"),
+                coin("xch", "x-protected", 1000, protected=True),
+                coin("xch", "fee", 100),
+            )
+        ),
+        (
+            target("cat", "tier", 11000, 0),
+            target("cat", "tier", 50, 1),
+            target("xch", "tier", 20, 0),
+        ),
+        constraints(
+            reserve_floors={"xch": 20, "cat": 50}, allow_bounded_prerequisite=True
+        ),
+    )
+    assert isinstance(result, BatchPlan)
+    assert result.fee_source_id == "fee"
+    assert set(result.reused_coin_ids) == {"cat-ready", "x-ready"}
+    assert len(result.source_coin_ids) == 50
+    assert "cat-protected" not in result.source_coin_ids
+    assert sum(o.amount_mojos for o in result.outputs if o.asset == "cat") == 10000
 
 
 def test_reserve_floor_counts_fee_and_refuses_erosion():

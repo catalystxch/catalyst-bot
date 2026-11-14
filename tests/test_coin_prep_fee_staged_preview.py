@@ -55,6 +55,20 @@ def preview(options=None):
     return function({} if options is None else options)
 
 
+def test_recovery_only_staged_preview_has_no_preparation_plan(staged, monkeypatch):
+    runtime = import_module("coin_prep_fee_runtime")
+    context = runtime.read_next_prep_fee_snapshot({})
+    context["recovery_only"] = True
+    context.pop("pricing")
+    monkeypatch.setattr(runtime, "read_next_prep_fee_snapshot", lambda options: context)
+    monkeypatch.setattr(runtime, "read_fee_economic_snapshot", lambda options: context)
+    result = runtime.read_staged_prep_fee_snapshot({}, quote_provider=staged["quote"])
+    assert result["available"] is True
+    assert [s["stage_id"] for s in result["stages"]] == ["cancel_xch", "cancel_cat"]
+    assert all(s["cancellation"] for s in result["stages"])
+    assert not any(utils._counts().values())
+
+
 def test_runtime_preview_prices_exact_cat_future_native_and_protected_cancels(staged):
     result = preview()
     assert result["available"] is True and result["funded"] is True
@@ -84,6 +98,76 @@ def test_runtime_preview_prices_exact_cat_future_native_and_protected_cancels(st
     assert "validated_unsigned" not in json.dumps(
         result
     ) and "coin_spends" not in json.dumps(result)
+
+
+@pytest.mark.parametrize(
+    "root_count,amount,remaining", [(55, 200, 0), (153, 80, 2), (500, 24, 9)]
+)
+def test_cat_fragmentation_preview_covers_consolidation_final_prep_and_cancels(
+    staged, root_count, amount, remaining
+):
+    from chia_rs import Coin
+    from fee_projection_test_utils import standard_puzzles
+
+    _native, cat = standard_puzzles()
+    staged["cat"] = []
+    for index in range(root_count):
+        parent = Coin(index.to_bytes(32, "big"), cat.get_tree_hash(), amount)
+        coin = Coin(parent.name(), cat.get_tree_hash(), amount)
+        row = utils._coin(index, str(amount))
+        row["coin_id"] = coin.name().hex()
+        staged["cat"].append(row)
+        staged["unsigned_roots"][coin.name().hex()] = (coin, cat, utils.ASSET)
+        staged["unsigned_parents"][coin.name().hex()] = parent
+    result = preview()
+    if remaining + 3 > 8:
+        assert result["available"] is False
+        assert result["reason"] == "FEE_PREP_BATCH_LIMIT_EXCEEDED"
+        assert result.get("preview_id") is None
+        assert not any(utils._counts().values())
+        return
+    assert result["available"] is True, result
+    expected = ["prep_cat_consolidation"]
+    if remaining:
+        expected.append("prep_cat_consolidation_remaining")
+    expected += ["prep_cat", "prep_xch", "cancel_xch", "cancel_cat"]
+    assert [s["stage_id"] for s in result["stages"]] == expected
+    assert result["stages"][0]["cost_kind"] == "exact_unsigned"
+    assert result["preparation_transaction_count_max"] == remaining + 3
+    assert result["estimated_total_fee_mojos"] == (remaining + 5) * 20
+    assert result["estimated_cancellation_fee_mojos"] == 40
+    assert not any(utils._counts().values())
+
+
+def test_cat_prerequisite_preview_refuses_future_fee_root_exhaustion(staged):
+    from chia_rs import Coin
+    from fee_projection_test_utils import standard_puzzles
+
+    native, cat = standard_puzzles()
+    staged["config"].LIQUIDITY_MODE = "sell_only"
+    staged["cat"] = []
+    for index in range(55):
+        parent = Coin(index.to_bytes(32, "big"), cat.get_tree_hash(), 200)
+        coin = Coin(parent.name(), cat.get_tree_hash(), 200)
+        row = utils._coin(index, "200")
+        row["coin_id"] = coin.name().hex()
+        staged["cat"].append(row)
+        staged["unsigned_roots"][coin.name().hex()] = (coin, cat, utils.ASSET)
+        staged["unsigned_parents"][coin.name().hex()] = parent
+    staged["xch"] = []
+    # Native targets already exist. Aggregate fee funding is ample, but after
+    # consuming the exact20 fee root no eligible root can pay the next20 fee.
+    for index, amount in enumerate([1_000_000_000, 1_000_000_000, 20] + [19] * 10):
+        coin = Coin(index.to_bytes(32, "big"), native.get_tree_hash(), amount)
+        row = utils._coin(index, str(amount))
+        row["coin_id"] = coin.name().hex()
+        staged["xch"].append(row)
+        staged["unsigned_roots"][coin.name().hex()] = (coin, native, None)
+    result = preview()
+    assert result["available"] is False, result
+    assert result["reason"] == "FEE_FUTURE_CAT_FEE_SOURCE_UNAVAILABLE"
+    assert result.get("preview_id") is None
+    assert not any(utils._counts().values())
 
 
 @pytest.mark.parametrize(

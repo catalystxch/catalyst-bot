@@ -67,13 +67,13 @@ def test_asymmetric_live_counts_and_spares_use_actual_sell_ladder_prices(setting
         ("xch", "replacement", 1_100_000_000_000)
     ] * 3 + [("xch", "fee_reserve", 1_000_000_000)] * 2 + [
         ("cat", "replacement", 110_000),
-        ("cat", "replacement", 27_500),
+        ("cat", "replacement", 36_667),
     ]
     plan = result["economic_plan"]
     assert plan["reserve_floors_mojos"] == {"xch": 250_000_000_000, "cat": 1001}
     assert plan["target_seconds"] == 300
     assert result["worker_args"]["prep_headroom_pct"] == "0"
-    assert result["worker_args"]["cat_tier_sizes"] == "inner=110,outer=27.5"
+    assert result["worker_args"]["cat_tier_sizes"] == "inner=110,outer=36.667"
     assert result["worker_args"]["xch_target"] == 5
     assert result["worker_args"]["cat_target"] == 2
 
@@ -115,12 +115,12 @@ def test_execution_worker_and_preview_share_the_hand_checked_economic_amounts(
     monkeypatch.setenv("MIN_EDGE_BPS", "0")
     assert worker._derive_tier_cat_sizes() == {
         "inner": Decimal("110"),
-        "outer": Decimal("27.5"),
+        "outer": Decimal("36.667"),
     }
     assert worker._apply_prep_headroom_xch(Decimal("1")) == Decimal("1.1")
     assert [
         o.amount_mojos for o in _build(settings)["targets"] if o.asset == "cat"
-    ] == [110_000, 27_500]
+    ] == [110_000, 36_667]
 
 
 def test_worker_spare_output_counts_do_not_create_imaginary_live_sell_slots(
@@ -154,8 +154,8 @@ def test_worker_spare_output_counts_do_not_create_imaginary_live_sell_slots(
 
     assert worker._derive_tier_cat_sizes() == {
         "inner": Decimal("62181.303"),
-        "mid": Decimal("50571.78"),
-        "outer": Decimal("37036.044"),
+        "mid": Decimal("51606.839"),
+        "outer": Decimal("38545.906"),
     }
 
 
@@ -179,14 +179,14 @@ def test_cat_spares_do_not_move_executable_live_ladder_prices(
     result = _service().build_standard_prep_economics(
         configuration=settings, fee_pool=FEE_POOL, live_price="0.000075"
     )
-    # Live slots are .000075, .00007875, .0000825 regardless of spares.
-    # The first mid slot is the largest required mid coin: ceil(.2/.00007875).
+    # The 10% configured spread means a 5% move from mid. Live slots and
+    # required prep denominations are unchanged by spare output counts.
     cat_outputs = [o.amount_mojos for o in result["targets"] if o.asset == "cat"]
-    assert cat_outputs == [1_333_334] * (1 + inner_spares) + [2_539_683] * (
+    assert cat_outputs == [1_333_334] * (1 + inner_spares) + [2_601_627] * (
         2 + mid_spares
     )
     assert result["worker_args"]["cat_target"] == 3 + inner_spares + mid_spares
-    assert result["worker_args"]["cat_tier_sizes"] == "inner=1333.334,mid=2539.683"
+    assert result["worker_args"]["cat_tier_sizes"] == "inner=1333.334,mid=2601.627"
 
 
 def test_reversed_modern_buy_positions_keep_counts_paired_with_their_sizes(settings):
