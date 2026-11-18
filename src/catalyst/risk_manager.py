@@ -507,7 +507,11 @@ class RiskManager:
              volatility from price snapshots stored in the local DB.
         """
         now = time.time()
-        if now - self._volatility_updated < 300 and self._cached_volatility > 0:
+        # Cache any computed value, including zero. Thin tokens have too few
+        # trades for a non-zero figure, and requiring one made every spread
+        # calculation refetch Dexie trade history, blocking for up to the
+        # 10 s request timeout whenever the network was slow.
+        if self._volatility_updated > 0 and now - self._volatility_updated < 300:
             return self._cached_volatility
 
         # F37: try Dexie v3 historical trades first
@@ -551,6 +555,7 @@ class RiskManager:
             except Exception:
                 pass
 
+        self._volatility_updated = now
         cached = self._cached_volatility
         if cached is None:
             return Decimal("0")

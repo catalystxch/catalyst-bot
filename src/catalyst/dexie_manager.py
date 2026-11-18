@@ -1038,6 +1038,15 @@ class DexieManager:
     # and trade size distribution for the trading pair.
     # -------------------------------------------------------------------
 
+    _V3_TRADES_FAILURE_BACKOFF_SECS = 60
+
+    def _note_v3_trades_failure(self, ticker_id: str) -> None:
+        if not isinstance(getattr(self, "_v3_trades_failed_until", None), dict):
+            self._v3_trades_failed_until = {}
+        self._v3_trades_failed_until[ticker_id] = (
+            time.time() + self._V3_TRADES_FAILURE_BACKOFF_SECS
+        )
+
     def fetch_v3_historical_trades(
         self, ticker_id: str, limit: int = 50, force: bool = False
     ) -> Optional[List[Dict]]:
@@ -1057,6 +1066,12 @@ class DexieManager:
             return None
         if time.time() < self._rate_limited_until:
             return None
+        # After a failed fetch, wait before trying again so a slow or broken
+        # network does not stall every caller for the full request timeout.
+        failed_until = getattr(self, "_v3_trades_failed_until", {}).get(ticker_id, 0)
+        if time.time() < failed_until:
+            stale = self._v3_trades_cache.get(ticker_id)
+            return stale["trades"] if stale else None
 
         # Cache check
         if not force:
@@ -1086,6 +1101,7 @@ class DexieManager:
                     "dexie_v3_trades_http_error",
                     f"v3 historical_trades returned HTTP {r.status_code}",
                 )
+                self._note_v3_trades_failure(ticker_id)
                 return None
             data = r.json()
         except Exception as e:
@@ -1094,6 +1110,7 @@ class DexieManager:
                 "dexie_v3_trades_error",
                 f"v3 historical_trades fetch failed: {e}",
             )
+            self._note_v3_trades_failure(ticker_id)
             return None
 
         # Dexie v3 returns either a list directly or a dict with "trades" key
@@ -1102,6 +1119,7 @@ class DexieManager:
             return None
 
         # Cache it
+        getattr(self, "_v3_trades_failed_until", {}).pop(ticker_id, None)
         self._v3_trades_cache[ticker_id] = {
             "trades": trades,
             "fetched_at": time.time(),
