@@ -402,7 +402,10 @@ class TestSmartDefaultsSourceContract(unittest.TestCase):
             def refresh(self, **_kwargs):
                 return SimpleNamespace(confidence="confidence")
 
-        with patch.object(market_runtime, "OfferBookMarketRuntime", Runtime):
+        with (
+            patch.object(market_runtime, "OfferBookMarketRuntime", Runtime),
+            patch.object(smart_defaults.cfg, "THIN_MARKET_MODE", False, create=True),
+        ):
             result = smart_defaults._derive_smart_market_confidence(
                 asset_id=self._ASSET_ID,
                 risk_profile="balanced",
@@ -528,6 +531,7 @@ class TestSmartDefaultsSourceContract(unittest.TestCase):
         }
 
         with (
+            patch.object(smart_defaults.cfg, "THIN_MARKET_MODE", False, create=True),
             patch("wallet.get_wallet_balance") as wallet_balance,
             patch("database.clear_market_analysis_cache") as clear_cache,
             patch.object(

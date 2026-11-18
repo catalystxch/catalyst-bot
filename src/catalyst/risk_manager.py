@@ -866,7 +866,11 @@ class RiskManager:
             return False
 
         # --- Dynamic limits (primary) ---
-        if self._price_engine:
+        # Skipped in thin-market mode: the band is centred on a legacy
+        # reference price the Dexie-only cycle never updates, so in a wide or
+        # new market it would cancel the whole ladder over a stale number.
+        # The operator's own hard limits below still apply.
+        if self._price_engine and not bool(getattr(cfg, "THIN_MARKET_MODE", False)):
             dyn_min, dyn_max = self._price_engine.get_dynamic_limits()
             if dyn_min is not None and mid_price < dyn_min:
                 self._trip_circuit_breaker(
@@ -1062,7 +1066,11 @@ class RiskManager:
             # blocked != side: this is the correcting side — let it run
 
         # --- 1b. Market toxicity side throttle ---
-        if bool(getattr(cfg, "MARKET_TOXICITY_ENABLED", True)):
+        # Not applied in thin-market mode: the score treats thin or lopsided
+        # public depth as toxic, which is the normal state of a thin market.
+        if bool(getattr(cfg, "MARKET_TOXICITY_ENABLED", True)) and not bool(
+            getattr(cfg, "THIN_MARKET_MODE", False)
+        ):
             snap = self._market_toxicity_snapshot
             try:
                 if snap is not None and snap.is_side_throttled(side, time.time()):

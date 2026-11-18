@@ -778,7 +778,16 @@ def _age_confidence_snapshot(
             fresh_books += 1
         elif provider_id in source_health:
             source_health[provider_id] = "unavailable"
-    if fresh_books == 0:
+    # Thin-market mode quotes from one provider at full size and keeps quoting
+    # on a held or operator-set price when no provider has a usable book, so
+    # the display must not downgrade what the runtime actually decided.
+    thin_market = bool(getattr(api_server.cfg, "THIN_MARKET_MODE", False))
+    holding_price = thin_market and bool(
+        {"holding_last_trusted_price", "using_manual_reference_price"} & set(reasons)
+    )
+    if fresh_books == 0 and holding_price:
+        pass
+    elif fresh_books == 0:
         aged["state"] = "RED"
         if (
             aged.get("derived_at") is not None
@@ -790,20 +799,25 @@ def _age_confidence_snapshot(
             and "market_evidence_expired" not in reasons
         ):
             reasons.append("market_evidence_expired")
-    elif fresh_books == 1 and str(aged.get("state") or "RED").upper() == "GREEN":
+    elif (
+        fresh_books == 1
+        and not thin_market
+        and str(aged.get("state") or "RED").upper() == "GREEN"
+    ):
         aged["state"] = "AMBER"
         if "single_provider_dependency" not in reasons:
             reasons.append("single_provider_dependency")
     data_valid = str(aged.get("state") or "RED").upper() != "RED"
     aged["data_valid"] = data_valid
     aged["provider_redundancy"] = fresh_books
+    full_capacity = fresh_books >= 2 or thin_market
     aged["follow_capacity_fraction"] = (
-        "0" if not data_valid else ("0.25" if fresh_books < 2 else "1")
+        "0" if not data_valid else ("1" if full_capacity else "0.25")
     )
     aged["market_stage"] = (
         "INVALID"
         if not data_valid
-        else ("FOLLOW_RESTRICTED" if fresh_books < 2 else "FOLLOW")
+        else ("FOLLOW" if full_capacity else "FOLLOW_RESTRICTED")
     )
     aged["reason_codes"] = reasons
     aged["source_health"] = source_health
@@ -874,6 +888,22 @@ def _degraded_timeline(degraded: dict | None, *, now: datetime) -> dict | None:
         "recovery_refreshes": int(degraded.get("recovery_refreshes") or 0),
         "recovery_refreshes_required": 3,
         "recovery_minimum_seconds": 60,
+    }
+
+
+def _thin_market_display_settings() -> dict:
+    """How the ladder is actually shaped in thin-market mode, for the UI."""
+
+    settings = api_server.cfg
+
+    def text(name: str, default: str) -> str:
+        return str(getattr(settings, name, default) or default)
+
+    return {
+        "enabled": bool(getattr(settings, "THIN_MARKET_MODE", False)),
+        "edge_step_bps": text("THIN_MARKET_EDGE_STEP_BPS", "10"),
+        "ladder_depth_bps": text("THIN_MARKET_LADDER_DEPTH_BPS", "1000"),
+        "manual_reference_price": text("MANUAL_REFERENCE_PRICE", "0"),
     }
 
 
@@ -990,6 +1020,7 @@ def api_market_confidence():
         "can_create": can_create,
         "can_requote": can_requote,
         "can_increase_exposure": can_create,
+        "thin_market": _thin_market_display_settings(),
     }
     return jsonify(payload)
 

@@ -21,6 +21,8 @@ def _patch_spread_cfg(monkeypatch):
         "risk_manager.cfg.COMPETITOR_AWARE_ENABLED", False, raising=False
     )
     monkeypatch.setattr("risk_manager.cfg.MARKET_TOXICITY_ENABLED", True, raising=False)
+    # The side throttle is a strict-mode control; thin-market mode skips it.
+    monkeypatch.setattr("risk_manager.cfg.THIN_MARKET_MODE", False, raising=False)
 
 
 def test_toxicity_multiplier_widens_before_clamp(monkeypatch):

@@ -148,7 +148,24 @@ class MarketConfidenceEngine:
         risk_preset: str,
         refresh_cadence_seconds: int = 60,
         minimum_provider_count: int = 2,
+        thin_market: bool = False,
+        fallback_price: Decimal | None = None,
     ) -> None:
+        if type(thin_market) is not bool:
+            raise TypeError("thin_market must be an exact bool")
+        # The operator's own starting price. It is only an anchor of last
+        # resort: used in thin-market mode while no outside price has ever
+        # been trusted (a brand-new token, an empty book, a provider outage).
+        if fallback_price is not None:
+            fallback_price = _price(fallback_price)
+            if fallback_price <= 0:
+                raise ValueError("fallback_price must be positive")
+        self._fallback_price = fallback_price
+        # Thin-market mode quotes from whatever attributable outside book
+        # exists: depth and provider redundancy stop being fatal, and when the
+        # book becomes unusable the last trusted bid/ask are held instead of
+        # withdrawing the ladder.
+        self._thin_market = thin_market
         preset = str(risk_preset).strip().lower()
         if preset not in _PRESETS:
             raise ValueError(
@@ -474,9 +491,9 @@ class MarketConfidenceEngine:
             if provider in executable_provider_ids
             and (selected_providers is None or provider in selected_providers)
         )
+        depth_sufficient = bid_depth >= required_depth and ask_depth >= required_depth
         movement_sample_safe = bool(
-            bid_depth >= required_depth
-            and ask_depth >= required_depth
+            (depth_sufficient or self._thin_market)
             and not source_conflict
             and manipulation_score < int(self._thresholds["manipulation_red"])
         )
@@ -484,7 +501,9 @@ class MarketConfidenceEngine:
             move_bps = _basis_points(proposed_midpoint, self._last_trusted_midpoint)
             hard_cap = move_bps > Decimal(self._thresholds["hard_move_cap_bps"])
             if hard_cap:
-                corroborated = movement_sample_safe and usable_provider_count >= 2
+                corroborated = movement_sample_safe and (
+                    usable_provider_count >= 2 or self._thin_market
+                )
                 pending_anchor_matches = (
                     self._pending_midpoint is not None
                     and _basis_points(proposed_midpoint, self._pending_midpoint)
@@ -551,8 +570,7 @@ class MarketConfidenceEngine:
 
         fatal = bool(
             proposed_midpoint is None
-            or bid_depth < required_depth
-            or ask_depth < required_depth
+            or (not depth_sufficient and not self._thin_market)
             or hard_cap
             or (source_conflict and "chain_override_source_conflict" not in reasons)
             or manipulation_score >= int(self._thresholds["manipulation_red"])
@@ -569,11 +587,35 @@ class MarketConfidenceEngine:
             and proposed_midpoint is not None
         ):
             reasons.append("single_provider_dependency")
-        state = "RED" if fatal else ("AMBER" if amber else "GREEN")
-        data_valid = not fatal
+        has_trusted_anchor = (
+            self._last_trusted_midpoint is not None
+            and self._last_trusted_bid is not None
+            and self._last_trusted_ask is not None
+        )
+        using_fallback = bool(
+            self._thin_market
+            and fatal
+            and not has_trusted_anchor
+            and self._fallback_price is not None
+        )
+        holding = bool(
+            self._thin_market and fatal and (has_trusted_anchor or using_fallback)
+        )
+        if using_fallback:
+            reasons.append("using_manual_reference_price")
+            state = "AMBER"
+        elif holding:
+            reasons.append("holding_last_trusted_price")
+            state = "AMBER"
+        else:
+            state = "RED" if fatal else ("AMBER" if amber else "GREEN")
+        data_valid = holding or not fatal
         if not data_valid:
             follow_capacity_fraction = Decimal("0")
             market_stage = "INVALID"
+        elif self._thin_market:
+            follow_capacity_fraction = Decimal("1")
+            market_stage = "FOLLOW"
         elif usable_provider_count < 2:
             follow_capacity_fraction = Decimal("0.25")
             market_stage = "FOLLOW_RESTRICTED"
@@ -594,6 +636,27 @@ class MarketConfidenceEngine:
         trusted_midpoint = self._last_trusted_midpoint
         trusted_bid = self._last_trusted_bid
         trusted_ask = self._last_trusted_ask
+        if using_fallback:
+            # Not written to the trusted state: changing the setting takes
+            # effect at once, and the first real outside book replaces it.
+            trusted_midpoint = trusted_bid = trusted_ask = self._fallback_price
+        if holding:
+            # Never quote at a held edge that is worse than the edge visible
+            # right now: sells stay at the higher ask, buys at the lower bid.
+            if best_ask is not None and best_ask > trusted_ask:
+                trusted_ask = best_ask
+            if best_bid is not None and best_bid < trusted_bid:
+                trusted_bid = best_bid
+            # Nor cross a lone visible edge: no buying above an ask that is
+            # on the book, no selling below a bid that is on the book.
+            if best_ask is not None and trusted_bid > best_ask:
+                trusted_bid = best_ask
+            if best_bid is not None and trusted_ask < best_bid:
+                trusted_ask = best_bid
+            if trusted_bid < trusted_ask:
+                trusted_midpoint = (trusted_bid + trusted_ask) / Decimal(2)
+            else:
+                trusted_midpoint = trusted_ask = trusted_bid
 
         self._prior_offer_ids = frozenset(churn_ids)
         self._prior_observed_at = current_time if churn_ids else None

@@ -5,6 +5,32 @@ All notable changes to CATalyst are recorded here.
 This changelog was added during public-readiness work. Earlier release notes may
 be reconstructed from GitHub Releases and tag history where available.
 
+## Unreleased
+
+Thin-market mode: build and keep a ladder on any token, however thin or new.
+
+- Added `THIN_MARKET_MODE` (on by default). The ladder no longer needs outside
+  depth or a second price source: it quotes from whatever Dexie book exists,
+  holds the last good bid and ask when the book becomes unusable, and never
+  withdraws because a refresh failed or ran late.
+- Each side is anchored to its own outside edge: the inner sell sits
+  `THIN_MARKET_EDGE_STEP_BPS` below the best outside ask, the inner buy the
+  same distance above the best outside bid, and each side reaches
+  `THIN_MARKET_LADDER_DEPTH_BPS` (10%) away from there.
+- Added `MANUAL_REFERENCE_PRICE`, a starting price for a token with no usable
+  book and no price history.
+- Profit-floor, snapshot-age, book-improvement, toxicity-throttle,
+  dynamic-band and 90-second rediscovery checks warn instead of blocking in
+  thin-market mode. Hard min/max price, position and reserve limits still apply.
+- Smart Settings no longer refuses a wide or shallow market, sizes for the
+  offers-per-side the operator entered, and no longer comes out one offer short.
+- Fixed startup refusing to run with `PUBLICATION_CLAIM_RECOVERY_REQUIRED`
+  after Splash publications failed in an earlier safety generation.
+- Fixed a resumed ladder being treated as an emergency price move on restart.
+- Fixed offers created before a restart being impossible to replace.
+- Dashboard, guidance and Market Intelligence now describe what thin-market
+  mode is actually doing.
+
 ## v1.3.5 - 2026-08-25
 
 - Fixed the Windows clean-install startup path so an unconfigured Sage wallet

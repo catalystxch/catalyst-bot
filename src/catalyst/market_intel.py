@@ -481,10 +481,13 @@ class MarketIntel:
         # aggregated Dexie price orderbook has already collapsed the book
         # into executable levels, so keep legitimately wide low-supply CAT
         # markets visible instead of blanking their depth.
+        # Thin-market mode also trusts the raw book: the junk guard assumes
+        # bids within 2x of asks, which empties a genuinely wide market and
+        # reports "no competitors" while real outside offers exist.
         trust_aggregated_book = source in {
             "dexie_v2_orderbook",
             "dexie_v3_orderbook",
-        }
+        } or bool(getattr(cfg, "THIN_MARKET_MODE", False))
         _raw_best_buy = competitor_buys[0]["price"] if competitor_buys else Decimal("0")
         _raw_best_sell = (
             competitor_sells[0]["price"] if competitor_sells else Decimal("0")

@@ -896,10 +896,19 @@ def test_bot_market_runtime_matches_provider_requirement_to_splash_configuration
     monkeypatch.setattr(bot_loop.cfg, "LOOP_SECONDS", 90, raising=False)
     monkeypatch.setattr(bot_loop.cfg, "MARKET_RISK_PRESET", "balanced", raising=False)
     monkeypatch.setattr(bot_loop.cfg, "SPLASH_ENABLED", splash_enabled, raising=False)
+    monkeypatch.setattr(bot_loop.cfg, "THIN_MARKET_MODE", False, raising=False)
 
     loop._ensure_market_runtime(ASSET_ID)
 
     assert captured["minimum_provider_count"] == 2
+    assert captured["thin_market"] is False
+
+    # Thin-market mode quotes from a single provider's book.
+    monkeypatch.setattr(bot_loop.cfg, "THIN_MARKET_MODE", True, raising=False)
+    loop._ensure_market_runtime(ASSET_ID)
+
+    assert captured["minimum_provider_count"] == 1
+    assert captured["thin_market"] is True
 
 
 def test_follow_capacity_restricts_configured_offer_target():
@@ -1505,6 +1514,7 @@ def test_market_refresh_failure_enforces_red_withdrawal_when_persistence_fails(
     withdrawals = []
     loop._apply_market_withdrawal = lambda value: withdrawals.append(value)
     monkeypatch.setattr(bot_loop.cfg, "CAT_ASSET_ID", ASSET_ID, raising=False)
+    monkeypatch.setattr(bot_loop.cfg, "THIN_MARKET_MODE", False, raising=False)
 
     decision = loop._enforce_market_refresh_failure(
         now=NOW,
@@ -1545,3 +1555,26 @@ def test_all_mutation_adjacent_price_reads_use_offer_book_confidence_only():
     for method in methods:
         source = inspect.getsource(method)
         assert "self.price_engine.get_price(" not in source, method.__name__
+
+
+def test_thin_market_refresh_failure_keeps_the_ladder(monkeypatch):
+    import bot_loop
+
+    loop = bot_loop.BotLoop.__new__(bot_loop.BotLoop)
+    loop._market_runtime = None
+    states = []
+    loop._set_state = lambda **kwargs: states.append(kwargs)
+    withdrawals = []
+    loop._apply_market_withdrawal = lambda value: withdrawals.append(value)
+    monkeypatch.setattr(bot_loop.cfg, "CAT_ASSET_ID", ASSET_ID, raising=False)
+    monkeypatch.setattr(bot_loop.cfg, "THIN_MARKET_MODE", True, raising=False)
+
+    decision = loop._enforce_market_refresh_failure(
+        now=NOW,
+        error=RuntimeError("provider refresh failed"),
+    )
+
+    assert withdrawals == []
+    assert decision.cancel_tiers == ()
+    assert decision.can_create is False
+    assert states == [{"market_confidence_reason_codes": ["market_refresh_failed"]}]

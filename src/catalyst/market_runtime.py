@@ -9,7 +9,7 @@ degraded-market controller as one coherent refresh.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from decimal import ROUND_CEILING, Decimal
 import json
 from typing import Callable
@@ -48,8 +48,12 @@ class OfferBookMarketRuntime:
         refresh_cadence_seconds: int = 60,
         minimum_provider_count: int = 2,
         evidence_freshness_seconds: int = 30,
+        thin_market: bool = False,
+        fallback_price: Decimal | None = None,
     ) -> None:
         self.asset_id = str(asset_id).strip().lower()
+        self._thin_market = thin_market
+        self._evidence_freshness_seconds = evidence_freshness_seconds
         self._fetch_splash_health = fetch_splash_health
         self._dexie = DexieOrderbookProvider(
             fetch_book=fetch_dexie_book,
@@ -66,6 +70,8 @@ class OfferBookMarketRuntime:
             risk_preset=risk_preset,
             refresh_cadence_seconds=refresh_cadence_seconds,
             minimum_provider_count=minimum_provider_count,
+            thin_market=thin_market,
+            fallback_price=fallback_price,
         )
         persisted_state = load_confidence_engine_state(self.asset_id)
         if persisted_state is not None:
@@ -137,11 +143,17 @@ class OfferBookMarketRuntime:
             for observation in (dexie, splash)
             if observation.quality.value == "valid" and observation.fresh_until >= now
         ]
+        if valid_observation_deadlines:
+            valid_until = min(valid_observation_deadlines)
+        elif self._thin_market and confidence.data_valid:
+            # A held or operator-set price does not expire with the provider:
+            # an empty book or an outage must not turn into a withdrawal.
+            valid_until = now + timedelta(seconds=self._evidence_freshness_seconds)
+        else:
+            valid_until = now
         return OfferBookRuntimeResult(
             confidence=confidence,
             degraded=degraded,
             snapshot_id=snapshot_id,
-            valid_until=(
-                min(valid_observation_deadlines) if valid_observation_deadlines else now
-            ),
+            valid_until=valid_until,
         )
