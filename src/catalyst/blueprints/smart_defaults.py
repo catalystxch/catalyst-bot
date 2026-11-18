@@ -969,6 +969,16 @@ def _smart_market_own_offer_identities(asset_id: str) -> frozenset[str]:
     return frozenset(identities)
 
 
+def _smart_manual_reference_price() -> Decimal | None:
+    """Operator's starting price, or None when it is not set."""
+
+    try:
+        price = Decimal(str(getattr(cfg, "MANUAL_REFERENCE_PRICE", "0") or "0"))
+    except (ArithmeticError, TypeError, ValueError):
+        return None
+    return price if price.is_finite() and price > 0 else None
+
+
 def _derive_smart_market_confidence(
     *,
     asset_id: str,
@@ -1001,6 +1011,7 @@ def _derive_smart_market_confidence(
             return []
         return active_bot._get_fresh_splash_confidence_offers(requested_asset, now=now)
 
+    _thin_market = bool(getattr(cfg, "THIN_MARKET_MODE", False))
     runtime = OfferBookMarketRuntime(
         asset_id=asset_id,
         risk_preset=risk_profile,
@@ -1011,7 +1022,9 @@ def _derive_smart_market_confidence(
         ),
         fetch_splash_offers=splash_offers,
         fetch_splash_health=splash_health,
-        minimum_provider_count=2,
+        minimum_provider_count=1 if _thin_market else 2,
+        thin_market=_thin_market,
+        fallback_price=_smart_manual_reference_price() if _thin_market else None,
     )
     return runtime.refresh(
         own_offer_identities=own_offer_identities,
@@ -1086,6 +1099,7 @@ def api_smart_defaults():
         cat_name = (request.args.get("cat_name", "") or "").strip()
         cat_wallet_id = _positive_int_or_none(request.args.get("cat_wallet_id"))
         cat_decimals = _nonnegative_int_or_none(request.args.get("cat_decimals"))
+        target_offers = _positive_int_or_none(request.args.get("target_offers"))
         return api_server._calculate_smart_defaults(
             xch_reserve=xch_res,
             cat_reserve=cat_res,
@@ -1097,6 +1111,7 @@ def api_smart_defaults():
             cat_decimals=cat_decimals,
             cat_ticker_id=cat_ticker_id or None,
             cat_name=cat_name or None,
+            target_offers=target_offers,
         )
     except Exception as e:
         import traceback
@@ -1120,6 +1135,7 @@ def _calculate_smart_defaults(
     cat_decimals=None,
     cat_ticker_id=None,
     cat_name=None,
+    target_offers=None,
 ):
     """Smart Defaults v2 — data-driven settings from 30 days of market data.
 
@@ -1294,13 +1310,24 @@ def _calculate_smart_defaults(
     )
     bootstrap_reason_codes = _smart_bootstrap_suggestion_reasons(market_confidence)
     bootstrap_suggested = bool(bootstrap_reason_codes)
+    thin_market_mode = bool(getattr(cfg, "THIN_MARKET_MODE", False))
+    if thin_market_mode and data_valid is True:
+        # Thin-market mode sizes a ladder for whatever market exists: a wide,
+        # shallow or one-sided book is a warning here, never a refusal.
+        bootstrap_suggested = False
     if data_valid is not True or bootstrap_suggested:
         reason_codes = list(market_confidence.reason_codes)
-        message = (
-            "Follow market is unsuitable; Bootstrap may be configured separately"
-            if bootstrap_suggested
-            else "Follow market data is invalid"
-        )
+        if bootstrap_suggested:
+            message = (
+                "Follow market is unsuitable; Bootstrap may be configured separately"
+            )
+        elif thin_market_mode:
+            message = (
+                "No price is available for this token: Dexie shows no two-sided "
+                "book. Set a starting price, then run Smart Settings again"
+            )
+        else:
+            message = "Follow market data is invalid"
         log_event(
             "warning",
             "smart_defaults_market_confidence_blocked",
@@ -2272,6 +2299,11 @@ def _calculate_smart_defaults(
     else:
         _market_n = 24
 
+    # The operator's own offers-per-side choice wins over the activity-based
+    # count; sizes are then solved so that many offers fit the balance.
+    if target_offers is not None and 1 <= int(target_offers) <= 200:
+        _market_n = int(target_offers)
+
     # Hard cap: never more offers than the minimum floor can support
     # (uses 2.5 as an approximate capital factor before tier selection)
     _max_possible_n = max(2, int(_trading_xch / (_MIN_OFFER_XCH * 2.5)))
@@ -2459,6 +2491,12 @@ def _calculate_smart_defaults(
                 return _solve_base_cat(n)
             return min(_solve_base_xch(n), _solve_base_cat(n))
 
+        from math import floor as _math_floor
+
+        # A size solved for exactly n offers gives a capacity of n.0 minus
+        # float noise; without this the int() floors below report n - 1.
+        _CAPACITY_EPSILON = 1e-6
+
         _base_size = _solve_base(_target_n)
 
         # Enforce minimum floor — reduce n if needed.
@@ -2495,6 +2533,7 @@ def _calculate_smart_defaults(
                 int(
                     (_xch_units_avail / _CP_HEADROOM_MULT - _BUY_SPARE_OVERHEAD)
                     / max(1e-9, _BUY_TIER_FACTOR)
+                    + _CAPACITY_EPSILON
                 ),
             )
             _n_buy = max(1, min(_target_n, _n_buy))
@@ -2516,6 +2555,7 @@ def _calculate_smart_defaults(
                     int(
                         (_cat_units_avail / _CP_HEADROOM_MULT - _SPARE_OVERHEAD)
                         / max(1e-9, _TIER_CAPITAL_FACTOR)
+                        + _CAPACITY_EPSILON
                     ),
                 )
         elif _avail_cat <= 0:
@@ -2530,7 +2570,11 @@ def _calculate_smart_defaults(
             _n_final = max(1, min(_n_buy, _n_sell)) if _n_sell > 0 else max(1, _n_buy)
 
         # Recalculate base size with agreed n (uses the binding constraint).
-        _base_size = max(_MIN_OFFER_XCH, round(_solve_base(_n_final), 4))
+        # Round DOWN: rounding the solved size up by a fraction of a mojo-XCH
+        # made the capacity re-check below come out one offer short.
+        _base_size = max(
+            _MIN_OFFER_XCH, _math_floor(_solve_base(_n_final) * 10000) / 10000
+        )
 
         # Re-check CAT capacity against the definitive final base_size.
         if (
@@ -2549,6 +2593,7 @@ def _calculate_smart_defaults(
                     int(
                         (_cat_units_avail / _CP_HEADROOM_MULT - _SPARE_OVERHEAD)
                         / max(1e-9, _TIER_CAPITAL_FACTOR)
+                        + _CAPACITY_EPSILON
                     ),
                 )
         _n_sell_cap = _n_sell  # definitive CAT-backed sell capacity

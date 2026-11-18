@@ -34032,7 +34032,12 @@ def suppress_orphaned_dispatched_publications_at_startup(
                 if (
                     claim_generation != attempt_count
                     or row_version < claim_generation
-                    or recovery_generation != latch_generation
+                    # A row from an EARLIER safety generation is still an
+                    # orphan: the latch advances during a normal run, and
+                    # requiring equality left such rows blocking every
+                    # later start for good. Only a row claiming a newer
+                    # generation than the latch is inconsistent.
+                    or recovery_generation > latch_generation
                     or row.get("next_attempt_at") is not None
                     or any(
                         row.get(field) is not None

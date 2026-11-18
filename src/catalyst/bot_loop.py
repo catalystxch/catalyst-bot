@@ -77,6 +77,7 @@ from sniper import Sniper
 from boost_manager import BoostManager
 from market_intel import MarketIntel
 from market_toxicity import MarketToxicityGuard, ToxicityContext
+from ladder_sizing import thin_market_edges, thin_market_side_mid
 from market_runtime import OfferBookMarketRuntime
 from degraded_market import DegradedMarketController, DegradedMarketDecision
 from runtime_monitor import RuntimeMonitor
@@ -1226,7 +1227,11 @@ class BotLoop:
         seconds_remaining = (
             valid_until.astimezone(timezone.utc) - current_time
         ).total_seconds()
-        if 0 < seconds_remaining <= 5:
+        # Thin-market mode also refreshes when the permit has already expired
+        # (a slow wallet sync or database wait), instead of treating a late
+        # cycle as a market failure.
+        thin_market = bool(getattr(cfg, "THIN_MARKET_MODE", False))
+        if (0 < seconds_remaining <= 5) or (thin_market and seconds_remaining <= 0):
             try:
                 self._refresh_offer_book_market()
             except Exception as exc:
@@ -1626,7 +1631,26 @@ class BotLoop:
             else:
                 result["pending"] += 1
 
-        if cancel_trade_ids and self._enter_runtime_effect_phase("cancel"):
+        if cancel_trade_ids and bool(getattr(cfg, "THIN_MARKET_MODE", False)):
+            # Thin-market mode keeps an offer that Dexie has not listed yet:
+            # slow indexing or an outage must not tear the ladder down. Warn
+            # once per offer and leave it live for the repost path.
+            warned = getattr(self, "_publication_unconfirmed_warned", None)
+            if type(warned) is not set:
+                warned = set()
+                self._publication_unconfirmed_warned = warned
+            fresh = sorted(set(cancel_trade_ids) - warned)
+            if fresh:
+                warned.update(fresh)
+                log_event(
+                    "warning",
+                    "offer_publication_unconfirmed",
+                    f"{len(fresh)} offer(s) not yet seen on Dexie after 90 "
+                    "seconds; keeping them live",
+                    data={"trade_ids": fresh},
+                )
+            result["unconfirmed"] = len(set(cancel_trade_ids))
+        elif cancel_trade_ids and self._enter_runtime_effect_phase("cancel"):
             unique_trade_ids = sorted(set(cancel_trade_ids))
             self.offer_manager.cancel_offers(
                 unique_trade_ids,
@@ -1702,7 +1726,18 @@ class BotLoop:
     def _ensure_market_runtime(self, asset_id: str) -> OfferBookMarketRuntime:
         asset = str(asset_id or "").strip().lower()
         refresh_cadence = max(1, int(getattr(cfg, "LOOP_SECONDS", 90) or 90))
-        minimum_provider_count = 2
+        thin_market = bool(getattr(cfg, "THIN_MARKET_MODE", False))
+        minimum_provider_count = 1 if thin_market else 2
+        fallback_price = None
+        if thin_market:
+            try:
+                manual_price = Decimal(
+                    str(getattr(cfg, "MANUAL_REFERENCE_PRICE", "0") or "0")
+                )
+                if manual_price.is_finite() and manual_price > 0:
+                    fallback_price = manual_price
+            except (ArithmeticError, TypeError, ValueError):
+                fallback_price = None
         risk_preset = (
             str(getattr(cfg, "MARKET_RISK_PRESET", "balanced") or "balanced")
             .strip()
@@ -1715,6 +1750,8 @@ class BotLoop:
             and getattr(self, "_market_runtime_refresh_cadence", 0) == refresh_cadence
             and getattr(self, "_market_runtime_minimum_provider_count", 0)
             == minimum_provider_count
+            and getattr(self, "_market_runtime_thin_market", False) == thin_market
+            and getattr(self, "_market_runtime_fallback_price", None) == fallback_price
         ):
             return self._market_runtime
 
@@ -1771,7 +1808,11 @@ class BotLoop:
             fetch_splash_health=self._splash_confidence_health,
             refresh_cadence_seconds=refresh_cadence,
             minimum_provider_count=minimum_provider_count,
+            thin_market=thin_market,
+            fallback_price=fallback_price,
         )
+        self._market_runtime_thin_market = thin_market
+        self._market_runtime_fallback_price = fallback_price
         self._market_runtime_asset_id = asset
         self._market_runtime_risk_preset = risk_preset
         self._market_runtime_refresh_cadence = refresh_cadence
@@ -1813,6 +1854,7 @@ class BotLoop:
                 timezone.utc
             ) + timedelta(seconds=30)
         self._market_refresh_failure_since = None
+        self._sync_thin_market_edges(result.confidence)
         self._apply_market_withdrawal(result.degraded)
         dexie_snapshot = self.market_intel.get_attributable_orderbook()
         splash_snapshot = self._get_fresh_splash_confidence_offers(
@@ -1860,6 +1902,33 @@ class BotLoop:
         """Turn any confidence-refresh exception into progressive RED safety."""
 
         current = now.astimezone(timezone.utc)
+        if bool(getattr(cfg, "THIN_MARKET_MODE", False)):
+            # Thin-market mode never withdraws the ladder because a refresh
+            # failed: warn, leave live offers alone, and retry next time. The
+            # phase gate still refuses to create against an expired snapshot.
+            log_event(
+                "warning",
+                "market_confidence_refresh_failed",
+                "Offer-book refresh failed; keeping the current ladder and "
+                f"retrying: {error}",
+            )
+            self._set_state(market_confidence_reason_codes=["market_refresh_failed"])
+            existing = getattr(self, "_market_degraded_decision", None)
+            if existing is not None:
+                return existing
+            return DegradedMarketDecision(
+                confidence_state="AMBER",
+                can_create=False,
+                can_requote=False,
+                cancel_tiers=(),
+                paused=False,
+                recovering=False,
+                stage="NONE",
+                degraded_since=None,
+                recovery_refreshes=0,
+                notify=False,
+                reason_code="MARKET_REFRESH_FAILED_HOLDING",
+            )
         decision = None
         controller = getattr(getattr(self, "_market_runtime", None), "_degraded", None)
         if controller is None:
@@ -3256,8 +3325,115 @@ class BotLoop:
                 f"Circuit breaker could not cancel live offers: {e} — will retry next cycle",
             )
 
+    def _apply_thin_market_startup_baseline(self, startup_mid: Decimal) -> None:
+        """Baseline each side on what its resumed ladder was really quoted at.
+
+        Thin-market drift is measured on a per-side mid anchored to that
+        side's outside edge. Leaving the plain midpoint as the baseline makes
+        an untouched, resumed ladder look like an emergency price move and
+        requotes both sides on every cycle after a restart.
+        """
+        if not bool(getattr(cfg, "THIN_MARKET_MODE", False)):
+            return
+        try:
+            inner_edge = Decimal(str(getattr(cfg, "MIN_EDGE_BPS", "0") or "0")) / (
+                Decimal("10000")
+            )
+            if not Decimal("0") <= inner_edge < 1:
+                return
+            rows = get_open_offers(cat_asset_id=getattr(cfg, "CAT_ASSET_ID", None))
+        except Exception as exc:
+            log_event(
+                "warning",
+                "thin_market_startup_baseline_failed",
+                f"Could not read resumed offers for the requote baseline: {exc}",
+            )
+            return
+        for side in ("buy", "sell"):
+            current_mid = self._get_thin_market_side_mid(side)
+            if current_mid is None:
+                continue
+            prices = []
+            for row in rows:
+                if str(row.get("side") or "").lower() != side:
+                    continue
+                try:
+                    price = Decimal(str(row.get("price_xch") or "0"))
+                except (ArithmeticError, TypeError, ValueError):
+                    continue
+                if price.is_finite() and price > 0:
+                    prices.append(price)
+            if prices and side == "buy":
+                quoted_mid = max(prices) / (Decimal("1") - inner_edge)
+            elif prices:
+                quoted_mid = min(prices) / (Decimal("1") + inner_edge)
+            else:
+                quoted_mid = current_mid
+            self._last_quoted_price[side] = quoted_mid
+            self._ladder_grid_mid[side] = quoted_mid
+            self._ladder_anchor_plain_mid[side] = startup_mid
+            log_event(
+                "info",
+                "thin_market_startup_baseline",
+                f"{side} requote baseline set from the resumed ladder: "
+                f"{quoted_mid:.8f} (current side mid {current_mid:.8f})",
+            )
+
+    def _sync_thin_market_edges(self, confidence) -> None:
+        """Tell the offer manager where thin-market ladders currently start."""
+        manager = getattr(self, "offer_manager", None)
+        setter = getattr(manager, "set_thin_market_edges", None)
+        if setter is None:
+            return
+        edges = None
+        if (
+            bool(getattr(cfg, "THIN_MARKET_MODE", False))
+            and confidence is not None
+            and getattr(confidence, "data_valid", False) is True
+        ):
+            try:
+                edges = thin_market_edges(
+                    trusted_bid=getattr(confidence, "trusted_bid", None),
+                    trusted_ask=getattr(confidence, "trusted_ask", None),
+                    step_bps=getattr(cfg, "THIN_MARKET_EDGE_STEP_BPS", Decimal("10")),
+                )
+            except (ArithmeticError, TypeError, ValueError):
+                edges = None
+        try:
+            if edges is None:
+                setter(None, None)
+            else:
+                setter(edges[0], edges[1])
+        except Exception as exc:
+            log_event(
+                "warning",
+                "thin_market_edges_sync_failed",
+                f"Could not update thin-market ladder edges: {exc}",
+            )
+
+    def _get_thin_market_side_mid(self, side: str) -> Optional[Decimal]:
+        """Thin-market mode: anchor each side just inside its outside book edge."""
+        if not bool(getattr(cfg, "THIN_MARKET_MODE", False)):
+            return None
+        confidence = getattr(self, "_market_confidence_result", None)
+        if confidence is None or getattr(confidence, "data_valid", False) is not True:
+            return None
+        try:
+            return thin_market_side_mid(
+                side,
+                trusted_bid=getattr(confidence, "trusted_bid", None),
+                trusted_ask=getattr(confidence, "trusted_ask", None),
+                step_bps=getattr(cfg, "THIN_MARKET_EDGE_STEP_BPS", Decimal("10")),
+                min_edge_bps=getattr(cfg, "MIN_EDGE_BPS", Decimal("0")),
+            )
+        except (ArithmeticError, TypeError, ValueError):
+            return None
+
     def _get_probe_anchored_mid(self, side: str, fallback_mid: Decimal) -> Decimal:
         """Back-solve a side-specific ladder mid from the surviving probe edge."""
+        thin_mid = self._get_thin_market_side_mid(side)
+        if thin_mid is not None:
+            return thin_mid
         try:
             probe = self._probe_state or {}
             if probe.get("active", False):
@@ -8229,6 +8405,7 @@ class BotLoop:
             self._last_quoted_price["sell"] = startup_mid
             self._last_quoted_plain_mid["buy"] = startup_mid
             self._last_quoted_plain_mid["sell"] = startup_mid
+            self._apply_thin_market_startup_baseline(startup_mid)
             self._current_mid_price = startup_mid
             with self._probe_lock:
                 if self._probe_state.get("confirmed_price") in (
@@ -9780,8 +9957,9 @@ class BotLoop:
                 log_event(
                     "warning",
                     "market_confidence_no_trusted_price",
-                    "No attributable trusted offer-book price is available; "
-                    "new exposure and requotes remain blocked",
+                    "No price is available for this token: Dexie shows no "
+                    "two-sided book and no starting price is set. Set a "
+                    "starting price (MANUAL_REFERENCE_PRICE) to build the ladder",
                 )
                 self._market_no_trusted_price_warned = True
             return
@@ -13763,9 +13941,20 @@ class BotLoop:
                 # Replacement: check drift of current plain mid vs the
                 # stored plain anchor (invariant of probe state).
                 try:
-                    drift_pct = (
-                        abs(mid_price - _plain_anchor) / _plain_anchor * Decimal("100")
-                    )
+                    if self._get_thin_market_side_mid(side) is not None:
+                        # Thin-market sides are anchored to their own outside
+                        # edge, so measure drift on that same side mid. The
+                        # plain mid moves when the OTHER edge moves, which
+                        # must not stall this side's refills.
+                        drift_pct = (
+                            abs(probe_anchored_mid - _grid) / _grid * Decimal("100")
+                        )
+                    else:
+                        drift_pct = (
+                            abs(mid_price - _plain_anchor)
+                            / _plain_anchor
+                            * Decimal("100")
+                        )
                 except Exception:
                     drift_pct = Decimal("0")
                 if drift_pct > self._ladder_anchor_drift_pct and recovery_active:

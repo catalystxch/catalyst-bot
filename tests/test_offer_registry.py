@@ -1753,3 +1753,39 @@ def test_authorizers_are_total_for_malformed_public_inputs():
         authorize_transition(object(), object(), "terminal", WALLET, NETWORK).code
         is AuthorizationCode.INVALID_INPUT
     )
+
+
+def test_replacement_is_allowed_for_an_offer_created_by_an_earlier_run():
+    """A restart starts a new run; pre-restart offers must stay replaceable."""
+
+    parent = record(state=RegistryState.VISIBLE, child_intent_id=None)
+    child = replace(
+        record(
+            intent_id="intent-child",
+            state=RegistryState.PREPARED,
+            trade_id=None,
+            offer_hash=None,
+            parent_intent_id=parent.intent_id,
+            generation=2,
+        ),
+        run_id="run-after-restart",
+    )
+    allowed = authorize_mutation(
+        RegistrySnapshot((parent, child)),
+        request(
+            MutationKind.CREATE,
+            ref=OfferReference(intent_id=child.intent_id),
+        ),
+    )
+    assert allowed.allowed is True
+
+    # Everything else about the slot must still match exactly.
+    other_wallet = replace(child, wallet_fingerprint_hash="f" * 64)
+    denied = authorize_mutation(
+        RegistrySnapshot((parent, other_wallet)),
+        request(
+            MutationKind.CREATE,
+            ref=OfferReference(intent_id=other_wallet.intent_id),
+        ),
+    )
+    assert denied.allowed is False

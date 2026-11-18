@@ -29,7 +29,11 @@ from typing import Optional, Dict, List, Tuple, Callable, Any
 
 from config import cfg
 from liquidity_side import bootstrap_side_enabled
-from ladder_sizing import classify_slot_tier, ladder_price_for_slot
+from ladder_sizing import (
+    classify_slot_tier,
+    ladder_price_for_slot,
+    thin_market_slot_price,
+)
 from database import (
     add_offer,
     update_offer_status,
@@ -338,6 +342,40 @@ def assess_offer_book_candidate(
         "improves_book": improves_book,
         "evidence_digest": evidence_digest,
     }
+
+
+_THIN_MARKET_HARD_BLOCKS = frozenset(
+    {
+        "market_data_invalid",
+        "trusted_range_missing",
+        "trusted_range_invalid",
+        "candidate_outside_profitable_side",
+    }
+)
+
+
+def _assess_candidate_for_market_mode(**kwargs: Any) -> Dict[str, Any]:
+    """Apply the candidate guard, relaxed to warnings in thin-market mode.
+
+    Thin-market mode exists so a ladder can always be built. The profit
+    floor, snapshot-age and book-improvement limits assume a deep outside
+    market and would skip exactly the inner slots a thin ladder needs, so
+    there they are reported and not enforced. A candidate with no usable
+    price, or on the wrong side of the midpoint, is still refused.
+    """
+
+    guard = assess_offer_book_candidate(**kwargs)
+    if not bool(getattr(cfg, "THIN_MARKET_MODE", False)):
+        return guard
+    reason = guard.get("reason_code")
+    if reason in _THIN_MARKET_HARD_BLOCKS:
+        return guard
+    relaxed = dict(guard)
+    if not guard.get("eligible"):
+        relaxed["warning_code"] = reason
+    relaxed["eligible"] = True
+    relaxed["improves_book"] = False
+    return relaxed
 
 
 def book_opportunity_size_cap(
@@ -4660,7 +4698,7 @@ class OfferManager:
             market_guard = None
             purpose = "normal_lifecycle"
             if market_confidence is not None:
-                market_guard = assess_offer_book_candidate(
+                market_guard = _assess_candidate_for_market_mode(
                     side=side,
                     candidate_price=price,
                     size_xch=size_xch,
@@ -4708,7 +4746,7 @@ class OfferManager:
                             str(wallet_cat): -int(cat_mojos),
                             str(cfg.WALLET_ID_XCH): int(xch_mojos),
                         }
-                    market_guard = assess_offer_book_candidate(
+                    market_guard = _assess_candidate_for_market_mode(
                         side=side,
                         candidate_price=price,
                         size_xch=size_xch,
@@ -4927,7 +4965,7 @@ class OfferManager:
         # effect so clamping or atomic rounding cannot evade the profit floor.
         if market_confidence is not None:
             for spec in offer_specs:
-                final_guard = assess_offer_book_candidate(
+                final_guard = _assess_candidate_for_market_mode(
                     side=side,
                     candidate_price=spec["price"],
                     size_xch=spec["size_xch"],
@@ -4996,7 +5034,7 @@ class OfferManager:
 
             market_guard = spec.get("market_guard") or {}
             if market_confidence is not None:
-                market_guard = assess_offer_book_candidate(
+                market_guard = _assess_candidate_for_market_mode(
                     side=side,
                     candidate_price=spec["price"],
                     size_xch=spec["size_xch"],
@@ -5402,6 +5440,19 @@ class OfferManager:
         This creates a smooth orderbook: tight offers near mid price
         (where most fills happen) and wider offers at the extremes.
         """
+        thin_edge = (getattr(self, "_thin_market_edges", None) or {}).get(side)
+        if thin_edge is not None and bool(getattr(cfg, "THIN_MARKET_MODE", False)):
+            # Thin-market ladders start at their outside-book edge and reach
+            # a fixed depth from it; the midpoint spread does not apply.
+            thin_price = thin_market_slot_price(
+                slot,
+                side,
+                thin_edge,
+                getattr(cfg, "THIN_MARKET_LADDER_DEPTH_BPS", Decimal("1000")),
+                max_offers,
+            )
+            if thin_price is not None:
+                return thin_price
         return ladder_price_for_slot(
             slot,
             side,
@@ -5410,6 +5461,18 @@ class OfferManager:
             max_offers,
             min_edge_bps=getattr(cfg, "MIN_EDGE_BPS", Decimal("0")),
         )
+
+    def set_thin_market_edges(
+        self, buy_edge: Optional[Decimal], sell_edge: Optional[Decimal]
+    ) -> None:
+        """Record the current inner-slot prices for thin-market ladders.
+
+        Pass None for both to return to ordinary midpoint pricing.
+        """
+        if buy_edge is None or sell_edge is None:
+            self._thin_market_edges = {}
+        else:
+            self._thin_market_edges = {"buy": buy_edge, "sell": sell_edge}
 
     def _interpolate_refill_price(
         self,

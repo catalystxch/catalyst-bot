@@ -165,6 +165,7 @@ def test_bot_cancels_via_authoritative_manager_after_discovery_deadline(
         cancel_offers=lambda ids, **kwargs: cancelled.extend(ids) or {}
     )
     monkeypatch.setattr(bot_loop.cfg, "CAT_ASSET_ID", intent["asset_id"], raising=False)
+    monkeypatch.setattr(bot_loop.cfg, "THIN_MARKET_MODE", False, raising=False)
     monkeypatch.setattr(
         loop, "_enter_runtime_effect_phase", lambda phase: phase == "cancel"
     )

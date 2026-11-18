@@ -843,9 +843,12 @@ def _lineage_decision(
     for related in (parent, child):
         if related is None:
             continue
+        # The run id is deliberately not compared. A restart starts a new run,
+        # and offers created before it must stay replaceable afterwards or the
+        # ladder can never be requoted again. Wallet, network, asset, side,
+        # tier and slot still have to match exactly.
         if (
-            related.run_id != record.run_id
-            or related.wallet_fingerprint_hash != record.wallet_fingerprint_hash
+            related.wallet_fingerprint_hash != record.wallet_fingerprint_hash
             or related.network != record.network
             or related.asset_id != record.asset_id
             or related.side != record.side

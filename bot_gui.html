@@ -17064,6 +17064,9 @@
             const _spreadCooldownActive = Date.now() < _saSpreadActionCooldownUntil;
             function pushSuggestion(item) {
                 if (!item) return;
+                // Spread-tuning advice is meaningless while the ladder is
+                // anchored to the outside book edges.
+                if (item.actionType === 'applySpread' && thinMarketSettings()) return;
                 // Errors always show; cap softer messages at 3 total
                 if (item.type !== 'error' && suggestions.length >= 3) return;
                 if (!suggestions.some((existing) => existing.msg === item.msg)) {
@@ -20103,6 +20106,13 @@
                     liquidity_mode: (typeof getLiquidityMode === 'function')
                         ? getLiquidityMode() : 'two_sided',
                 });
+                // Size the plan for the offers-per-side the operator has
+                // entered, instead of replacing it with an automatic count.
+                const wantedOffers = Math.max(
+                    parseInt(document.getElementById('configMaxBuy')?.value, 10) || 0,
+                    parseInt(document.getElementById('configMaxSell')?.value, 10) || 0,
+                );
+                if (wantedOffers > 0) params.set('target_offers', String(wantedOffers));
                 if (sdStatus) sdStatus.textContent = 'Analysing market data + calculating capital allocation...';
                 const resp = await apiFetch(`${API_URL}/smart-defaults?${params}`);
                 let data = await resp.json();
@@ -24195,6 +24205,27 @@
         let _marketSummaryTimer = null;
         let _lastMarketSummary = null;
         let _lastMarketConfidence = null;
+        // Thin-market mode anchors each side of the ladder to its outside
+        // book edge. The midpoint spread settings do not shape that ladder,
+        // so panels that describe or tune them must say what is really used.
+        function thinMarketSettings() {
+            const thin = _lastMarketConfidence && _lastMarketConfidence.thin_market;
+            return thin && thin.enabled ? thin : null;
+        }
+        function applyThinMarketSpreadPanel() {
+            const thin = thinMarketSettings();
+            if (!thin) return false;
+            const pct = (bps) => (Number(bps || 0) / 100).toFixed(1) + '%';
+            const set = (id, text) => {
+                const node = document.getElementById(id);
+                if (node) node.textContent = text;
+            };
+            set('ccSpreadMode', 'thin market (edge-anchored)');
+            set('ccBaseSpread', pct(thin.ladder_depth_bps) + ' deep per side');
+            set('ccSpreadRange', pct(thin.edge_step_bps) + ' inside outside bid/ask');
+            set('ccMinEdge', 'n/a');
+            return true;
+        }
 
         function formatTrustedRangePrice(value) {
             const price = Number(String(value ?? '').trim());
@@ -24257,6 +24288,7 @@
 
         function renderMarketConfidence(data = {}) {
             _lastMarketConfidence = data;
+            applyThinMarketSpreadPanel();
             const confidence = data.confidence || {};
             const metrics = data.metrics || {};
             const state = String(confidence.state || 'RED').toUpperCase();
@@ -26146,7 +26178,20 @@
                     const pairLabel = receive.pair_label || 'CAT/XCH';
                     const receivedCount = Number(receive.total || 0);
                     const relevantCount = Number(receive.relevant || 0);
-                    if (enabled && !active) {
+                    const botRunning = !!(typeof bot_state !== 'undefined' && bot_state && bot_state.running);
+                    // The install check runs once at load; if the bot installed
+                    // Splash itself afterwards, refresh the stale "Install" button.
+                    const splashSetupBtn = document.getElementById('splashSetupBtn');
+                    if (splashSetupBtn && /Install/.test(splashSetupBtn.textContent || '')
+                            && Date.now() - (window._splashInstallRecheckAt || 0) > 60000
+                            && typeof checkSplashInstalled === 'function') {
+                        window._splashInstallRecheckAt = Date.now();
+                        checkSplashInstalled();
+                    }
+                    if (enabled && !active && botRunning) {
+                        el('splashIncomingHint').textContent =
+                            'Splash node is not running or cannot reach peers. Offers are still published to Dexie.';
+                    } else if (enabled && !active) {
                         el('splashIncomingHint').textContent =
                             'Listening enabled; start the bot to receive peer offers.';
                     } else if (active && receivedCount > 0 && relevantCount === 0) {
@@ -27185,6 +27230,7 @@
                     if (sp.base_spread_bps) el('ccBaseSpread').textContent = bps2pct(sp.base_spread_bps);
                     if (sp.min_spread_bps !== undefined) el('ccSpreadRange').textContent = bps2pct(sp.min_spread_bps) + ' – ' + bps2pct(sp.max_spread_bps);
                     if (sp.min_edge_bps !== undefined) el('ccMinEdge').textContent = bps2pct(sp.min_edge_bps);
+                    applyThinMarketSpreadPanel();
                 }
 
                 // Inventory
@@ -27792,7 +27838,9 @@
                         ? (getBootstrapCampaignStartBlock()?.message
                             || 'Bounded Bootstrap active — Follow mode is blocked by RED confidence')
                         : 'Market blocked — offer-book confidence is RED')
-                    : 'Market restricted — offer-book confidence is AMBER')
+                    : ((_lastMarketConfidence && _lastMarketConfidence.can_create)
+                        ? 'Quoting on a held price — offer-book confidence is AMBER'
+                        : 'Market restricted — offer-book confidence is AMBER'))
                 : (
                     isRecoveryGuidanceActive()
                     && String(h.message || '') === 'Market healthy — bot operating normally'

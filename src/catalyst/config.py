@@ -357,6 +357,24 @@ class Config:
         if _market_risk_preset not in ("conservative", "balanced", "aggressive"):
             _market_risk_preset = "balanced"
         self.MARKET_RISK_PRESET = _market_risk_preset
+        # Thin-market mode: quote inside whatever outside Dexie book exists,
+        # without demanding outside depth or a second provider, and hold the
+        # last trusted bid/ask when the book becomes unusable.
+        self.THIN_MARKET_MODE = _bool("THIN_MARKET_MODE", True)
+        # How far inside the best outside bid/ask the inner slots sit.
+        self.THIN_MARKET_EDGE_STEP_BPS = _decimal("THIN_MARKET_EDGE_STEP_BPS", "10")
+        # How far each side of a thin-market ladder reaches from its outside
+        # edge: the last sell sits this far above the inner sell, the last
+        # buy this far below the inner buy.
+        self.THIN_MARKET_LADDER_DEPTH_BPS = _decimal(
+            "THIN_MARKET_LADDER_DEPTH_BPS", "1000"
+        )
+        # Operator's starting price (XCH per CAT) for a token with no usable
+        # outside book and no price history. 0 = not set.
+        _manual_reference_price = _decimal("MANUAL_REFERENCE_PRICE", "0")
+        if not _manual_reference_price.is_finite() or _manual_reference_price < 0:
+            _manual_reference_price = Decimal("0")
+        self.MANUAL_REFERENCE_PRICE = _manual_reference_price
         self.MINIMUM_PROFIT_XCH = _decimal("MINIMUM_PROFIT_XCH", "0.0001")
         self.EXPECTED_CANCEL_REQUOTES = _int("EXPECTED_CANCEL_REQUOTES", 2)
         self.COMPETITION_COOLDOWN_SECS = _int("COMPETITION_COOLDOWN_SECS", 30)
@@ -1066,6 +1084,10 @@ class Config:
         "MAX_TRADE_XCH",
         "DEFAULT_TRADE_XCH",
         "MARKET_RISK_PRESET",
+        "THIN_MARKET_MODE",
+        "THIN_MARKET_EDGE_STEP_BPS",
+        "THIN_MARKET_LADDER_DEPTH_BPS",
+        "MANUAL_REFERENCE_PRICE",
         "MINIMUM_PROFIT_XCH",
         "EXPECTED_CANCEL_REQUOTES",
         "COMPETITION_COOLDOWN_SECS",

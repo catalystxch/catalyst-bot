@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from decimal import Decimal, ROUND_HALF_UP
-from typing import Dict, Optional
+from typing import Dict, Optional, Tuple
 
 
 TIER_ORDER = ("inner", "mid", "outer", "extreme")
@@ -76,6 +76,80 @@ def classify_slot_tier(
         if slot < running:
             return tier
     return "extreme"
+
+
+def thin_market_edges(
+    *, trusted_bid, trusted_ask, step_bps
+) -> Optional[Tuple[Decimal, Decimal]]:
+    """Return the (buy, sell) inner-slot prices just inside the outside book.
+
+    The inner buy sits ``step_bps`` above the best outside bid and the inner
+    sell ``step_bps`` below the best outside ask.  Returns None when the edges
+    are unknown or too close together to step inside without crossing.
+    """
+    if trusted_bid is None or trusted_ask is None:
+        return None
+    bid = _decimal(trusted_bid)
+    ask = _decimal(trusted_ask)
+    step = _decimal(step_bps) / Decimal("10000")
+    if bid <= 0 or ask <= bid or step < 0:
+        return None
+    buy_edge = bid * (Decimal("1") + step)
+    sell_edge = ask * (Decimal("1") - step)
+    if buy_edge >= sell_edge:
+        return None
+    return buy_edge, sell_edge
+
+
+def thin_market_side_mid(
+    side: str,
+    *,
+    trusted_bid,
+    trusted_ask,
+    step_bps,
+    min_edge_bps=Decimal("0"),
+) -> Optional[Decimal]:
+    """Back-solve a side-specific ladder mid from the outside book edge.
+
+    Used as the per-side reference for drift and requote decisions: it moves
+    in proportion to that side's own outside edge and nothing else.
+    """
+    if side not in ("buy", "sell"):
+        return None
+    edges = thin_market_edges(
+        trusted_bid=trusted_bid, trusted_ask=trusted_ask, step_bps=step_bps
+    )
+    inner_edge = _decimal(min_edge_bps) / Decimal("10000")
+    if edges is None or not Decimal("0") <= inner_edge < 1:
+        return None
+    buy_edge, sell_edge = edges
+    if side == "buy":
+        return buy_edge / (Decimal("1") - inner_edge)
+    return sell_edge / (Decimal("1") + inner_edge)
+
+
+def thin_market_slot_price(
+    slot: int, side: str, edge_price, depth_bps, max_offers: int
+) -> Optional[Decimal]:
+    """Price one slot of a ladder that starts at its outside-book edge.
+
+    Slot 0 sits at ``edge_price``; the last slot sits ``depth_bps`` further
+    from the market (lower for buys, higher for sells), evenly stepped.
+    """
+    max_offers = int(max_offers or 0)
+    edge = _decimal(edge_price)
+    depth = _decimal(depth_bps) / Decimal("10000")
+    if max_offers <= 0 or edge <= 0 or depth < 0 or side not in ("buy", "sell"):
+        return None
+    index = min(max(0, int(slot or 0)), max_offers - 1)
+    distance = (
+        Decimal("0") if max_offers == 1 else depth * Decimal(index) / (max_offers - 1)
+    )
+    if side == "buy":
+        price = edge * (Decimal("1") - distance)
+    else:
+        price = edge * (Decimal("1") + distance)
+    return price if price > 0 else None
 
 
 def ladder_price_for_slot(
