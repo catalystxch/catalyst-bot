@@ -22,7 +22,7 @@ import os
 import re
 import time
 import threading
-from dataclasses import dataclass
+from dataclasses import dataclass, replace as _dataclass_replace
 from datetime import datetime, timezone
 from decimal import Decimal, ROUND_DOWN
 from typing import Optional, Dict, List, Tuple, Callable, Any
@@ -2998,6 +2998,55 @@ class OfferManager:
         with self._sage_creation_authority_lock:
             pass
 
+    _MAX_CREATION_RETRIES_WITHOUT_EFFECT = 16
+
+    @classmethod
+    def _retry_intent_after_failure_without_effect(
+        cls, intent: _CanonicalOfferCreationIntent
+    ) -> Optional[_CanonicalOfferCreationIntent]:
+        """Give an identical request a fresh identity after a no-effect failure.
+
+        An intent's identity is a digest of the exact request, so retrying the
+        same price, coin and slot after a failure that never reached Sage would
+        otherwise be refused as already finalized, leaving the slot stuck for
+        the rest of the run. Each retry is chained to the previous identity.
+        Returns None when the latest identity in the chain is anything other
+        than a proven no-effect failure, so its recorded outcome is honoured.
+        """
+        current_id = intent.intent_id
+        for attempt in range(1, cls._MAX_CREATION_RETRIES_WITHOUT_EFFECT + 1):
+            if not database.offer_intent_failed_without_wallet_effect(current_id):
+                return None
+            retry_id = hashlib.sha256(
+                cls._canonical_creation_json(
+                    {
+                        "schema_version": 1,
+                        "retry_of_intent_id": current_id,
+                        "retry_attempt": attempt,
+                    }
+                ).encode("utf-8")
+            ).hexdigest()
+            if database.get_offer_intent(retry_id) is None:
+                log_event(
+                    "info",
+                    "offer_creation_retry_after_no_effect",
+                    f"Retrying {intent.side} slot {intent.slot_key} after a "
+                    "failure that never reached the wallet",
+                    data={
+                        "previous_intent_id": current_id,
+                        "retry_intent_id": retry_id,
+                        "attempt": attempt,
+                    },
+                )
+                return _dataclass_replace(
+                    intent,
+                    intent_id=retry_id,
+                    operation_id=f"create:{retry_id}",
+                    canonical_intent_sha256=retry_id,
+                )
+            current_id = retry_id
+        return None
+
     def _create_offer_from_journal_serialized(
         self,
         *,
@@ -3006,7 +3055,10 @@ class OfferManager:
     ) -> dict:
         existing = database.get_offer_intent(intent.intent_id)
         if existing is not None:
-            return self._existing_creation_result(intent, existing)
+            retry = self._retry_intent_after_failure_without_effect(intent)
+            if retry is None:
+                return self._existing_creation_result(intent, existing)
+            intent = retry
         continuation = None
         journal = None
         prepared = False

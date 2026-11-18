@@ -28957,6 +28957,49 @@ def get_offer_intent(intent_id: str) -> Optional[Dict[str, Any]]:
     return dict(row) if row is not None else None
 
 
+def offer_intent_failed_without_wallet_effect(intent_id: str) -> bool:
+    """True only when a creation intent provably failed before Sage was called.
+
+    Proof requires the intent to be ``creation_failed``, its journal to hold
+    exactly one FINALIZED/FAILED event recording ``effect_attempted: false``,
+    and no journal event for it to carry a transaction or spend identity.
+    Anything less, including unreadable evidence, returns False.
+    """
+    conn = get_connection()
+    intent = conn.execute(
+        "SELECT lifecycle_state, sage_trade_id, offer_text_sha256 "
+        "FROM offer_intents WHERE intent_id=?",
+        (str(intent_id),),
+    ).fetchone()
+    if (
+        intent is None
+        or intent["lifecycle_state"] != "creation_failed"
+        or intent["sage_trade_id"] is not None
+        or intent["offer_text_sha256"] is not None
+    ):
+        return False
+    events = conn.execute(
+        "SELECT phase, outcome, evidence_json, transaction_id, spend_identity "
+        "FROM offer_operation_journal WHERE intent_id=?",
+        (str(intent_id),),
+    ).fetchall()
+    finals = [
+        row
+        for row in events
+        if row["phase"] == "FINALIZED" and row["outcome"] == "FAILED"
+    ]
+    if len(finals) != 1 or any(
+        row["transaction_id"] is not None or row["spend_identity"] is not None
+        for row in events
+    ):
+        return False
+    try:
+        evidence = json.loads(finals[0]["evidence_json"] or "null")
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return False
+    return type(evidence) is dict and evidence.get("effect_attempted") is False
+
+
 _OFFER_DISCOVERY_PROVIDERS = ("dexie", "splash")
 
 

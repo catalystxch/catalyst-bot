@@ -2490,14 +2490,23 @@ def test_offer_manager_finalizes_failed_or_unknown_from_exact_effect_evidence(
         database.get_offer_intent_coin_reservations(intent["intent_id"])[0]["status"]
         == expected_reservation
     )
-    assert len(effects) == 1
     assert first["success"] is False
     assert replay["success"] is False
     if expected_state == "creation_unknown":
+        # An uncertain outcome is never retried: it needs reconciliation.
+        assert len(effects) == 1
         assert replay["reason"] == "OFFER_CREATION_RECONCILIATION_REQUIRED"
         assert database.get_runtime_safety_latch()["state"] == "tripped"
     else:
-        assert replay["reason"] == "OFFER_CREATION_ALREADY_FINALIZED"
+        # A failure proven not to have reached the wallet is retried under a
+        # fresh, chained identity; the original record is left untouched.
+        assert len(effects) == 2
+        assert len(begun) == 2
+        assert begun[1]["intent_id"] != begun[0]["intent_id"]
+        retried = database.get_offer_intent(begun[1]["intent_id"])
+        assert retried["lifecycle_state"] == "creation_failed"
+        assert retried["slot_key"] == intent["slot_key"]
+        assert retried["generation"] == intent["generation"]
         assert database.get_runtime_safety_latch()["state"] == "resolved"
 
 
@@ -3152,3 +3161,69 @@ def test_offer_manager_adapter_local_rejection_finalizes_failed_and_releases(
         == "released"
     )
     assert database.get_runtime_safety_latch()["state"] == "resolved"
+
+
+def test_retry_after_no_effect_failure_succeeds_on_the_same_slot(
+    isolated_database,
+    monkeypatch,
+):
+    """A transient no-effect failure must not leave the slot stuck."""
+
+    assert database.upsert_coin(COIN_A, "xch", 1000, designation="tier_spare")
+    results = [
+        {
+            "success": False,
+            "reason": "WALLET_REJECTED",
+            "_catalyst_effect_attempted": False,
+        },
+        {
+            "success": True,
+            "trade_id": "3" * 64,
+            "offer": VALID_SAGE_OFFER,
+            "_catalyst_effect_attempted": True,
+        },
+    ]
+    effects = []
+
+    def effect(*_args, **_kwargs):
+        effects.append(True)
+        return dict(results[len(effects) - 1])
+
+    begun, _closed = _stub_offer_manager_wallet(monkeypatch, effect=effect)
+    manager = offer_manager.OfferManager()
+    monkeypatch.setattr(
+        manager,
+        "_verify_sage_offer_locked_inputs",
+        lambda *_args, **_kwargs: {
+            "verified": True,
+            "locked_coin_ids": ["0x" + COIN_A],
+            "selected_present": True,
+        },
+    )
+    call = lambda: manager.create_offer_with_retry(
+        {"1": -1000, "2": 2000},
+        max_retries=4,
+        coin_ids_enabled=True,
+        selected_coin_id=COIN_A,
+        preferred_tier="inner",
+        creation_context=CREATION_CONTEXT,
+    )
+
+    first = call()
+    second = call()
+
+    assert first["success"] is False
+    assert effects == [True, True]
+    failed = database.get_offer_intent(begun[0]["intent_id"])
+    assert failed["lifecycle_state"] == "creation_failed"
+    assert second["_catalyst_intent_id"] == begun[1]["intent_id"]
+    assert second["success"] is True, second
+    created = database.get_offer_intent(begun[1]["intent_id"])
+    assert created["lifecycle_state"] in {"created", "visible"}
+    assert second["_catalyst_intent_id"] != failed["intent_id"]
+
+
+def test_no_effect_check_refuses_anything_that_may_have_reached_the_wallet(
+    isolated_database,
+):
+    assert database.offer_intent_failed_without_wallet_effect("0" * 64) is False
