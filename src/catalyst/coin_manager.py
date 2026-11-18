@@ -9287,6 +9287,37 @@ class CoinManager:
             )
         return kept
 
+    def _remember_absorbed_output_coins(self, receipt, owned_map) -> None:
+        """Mark coins created by a misfit absorption as internal, not deposits."""
+        try:
+            prepared_evidence = json.loads(receipt.operation["prepared_evidence_json"])
+            pre_ids = {
+                self._canonical_runtime_topup_coin_id(value)
+                for value in prepared_evidence["pre_view_coin_ids"]
+            }
+            outputs = {
+                "0x" + self._canonical_runtime_topup_coin_id(coin_id)
+                for coin_id in (owned_map or {})
+                if self._canonical_runtime_topup_coin_id(coin_id) not in pre_ids
+            }
+            if not outputs:
+                return
+            from database import get_setting, set_setting
+
+            raw = get_setting("deposit_advisory_advised_coins", "") or ""
+            advised = {part.strip() for part in raw.split(",") if part.strip()}
+            if outputs <= advised:
+                return
+            set_setting(
+                "deposit_advisory_advised_coins", ",".join(sorted(advised | outputs))
+            )
+        except Exception as exc:
+            log_event(
+                "debug",
+                "topup_absorb_output_remember_failed",
+                f"Could not record absorbed output coins as internal: {exc}",
+            )
+
     @staticmethod
     def _canonical_runtime_topup_coin_id(value: str) -> str:
         if type(value) is not str:
@@ -12037,6 +12068,11 @@ class CoinManager:
                     _set_setting(_abs_key, str(int(time.time())))
                 except Exception:
                     pass  # advisory is best-effort — don't block absorption
+                # The timestamp above only covers 90 seconds. Record the
+                # absorption's output coin itself so it is never later
+                # mistaken for an external deposit, which would also keep
+                # top-up from spending it.
+                self._remember_absorbed_output_coins(prep_receipt, owned_map)
                 return True
 
             # Log the actual Sage error (not just "Unknown") for diagnosis
